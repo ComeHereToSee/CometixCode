@@ -106,6 +106,21 @@ pub struct McpToolInfo {
     pub tool_name: String,
 }
 
+/// The server tool's MCP `annotations`, which the per-tool closures of CC's
+/// `fetchToolsForClient` read (`services/mcp/client.ts:1795-1809,1972-1976`).
+/// A missing hint is `false`, as their `?? false` makes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpToolAnnotations {
+    /// `annotations.title`, which `userFacingName()` prefers to the tool name.
+    pub title: Option<String>,
+    /// `isReadOnly()`, and `isConcurrencySafe()` with it.
+    pub read_only_hint: bool,
+    /// `isDestructive()`.
+    pub destructive_hint: bool,
+    /// `isOpenWorld()`.
+    pub open_world_hint: bool,
+}
+
 /// Maps to: CC `Tool.ts` `Tool` metadata consumed by `utils/api.ts#toolToAPISchema`.
 ///
 /// This type is the model/API-visible metadata half of CC's `Tool` interface,
@@ -141,6 +156,14 @@ pub struct Tool {
     /// shadows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_info: Option<McpToolInfo>,
+    /// The MCP tool's annotations; default for every other tool.
+    #[serde(skip)]
+    pub mcp_annotations: McpToolAnnotations,
+    /// Maps to: CC MCP tool `description()` (`client.ts:1786-1788`), the
+    /// server's description untruncated. [`Tool::description`] holds what
+    /// `prompt()` returns, cut at `MAX_MCP_DESCRIPTION_LENGTH`.
+    #[serde(skip)]
+    pub mcp_description: String,
     /// Maps to: CC `Tool.strict` after model/gate filtering in `toolToAPISchema`.
     pub strict: Option<bool>,
 }
@@ -185,6 +208,24 @@ impl Tool {
             Some(call) => call.prompt(self, options),
             None => self.description.clone(),
         }
+    }
+
+    /// Maps to: CC MCP tool `userFacingName()` (`client.ts:1972-1976`):
+    /// `` `${client.name} - ${annotations.title || tool.name} (MCP)` ``.
+    /// `None` for a tool that is not from an MCP server.
+    ///
+    /// PARTIAL: CC replaces this for a stdio Claude in Chrome server's tools
+    /// (`client.ts:1977-1982`, `claudeInChrome/toolRendering.tsx:292`); that
+    /// override is not ported.
+    pub fn mcp_user_facing_name(&self) -> Option<String> {
+        let info = self.mcp_info.as_ref()?;
+        Some(crate::services::mcp::client::mcp_tool_user_facing_name(
+            &info.server_name,
+            &crate::services::mcp::client::mcp_tool_display_name(
+                self.mcp_annotations.title.as_deref(),
+                &info.tool_name,
+            ),
+        ))
     }
 }
 

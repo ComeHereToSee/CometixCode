@@ -332,23 +332,26 @@ impl Command {
     pub(crate) fn from_mcp_prompt(
         prompt: crate::services::mcp::client::McpPromptCommandSnapshot,
     ) -> Self {
-        let argument_hint = (!prompt.arg_names.is_empty())
-            .then(|| format!("[{}]", prompt.arg_names.join(" ")))
-            .map(Cow::Owned);
         Self {
             name: Cow::Owned(prompt.name),
             aliases: Vec::new(),
             description: Cow::Owned(prompt.description),
             description_resolver: None,
             has_user_specified_description: prompt.has_user_specified_description,
-            argument_hint,
+            // CC's prompt command has `argNames` and no `argumentHint`; its
+            // suggestion row lists the names instead
+            // (`commandSuggestions.ts:274-278`).
+            argument_hint: None,
             argument_hint_resolver: None,
             arg_names: prompt.arg_names.into_iter().map(Cow::Owned).collect(),
             when_to_use: None,
             version: None,
             disable_model_invocation: false,
             user_invocable: true,
-            loaded_from: Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp),
+            // CC's prompt commands carry no `loadedFrom` (`client.ts:2056-2095`);
+            // `'mcp'` marks MCP skills, which SkillTool and the skill listing
+            // take and plain prompts must not reach (`SkillTool.ts:82-90`).
+            loaded_from: None,
             user_facing_name: Some(Cow::Owned(prompt.user_facing_name)),
             kind: CommandKind::Prompt,
             source: CommandSource::Mcp,
@@ -1987,15 +1990,23 @@ mod tests {
     fn mcp_skill_commands_match_feature_gate_and_source_predicate() {
         use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
 
-        let enabled =
+        // A plain MCP prompt carries no `loadedFrom`, so it is never an MCP
+        // skill; one marked `'mcp'` is.
+        let plain =
             Command::from_mcp_prompt(crate::services::mcp::client::McpPromptCommandSnapshot {
-                name: "mcp:enabled".to_string(),
-                description: "Enabled MCP skill".to_string(),
+                name: "mcp:plain".to_string(),
+                description: "Plain MCP prompt".to_string(),
                 has_user_specified_description: true,
-                user_facing_name: "mcp:enabled".to_string(),
+                user_facing_name: "mcp:plain".to_string(),
                 arg_names: Vec::new(),
                 source: "mcp",
             });
+        assert_eq!(plain.loaded_from, None);
+        // CC `client.ts:2056-2095`: `argNames`, but no `argumentHint`.
+        assert_eq!(plain.argument_hint, None);
+        let mut enabled = plain.clone();
+        enabled.name = "mcp:enabled".into();
+        enabled.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
         let mut disabled = enabled.clone();
         disabled.name = "mcp:disabled".into();
         disabled.disable_model_invocation = true;
@@ -2004,7 +2015,7 @@ mod tests {
         local.loaded_from = None;
         local.source = CommandSource::ProjectSettings;
 
-        let actual = get_mcp_skill_commands(&[enabled, disabled, local]);
+        let actual = get_mcp_skill_commands(&[plain, enabled, disabled, local]);
         if feature_enabled(FeatureFlag::McpSkills) {
             assert_eq!(
                 actual

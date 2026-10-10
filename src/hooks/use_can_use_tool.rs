@@ -512,36 +512,12 @@ pub fn can_use_tool(params: CanUseToolParams<'_>) -> CanUseToolResult {
             }) = &request.decision_reason
             {
                 if classifier == "auto-mode" {
-                    let description_and_name = if let Some(mcp_info) =
-                        params.tool.and_then(|tool| tool.mcp_info.as_ref())
+                    // An MCP tool answers `description()` and
+                    // `userFacingName()` from its own server tool.
+                    let description_and_name = if let Some(tool) = params.tool
+                        && let Some(user_facing_name) = tool.mcp_user_facing_name()
                     {
-                        params.tool_use_context.and_then(|context| {
-                            context
-                                .mcp_state
-                                .clients
-                                .iter()
-                                .find(|server| server.client.name == mcp_info.server_name)
-                                .and_then(|server| {
-                                    server
-                                        .tools
-                                        .iter()
-                                        .find(|tool| tool.name == mcp_info.tool_name)
-                                })
-                                .map(|tool| {
-                                    let display_name =
-                                        crate::services::mcp::client::mcp_tool_display_name(
-                                            tool.display_name.as_deref(),
-                                            &tool.name,
-                                        );
-                                    (
-                                        crate::services::mcp::client::mcp_tool_description(tool),
-                                        crate::services::mcp::client::mcp_tool_user_facing_name(
-                                            &mcp_info.server_name,
-                                            &display_name,
-                                        ),
-                                    )
-                                })
-                        })
+                        Some((tool.mcp_description.clone(), user_facing_name))
                     } else {
                         crate::services::tools::tool_execution::find_tool_call(tool_name).map(
                             |tool| {
@@ -560,9 +536,9 @@ pub fn can_use_tool(params: CanUseToolParams<'_>) -> CanUseToolResult {
                     {
                         return cancel(context);
                     }
-                    // An unregistered custom tool or missing MCP snapshot has
-                    // no description callback in this port. Do not substitute
-                    // the model prompt or input summary for that missing owner.
+                    // An unregistered non-MCP tool has no description callback
+                    // in this port. Do not substitute the model prompt or input
+                    // summary for that missing owner.
                     if let Some((description, user_facing_name)) = description_and_name {
                         crate::utils::auto_mode_denials::record_auto_mode_denial(
                             crate::utils::auto_mode_denials::AutoModeDenial {
@@ -2108,9 +2084,10 @@ mod tests {
         };
         // CC client.ts:1786-1788 supplies untruncated description; :1972-1974
         // supplies the server/title user-facing name used by the notification.
+        // Both come off the tool: no server is in the context's state.
         let raw = "original MCP description ".repeat(250);
         let mut context = crate::tool::ToolUseContext::default();
-        context.mcp_state.clients.push(McpServerSnapshot {
+        let server = McpServerSnapshot {
             connection_id: None,
             client: McpClientSnapshot {
                 name: "docs".into(),
@@ -2134,23 +2111,18 @@ mod tests {
             }],
             prompts: vec![],
             resources: vec![],
-        });
+        };
         let notifications = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = notifications.clone();
         context.add_notification =
             crate::tool::AddNotification(Some(std::sync::Arc::new(move |notification| {
                 captured.lock().unwrap().push(notification)
             })));
-        let tool = Tool {
-            name: "read".into(), // SDK skip-prefix case still carries mcpInfo.
-            description: "truncated model prompt is not the UI description".into(),
-            is_mcp: true,
-            mcp_info: Some(crate::types::tools::McpToolInfo {
-                server_name: "docs".into(),
-                tool_name: "read".into(),
-            }),
-            ..Default::default()
-        };
+        let mut tool = crate::services::mcp::client::mcp_tools_for_server_snapshot(&server)
+            .pop()
+            .expect("the projected tool");
+        assert_ne!(tool.description, raw, "the model prompt is truncated");
+        tool.name = "read".into(); // SDK skip-prefix case still carries mcpInfo.
         let tool_use = ToolUsePermissionRequest {
             tool_use_id: "mcp-deny".into(),
             tool_name: "read".into(),

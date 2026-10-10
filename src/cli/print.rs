@@ -1392,8 +1392,9 @@ fn context_usage_response(context: &crate::tool::ToolUseContext) -> serde_json::
 /// Two source behaviours are deliberately absent, both because their
 /// subsystems are unported rather than by choice:
 /// - CC merges THREE client sources (`:1620-1626`): `appState.mcp.clients`
-///   plus `sdkClients` plus `dynamicMcpState.clients`, deduped by name.
-///   Neither extra source exists here yet.
+///   plus `sdkClients` plus `dynamicMcpState.clients`, deduped by name, and
+///   two tool sources (`:1615-1618`): `mcp.tools` plus
+///   `dynamicMcpState.tools`. Neither extra source exists here yet.
 /// - `reload_plugins` is the second caller upstream; not ported, so this has
 ///   one caller.
 ///
@@ -1464,30 +1465,36 @@ fn build_mcp_server_statuses(
                     Transport::SseIde | Transport::Ws | Transport::WsIde | Transport::Sdk => None,
                 });
 
-            // CC `:1653-1663` — tools only for connected servers, each with the
-            // three annotations. The `|| undefined` there means a false hint is
-            // ABSENT, not `false`.
+            // CC `:1655-1665` — tools only for connected servers, the
+            // server's share of `mcp.tools` (`filterToolsByServer`), each with
+            // the three annotations. The `|| undefined` there means a false
+            // hint is ABSENT, not `false`.
             let tools = connected.then(|| {
-                server
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        let mut annotations = serde_json::Map::new();
-                        if tool.read_only_hint {
-                            annotations.insert("readOnly".to_string(), true.into());
-                        }
-                        if tool.destructive_hint {
-                            annotations.insert("destructive".to_string(), true.into());
-                        }
-                        if tool.open_world_hint {
-                            annotations.insert("openWorld".to_string(), true.into());
-                        }
-                        serde_json::json!({
-                            "name": tool.name,
-                            "annotations": serde_json::Value::Object(annotations),
-                        })
+                crate::services::mcp::utils::filter_tools_by_server(
+                    &state.tools,
+                    &server.client.name,
+                )
+                .iter()
+                .map(|tool| {
+                    let mut annotations = serde_json::Map::new();
+                    if tool.mcp_annotations.read_only_hint {
+                        annotations.insert("readOnly".to_string(), true.into());
+                    }
+                    if tool.mcp_annotations.destructive_hint {
+                        annotations.insert("destructive".to_string(), true.into());
+                    }
+                    if tool.mcp_annotations.open_world_hint {
+                        annotations.insert("openWorld".to_string(), true.into());
+                    }
+                    serde_json::json!({
+                        "name": tool
+                            .mcp_info
+                            .as_ref()
+                            .map_or(&tool.name, |info| &info.tool_name),
+                        "annotations": serde_json::Value::Object(annotations),
                     })
-                    .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
             });
 
             let mut status = serde_json::Map::new();
@@ -2537,15 +2544,22 @@ mod mcp_server_status_tests {
     }
 
     fn statuses(servers: Vec<McpServerSnapshot>) -> Vec<serde_json::Value> {
+        // `mcp.tools` is each server's projected tools, as the connection
+        // flush writes it.
+        let tools = servers
+            .iter()
+            .flat_map(crate::services::mcp::client::mcp_tools_for_server_snapshot)
+            .collect();
         let state = crate::state::app_state_store::McpState {
             clients: servers,
+            tools,
             ..Default::default()
         };
         build_mcp_server_statuses(&state, &Default::default())
     }
 
     /// Maps to: CC `print.ts:1689-1698` — connected servers carry `serverInfo`
-    /// and `tools`, and `:1653-1663`'s `|| undefined` means a FALSE annotation
+    /// and `tools`, and `:1655-1665`'s `|| undefined` means a FALSE annotation
     /// is absent rather than `false`.
     #[test]
     fn connected_server_carries_server_info_and_only_true_annotations() {
@@ -2558,6 +2572,9 @@ mod mcp_server_status_tests {
         assert_eq!(out[0]["name"], "docs");
         assert_eq!(out[0]["status"], "connected");
         assert_eq!(out[0]["serverInfo"]["version"], "1.2.3");
+        // `tool.mcpInfo?.toolName ?? tool.name`: the server's own name, not
+        // the prefixed `mcp__docs__search`.
+        assert_eq!(out[0]["tools"][0]["name"], "search");
         let annotations = &out[0]["tools"][0]["annotations"];
         assert_eq!(annotations["readOnly"], true);
         assert!(
@@ -2570,7 +2587,7 @@ mod mcp_server_status_tests {
     }
 
     /// Maps to: CC `:1691-1693` — `serverInfo` is connected-only and `error`
-    /// is failed-only; a failed server also reports no tools (`:1653`).
+    /// is failed-only; a failed server also reports no tools (`:1656`).
     #[test]
     fn failed_server_reports_error_and_no_tools_or_server_info() {
         let out = statuses(vec![server(

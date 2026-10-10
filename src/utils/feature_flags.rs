@@ -416,7 +416,7 @@ pub const FEATURE_SWITCHES: &[FeatureSwitch] = &[
         flag: FeatureFlag::McpSkills,
         cc_growthbook_name: "MCP_SKILLS",
         enabled: true,
-        note: "CC 2.1.88 build enables MCP prompt commands as Skill-tool skills; listing and invocation share this seam.",
+        note: "CC 2.1.88 build fetches MCP skills from servers that support resources (`client.ts:2172-2176`, `fetchMcpSkillsForClient`) and lists `loadedFrom: 'mcp'` commands as skills. Plain MCP prompts are never skills. Cometix has no MCP skill producer (the rebuild's `mcpSkills.ts` is a stub), so the gated readers find nothing.",
     },
     FeatureSwitch {
         flag: FeatureFlag::ExperimentalSkillSearch,

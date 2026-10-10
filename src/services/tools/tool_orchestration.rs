@@ -207,24 +207,20 @@ fn is_concurrency_safe_tool_use_in_context(
     else {
         return false;
     };
-    let parsed_input = if definition.is_mcp {
-        tool_use.input.clone()
-    } else {
-        find_tool_call(&definition.name)
-            .map(|tool| tool.normalize_input_with_context(&tool_use.input, context))
-            .unwrap_or_else(|| tool_use.input.clone())
-    };
+    // An MCP tool's `inputSchema` is MCPTool's `z.object({}).passthrough()`
+    // (`MCPTool.ts:14`), so CC's `safeParse` (`toolOrchestration.ts:97`) only
+    // asks for an object; the server's own schema is not checked here. Its
+    // `isConcurrencySafe()` is `annotations?.readOnlyHint ?? false`.
+    if definition.is_mcp {
+        return tool_use.input.is_object() && definition.mcp_annotations.read_only_hint;
+    }
+    let parsed_input = find_tool_call(&definition.name)
+        .map(|tool| tool.normalize_input_with_context(&tool_use.input, context))
+        .unwrap_or_else(|| tool_use.input.clone());
     if validate_tool_input_against_schema(&definition.name, &parsed_input, &definition.input_schema)
         .is_err()
     {
         return false;
-    }
-    if definition.is_mcp {
-        return crate::services::mcp::client::mcp_tool_snapshot_for_invocation(
-            &definition.name,
-            &context.mcp_state,
-        )
-        .is_some_and(|tool| tool.read_only_hint);
     }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         find_tool_call(&definition.name).is_some_and(|tool| tool.is_concurrency_safe(&parsed_input))
@@ -577,24 +573,48 @@ mod tests {
                 destructive_hint: false,
                 open_world_hint: false,
             });
+        server
+            .tools
+            .push(crate::services::mcp::types::McpToolSnapshot {
+                name: "write".to_string(),
+                display_name: None,
+                description: Some("write docs".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only_hint: false,
+                destructive_hint: false,
+                open_world_hint: false,
+            });
         let mut state = crate::state::app_state_store::McpState {
             clients: vec![server],
             ..crate::state::app_state_store::McpState::default()
         };
         crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
         let tool_name = "mcp__docs__lookup";
+        // The annotation travels on the tool (CC `isConcurrencySafe()` closes
+        // over it); the context carries no MCP state to look it up in.
         let context = ToolUseContext::with_permission_context(ToolPermissionContext::default())
-            .with_tools(state.tools.clone())
-            .with_mcp_state(state);
-        let block = ToolUseBlock {
-            id: crate::types::ids::ToolUseId("toolu_mcp_read".to_string()),
-            name: tool_name.to_string(),
-            input: serde_json::json!({"query": "rust"}),
+            .with_tools(state.tools.clone());
+        let block = |id: &str, name: &str, input| ToolUseBlock {
+            id: crate::types::ids::ToolUseId(id.to_string()),
+            name: name.to_string(),
+            input,
         };
+        let read = block(
+            "toolu_mcp_read",
+            tool_name,
+            serde_json::json!({"query": "rust"}),
+        );
+        // Missing the server schema's required `query`: CC's MCPTool schema
+        // is a passthrough object, so this still batches with the first.
+        let second_read = block("toolu_mcp_read_2", tool_name, serde_json::json!({}));
+        let write = block("toolu_mcp_write", "mcp__docs__write", serde_json::json!({}));
 
-        let batches = partition_tool_calls(&[block], &context);
-        assert_eq!(batches.len(), 1);
+        let batches = partition_tool_calls(&[read, second_read, write], &context);
+        assert_eq!(batches.len(), 2);
         assert!(batches[0].is_concurrency_safe);
+        assert_eq!(batches[0].blocks.len(), 2);
+        assert!(!batches[1].is_concurrency_safe);
+        assert_eq!(batches[1].blocks[0].id.0, "toolu_mcp_write");
     }
 
     #[test]

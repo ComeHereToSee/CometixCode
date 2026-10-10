@@ -14,10 +14,10 @@ use super::types::{
     MCPViewState, McpToolInfo, McpToolParameterInfo, ServerInfo, mcp_client_state_from_parts,
 };
 use crate::services::mcp::config::all_configured_mcp_servers_readonly;
+use crate::services::mcp::types::McpServerSnapshot;
 use crate::services::mcp::types::{
     ConfigScope, McpServerConnectionType, ScopedMcpServerConfig, Transport,
 };
-use crate::services::mcp::types::{McpServerSnapshot, McpToolSnapshot};
 use crate::utils::config::{GlobalConfig, ProjectConfig, normalize_project_path};
 use crate::utils::status::StartupDiagnosticsSnapshot;
 use iocraft::prelude::*;
@@ -55,27 +55,22 @@ fn parameter_infos_from_schema(schema: &serde_json::Value) -> Vec<McpToolParamet
         .collect()
 }
 
-/// `user_facing_name` maps to CC `tool.userFacingName({})` as read by
-/// `MCPToolListView.tsx:36-42` and `MCPToolDetailView.tsx`, i.e. the FULL
-/// `` `${client.name} - ${displayName} (MCP)` `` string that
-/// `extractMcpToolDisplayName` then parses. It used to be the bare
-/// `annotations.title`, which that parser can never split, so the list showed
-/// the raw title (or the prefixed name when there was none).
-fn mcp_tool_info_from_snapshot(tool: &McpToolSnapshot, server_name: &str) -> McpToolInfo {
-    McpToolInfo {
-        name: tool.name.clone(),
-        user_facing_name: Some(crate::services::mcp::client::mcp_tool_user_facing_name(
-            server_name,
-            &crate::services::mcp::client::mcp_tool_display_name(
-                tool.display_name.as_deref(),
-                &tool.name,
-            ),
-        )),
-        description: tool.description.clone(),
-        is_read_only: tool.read_only_hint,
-        is_destructive: tool.destructive_hint,
-        is_open_world: tool.open_world_hint,
-        parameters: parameter_infos_from_schema(&tool.input_schema),
+/// An `mcp.tools` entry as CC's tool views read it, off the tool itself:
+/// `userFacingName()` (`MCPToolListView.tsx:36-42`, `MCPToolDetailView.tsx`),
+/// i.e. the FULL `` `${client.name} - ${displayName} (MCP)` `` string that
+/// `extractMcpToolDisplayName` then parses; `description()`; and the three
+/// annotation methods.
+impl From<&crate::types::tools::Tool> for McpToolInfo {
+    fn from(tool: &crate::types::tools::Tool) -> Self {
+        Self {
+            name: tool.name.clone(),
+            user_facing_name: tool.mcp_user_facing_name(),
+            description: Some(tool.mcp_description.clone()),
+            is_read_only: tool.mcp_annotations.read_only_hint,
+            is_destructive: tool.mcp_annotations.destructive_hint,
+            is_open_world: tool.mcp_annotations.open_world_hint,
+            parameters: parameter_infos_from_schema(&tool.input_schema),
+        }
     }
 }
 
@@ -247,36 +242,14 @@ fn server_infos_from_capability_arrays(
             let tools = if let Some(runtime_tools) = runtime_tools {
                 crate::services::mcp::utils::filter_tools_by_server(runtime_tools, &name)
                     .iter()
-                    .map(|tool| {
-                        runtime
-                            .and_then(|server| {
-                                server.tools.iter().find(|snapshot| {
-                                    crate::services::mcp::mcp_string_utils::build_mcp_tool_name(
-                                        &name,
-                                        &snapshot.name,
-                                    ) == tool.name
-                                        || snapshot.name == tool.name
-                                })
-                            })
-                            .map(|snapshot| mcp_tool_info_from_snapshot(snapshot, &name))
-                            .unwrap_or_else(|| McpToolInfo {
-                                name: tool.name.clone(),
-                                user_facing_name: None,
-                                description: Some(tool.description.clone()),
-                                is_read_only: false,
-                                is_destructive: false,
-                                is_open_world: false,
-                                parameters: parameter_infos_from_schema(&tool.input_schema),
-                            })
-                    })
+                    .map(McpToolInfo::from)
                     .collect::<Vec<_>>()
             } else {
                 runtime
                     .map(|server| {
-                        server
-                            .tools
+                        crate::services::mcp::client::mcp_tools_for_server_snapshot(server)
                             .iter()
-                            .map(|snapshot| mcp_tool_info_from_snapshot(snapshot, &name))
+                            .map(McpToolInfo::from)
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default()
@@ -637,32 +610,39 @@ mod tests {
             id: None,
             plugin_source: None,
         };
+        let server = McpServerSnapshot {
+            connection_id: None,
+            client: McpClientSnapshot {
+                name: "docs".to_string(),
+                status: McpServerConnectionType::Connected,
+                reconnect_attempt: None,
+                max_reconnect_attempts: None,
+                ide_name: None,
+                server_version: None,
+                error: None,
+            },
+            config: Some(config),
+            supports_resources: false,
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            resources: Vec::new(),
+        };
+        // The flat `mcp.tools` entry, as the projection makes it; the nested
+        // list on the server stays empty.
+        let mut with_tools = server.clone();
+        with_tools.tools.push(McpToolSnapshot {
+            name: "search".to_string(),
+            display_name: Some("Search Docs".to_string()),
+            description: Some("Search docs".to_string()),
+            input_schema: serde_json::json!({"type":"object"}),
+            read_only_hint: true,
+            destructive_hint: false,
+            open_world_hint: false,
+        });
         let state = crate::state::app_state_store::McpState {
             plugin_reconnect_key: 0,
-            clients: vec![McpServerSnapshot {
-                connection_id: None,
-                client: McpClientSnapshot {
-                    name: "docs".to_string(),
-                    status: McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: Some(config),
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
-            }],
-            tools: vec![crate::types::tools::Tool {
-                name: "mcp__docs__search".to_string(),
-                description: "Search docs".to_string(),
-                input_schema: serde_json::json!({"type":"object"}),
-                is_mcp: true,
-                ..Default::default()
-            }],
+            clients: vec![server],
+            tools: crate::services::mcp::client::mcp_tools_for_server_snapshot(&with_tools),
             commands: vec![crate::commands::Command::from_mcp_prompt(
                 crate::services::mcp::client::McpPromptCommandSnapshot {
                     name: "mcp__docs__summarize".to_string(),
@@ -694,6 +674,12 @@ mod tests {
         let docs = infos.iter().find(|server| server.name == "docs").unwrap();
         assert_eq!(docs.tools.len(), 1);
         assert_eq!(docs.tools[0].name, "mcp__docs__search");
+        assert_eq!(
+            docs.tools[0].user_facing_name.as_deref(),
+            Some("docs - Search Docs (MCP)")
+        );
+        assert_eq!(docs.tools[0].description.as_deref(), Some("Search docs"));
+        assert!(docs.tools[0].is_read_only);
         assert_eq!(docs.prompts_count, 1);
         assert_eq!(docs.resources_count, 1);
     }

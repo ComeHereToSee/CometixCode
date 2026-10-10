@@ -413,97 +413,6 @@ async fn execute_forked_skill(
     }
 }
 
-// Existing L1 transport seam: MCP getPrompt is asynchronous while Command's
-// getPromptForCommand is a synchronous function pointer. This separate path
-// predates the shared inline repair; it is not CC's remote-canonical branch.
-async fn execute_mcp_skill(
-    command_name: &str,
-    skill_args: Option<&str>,
-    context: &crate::tool::ToolUseContext,
-) -> Option<crate::tool::ToolResult> {
-    let state = context.get_app_state();
-    let mcp_state = state
-        .as_ref()
-        .map_or(&context.mcp_state, |state| &state.mcp);
-    let registry_command = crate::commands::find_command(command_name, &mcp_state.commands)?;
-    if registry_command.kind != crate::commands::CommandKind::Prompt
-        || registry_command.loaded_from
-            != Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp)
-    {
-        return None;
-    }
-    if registry_command.disable_model_invocation {
-        return Some(skill_tool_error(format!(
-            "Skill {command_name} cannot be used with Skill tool due to disable-model-invocation"
-        )));
-    }
-    let pair = mcp_state.clients.iter().find_map(|server| {
-        server.prompts.iter().find_map(|prompt| {
-            (crate::services::mcp::client::mcp_prompt_command_name(
-                &server.client.name,
-                &prompt.name,
-            ) == registry_command.name)
-                .then_some((server, prompt))
-        })
-    });
-    let Some((server, prompt)) = pair else {
-        return Some(skill_tool_error(format!(
-            "MCP skill {command_name} is no longer available"
-        )));
-    };
-    let blocks = match crate::services::mcp::client::get_mcp_prompt_for_command(
-        server,
-        &prompt.name,
-        &prompt.arg_names,
-        skill_args.unwrap_or_default(),
-    )
-    .await
-    {
-        Ok(blocks) => blocks,
-        Err(error) => {
-            return Some(skill_tool_error(format!(
-                "MCP skill {command_name} failed: {error}"
-            )));
-        }
-    };
-    let prompt_text = crate::services::mcp::client::mcp_prompt_content_blocks_summary(&blocks);
-    crate::bootstrap::state::add_invoked_skill(
-        registry_command.name.as_ref(),
-        format!("mcp:{}:{}", server.client.name, prompt.name),
-        &prompt_text,
-        context.agent_id.as_deref(),
-    );
-    Some(crate::tool::ToolResult {
-        // Existing MCP result seam, unchanged here. CC MCP skills use the
-        // normal processPromptSlashCommand result at SkillTool.ts:768-839;
-        // :1102 belongs to remote canonical skills, not this transport.
-        data: crate::tool::ToolOutput::Skill(Output::Inline {
-            success: true,
-            command_name: registry_command.name.to_string(),
-            allowed_tools: None,
-            model: None,
-            status: Some("inline".to_string()),
-            context_modifier: None,
-        }),
-        new_messages: vec![crate::types::message::Message::User(
-            crate::types::message::UserMessage {
-                uuid: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now(),
-                content: vec![crate::types::message::UserContent::MetaText(prompt_text)],
-                is_compact_summary: false,
-                plan_content: None,
-                image_paste_ids: None,
-                is_visible_in_transcript_only: false,
-                mcp_meta: None,
-                source_tool_assistant_uuid: None,
-                permission_mode: None,
-                origin: None,
-                summarize_metadata: None,
-            },
-        )],
-    })
-}
-
 impl crate::tool::ToolCall for SkillTool {
     fn name(&self) -> &'static str {
         "Skill"
@@ -736,18 +645,6 @@ impl crate::tool::ToolCall for SkillTool {
                     )
                     .await;
                 }
-            }
-            // Existing MCP async transport seam: its descriptor has no sync
-            // getPromptForCommand callback. Candidate eligibility still comes
-            // from getAllCommands, never from plain MCP prompts or discovery.
-            if command.loaded_from == Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp)
-                && command.get_prompt_for_command.is_none()
-            {
-                return execute_mcp_skill(&command_name, skill_args, context)
-                    .await
-                    .unwrap_or_else(|| {
-                        skill_tool_error(format!("MCP skill {command_name} is no longer available"))
-                    });
             }
             // CC SkillTool.ts:633-644,754-759: this shared owner performs
             // callback -> hooks -> invocation -> metadata/meta/permissions.
@@ -1470,63 +1367,68 @@ mod tests {
         assert!(recorded.get("contextModifier").is_none());
     }
 
+    /// CC `SkillTool.ts:82-90`: only MCP skills (`loadedFrom === 'mcp'`) join
+    /// the catalog, "not plain MCP prompts". A plain prompt's command name is
+    /// an unknown skill even though `mcp.commands` holds it.
     #[test]
-    fn listed_mcp_skill_uses_the_same_invocation_registry() {
-        let server_name = "docs";
-        let prompt_name = "summarize";
-        let command_name =
-            crate::services::mcp::client::mcp_prompt_command_name(server_name, prompt_name);
-        let command = crate::commands::Command::from_mcp_prompt(
-            crate::services::mcp::client::McpPromptCommandSnapshot {
-                name: command_name.clone(),
-                description: "Summarize docs".to_string(),
-                has_user_specified_description: true,
-                user_facing_name: "docs:summarize (MCP)".to_string(),
-                arg_names: vec!["path".to_string()],
-                source: "mcp",
-            },
-        );
+    fn plain_mcp_prompts_are_not_skills() {
+        use crate::tool::ToolCall as _;
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let prompt = |name: &str| {
+            crate::commands::Command::from_mcp_prompt(
+                crate::services::mcp::client::McpPromptCommandSnapshot {
+                    name: name.to_string(),
+                    description: "Summarize docs".to_string(),
+                    has_user_specified_description: true,
+                    user_facing_name: "docs:summarize (MCP)".to_string(),
+                    arg_names: vec!["path".to_string()],
+                    source: "mcp",
+                },
+            )
+        };
+        let mut skill = prompt("mcp__docs__skill");
+        skill.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
         let mut context = crate::tool::ToolUseContext::default();
-        context.mcp_state.commands.push(command);
         context
             .mcp_state
-            .clients
-            .push(crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: server_name.to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: vec![crate::services::mcp::types::McpPromptSnapshot {
-                    name: prompt_name.to_string(),
-                    description: Some("Summarize docs".to_string()),
-                    arg_names: vec!["path".to_string()],
-                }],
-                resources: Vec::new(),
-            });
-        let result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(execute_mcp_skill(
-                &command_name,
-                Some("README.md"),
-                &context,
-            ))
-            .expect("MCP registry command should be recognized");
+            .commands
+            .extend([prompt("mcp__docs__summarize"), skill]);
+
+        let catalog = get_all_commands(&context);
+        assert!(
+            !catalog
+                .iter()
+                .any(|command| command.name == "mcp__docs__summarize")
+        );
+        assert!(
+            catalog
+                .iter()
+                .any(|command| command.name == "mcp__docs__skill")
+        );
+
+        let request = crate::utils::permissions::permissions::mock_permission_request_with_input(
+            "perm-skill".to_string(),
+            "toolu_skill".to_string(),
+            "Skill".to_string(),
+            "mcp__docs__summarize".to_string(),
+            serde_json::json!({"skill": "mcp__docs__summarize", "args": "README.md"}),
+            crate::types::permissions::PermissionMode::Default,
+        );
+        let result = futures::executor::block_on(SkillTool.call(
+            &request.input,
+            &request,
+            &context,
+            None,
+            None,
+            None,
+        ));
         let crate::tool::ToolOutput::Composed { content, .. } = result.data else {
-            panic!("unconnected test MCP should return a composed runtime error");
+            panic!("expected a tool error");
         };
-        assert!(content.contains("MCP skill"));
-        assert!(!content.contains("Unknown skill"));
+        assert!(
+            content.contains("Unknown skill: mcp__docs__summarize"),
+            "{content}"
+        );
     }
 
     #[test]

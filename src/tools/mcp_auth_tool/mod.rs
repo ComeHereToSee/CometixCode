@@ -53,7 +53,10 @@ pub fn create_mcp_auth_tool(
             // `services/mcp/client.rs` adds the canonical server prefix when it
             // materializes this server-local registry snapshot.
             name: "authenticate".to_string(),
-            display_name: Some(format!("{server_name} - authenticate (MCP)")),
+            // No title: the projected tool's `userFacingName()` is then
+            // `${serverName} - authenticate (MCP)`, CC's
+            // (`McpAuthTool.ts:70`).
+            display_name: None,
             description: Some(description),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -325,10 +328,7 @@ mod tests {
         let tool = create_mcp_auth_tool("linear", &config);
         let snapshot = tool.snapshot();
         assert_eq!(snapshot.name, "authenticate");
-        assert_eq!(
-            snapshot.display_name.as_deref(),
-            Some("linear - authenticate (MCP)")
-        );
+        assert_eq!(snapshot.display_name, None);
         assert!(
             snapshot
                 .description

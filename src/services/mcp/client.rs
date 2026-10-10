@@ -611,6 +611,13 @@ fn project_mcp_server_tools(
                             server_name: server.client.name.clone(),
                             tool_name: tool.name.clone(),
                         }),
+                        mcp_annotations: crate::types::tools::McpToolAnnotations {
+                            title: tool.display_name.clone(),
+                            read_only_hint: tool.read_only_hint,
+                            destructive_hint: tool.destructive_hint,
+                            open_world_hint: tool.open_world_hint,
+                        },
+                        mcp_description: tool.description.clone().unwrap_or_default(),
                         ..Default::default()
                     }
                 })
@@ -643,7 +650,7 @@ pub fn mcp_prompt_user_facing_name(server_name: &str, prompt_name: &str) -> Stri
     format!("{server_name}:{prompt_name} (MCP)")
 }
 
-/// Maps to: CC `services/mcp/client.ts:1971-1975` — the `userFacingName()` that
+/// Maps to: CC `services/mcp/client.ts:1972-1976` — the `userFacingName()` that
 /// `fetchToolsForClient(...)` hangs on every dynamic MCP tool:
 ///
 /// ```ts
@@ -659,13 +666,6 @@ pub fn mcp_prompt_user_facing_name(server_name: &str, prompt_name: &str) -> Stri
 /// (`FallbackPermissionRequest.tsx:33-35`) were both unreachable.
 pub fn mcp_tool_user_facing_name(server_name: &str, display_name: &str) -> String {
     format!("{server_name} - {display_name} (MCP)")
-}
-
-/// Maps to: CC `client.ts:1786-1788` MCP Tool's `description` callback.
-/// This is the raw permission/UI description, unlike the separately
-/// truncated `prompt` callback stored in the model-facing Tool descriptor.
-pub fn mcp_tool_description(tool: &crate::services::mcp::types::McpToolSnapshot) -> String {
-    tool.description.clone().unwrap_or_default()
 }
 
 /// Maps to: CC `client.ts:1973` `tool.annotations?.title || tool.name` — the
@@ -866,21 +866,6 @@ pub fn resolve_mcp_tool_invocation(
                     .then(|| (server.client.name.clone(), tool.name.clone()))
             })
         })
-}
-
-/// Returns the live MCP annotations for a model-facing dynamic tool name.
-/// Maps to the per-tool overrides created by CC `fetchToolsForClient(...)`.
-pub fn mcp_tool_snapshot_for_invocation(
-    full_tool_name: &str,
-    state: &McpState,
-) -> Option<McpToolSnapshot> {
-    let (server_name, raw_tool_name) = resolve_mcp_tool_invocation(full_tool_name, state)?;
-    state
-        .clients
-        .iter()
-        .find(|server| server.client.name == server_name)
-        .and_then(|server| server.tools.iter().find(|tool| tool.name == raw_tool_name))
-        .cloned()
 }
 
 /// Maps to the callback result of getMcpToolsCommandsAndResources and
@@ -1167,7 +1152,7 @@ mod runtime {
     /// helpers answer from it while a server's `ttlMs` lasts, and fall back
     /// to a stale entry when a refetch fails. CC sends every request and
     /// surfaces every failure, so the cache is off for every connection.
-    pub(super) async fn serve_client<T, E, A>(
+    async fn serve_client<T, E, A>(
         handler: CometixMcpClientHandler,
         transport: T,
     ) -> Result<RunningService<RoleClient, CometixMcpClientHandler>, ClientInitializeError>
@@ -3104,11 +3089,13 @@ mod runtime {
         })
     }
 
-    fn tool_snapshot(tool: rmcp::model::Tool) -> McpToolSnapshot {
+    pub(super) fn tool_snapshot(tool: rmcp::model::Tool) -> McpToolSnapshot {
         let annotations = tool.annotations.clone().unwrap_or_default();
         McpToolSnapshot {
             name: tool.name.to_string(),
-            display_name: annotations.title.or(tool.title),
+            // CC reads `tool.annotations?.title` only (`client.ts:1974`), not
+            // the tool's top-level `title`.
+            display_name: annotations.title,
             description: tool.description.map(|value| value.to_string()),
             input_schema: Value::Object((*tool.input_schema).clone()),
             read_only_hint: annotations.read_only_hint.unwrap_or(false),
@@ -8752,24 +8739,117 @@ rl.on('line', line => {
         assert_eq!(discoveries[0].server.tools[0].name, "authenticate");
     }
 
+    /// CC's `userFacingName()` reads `tool.annotations?.title` only
+    /// (`client.ts:1974`); the tool's top-level `title` is not a fallback.
     #[test]
-    fn mcp_tool_description_matches_official_untruncated_description_callback() {
-        // CC client.ts:1786-1794: description preserves the entire original
-        // text, whereas prompt separately applies MAX_MCP_DESCRIPTION_LENGTH.
+    fn tool_snapshot_takes_the_title_from_annotations_only() {
+        let tool = |value| serde_json::from_value::<rmcp::model::Tool>(value).unwrap();
+        let top_level_only = runtime::tool_snapshot(tool(serde_json::json!({
+            "name": "lookup",
+            "title": "Top Level",
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": true}
+        })));
+        assert_eq!(top_level_only.display_name, None);
+        assert!(top_level_only.read_only_hint);
+        let annotated = runtime::tool_snapshot(tool(serde_json::json!({
+            "name": "lookup",
+            "title": "Top Level",
+            "inputSchema": {"type": "object"},
+            "annotations": {"title": "Annotated"}
+        })));
+        assert_eq!(annotated.display_name.as_deref(), Some("Annotated"));
+        assert!(!annotated.read_only_hint);
+    }
+
+    /// Every `mcp.tools` entry answers what CC's per-tool closures do
+    /// (`client.ts:1786-1809,1972-1976`): `description()` untruncated,
+    /// `prompt()` cut at MAX_MCP_DESCRIPTION_LENGTH, the three annotation
+    /// methods, and `userFacingName()` from `annotations.title || tool.name`.
+    #[test]
+    fn projected_mcp_tools_carry_the_server_tool_metadata() {
         let raw = "metadata ".repeat(MAX_MCP_DESCRIPTION_LENGTH + 1);
-        let mut tool = crate::services::mcp::types::McpToolSnapshot {
-            name: "read".into(),
-            display_name: None,
-            description: Some(raw.clone()),
-            input_schema: serde_json::json!({"type":"object"}),
-            read_only_hint: true,
-            destructive_hint: false,
-            open_world_hint: false,
+        let tool = |name: &str, title: Option<&str>, description: Option<String>| {
+            crate::services::mcp::types::McpToolSnapshot {
+                name: name.into(),
+                display_name: title.map(str::to_string),
+                description,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only_hint: name == "read",
+                destructive_hint: name == "drop",
+                open_world_hint: name == "drop",
+            }
         };
-        assert_eq!(mcp_tool_description(&tool), raw);
-        assert_ne!(truncate_mcp_description(tool.description.clone()), raw);
-        tool.description = None;
-        assert_eq!(mcp_tool_description(&tool), "");
+        let auth = crate::tools::mcp_auth_tool::create_mcp_auth_tool(
+            "docs",
+            &ScopedMcpServerConfig {
+                name: None,
+                scope: crate::services::mcp::types::ConfigScope::Local,
+                transport: Transport::Http,
+                command: None,
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                url: Some("https://mcp.example.com".to_string()),
+                headers: std::collections::BTreeMap::new(),
+                headers_helper: None,
+                oauth: None,
+                ide_running_in_windows: None,
+                ide_name: None,
+                auth_token: None,
+                id: None,
+                plugin_source: None,
+            },
+        );
+        let server = McpServerSnapshot {
+            connection_id: None,
+            client: McpClientSnapshot {
+                name: "docs".to_string(),
+                status: McpServerConnectionType::Connected,
+                reconnect_attempt: None,
+                max_reconnect_attempts: None,
+                ide_name: None,
+                server_version: None,
+                error: None,
+            },
+            config: None,
+            supports_resources: false,
+            tools: vec![
+                tool("read", Some("Read Docs"), Some(raw.clone())),
+                tool("drop", Some(""), None),
+                auth.snapshot(),
+            ],
+            prompts: Vec::new(),
+            resources: Vec::new(),
+        };
+
+        let tools = project_mcp_server_tools(std::slice::from_ref(&server));
+        let [read, drop, authenticate] = tools.as_slice() else {
+            panic!("three tools: {tools:?}");
+        };
+        assert_eq!(read.mcp_description, raw);
+        assert_eq!(read.description, truncate_mcp_description(Some(raw)));
+        assert!(read.mcp_annotations.read_only_hint);
+        assert!(!read.mcp_annotations.destructive_hint);
+        assert_eq!(
+            read.mcp_user_facing_name().as_deref(),
+            Some("docs - Read Docs (MCP)")
+        );
+
+        assert_eq!(drop.mcp_description, "");
+        assert!(!drop.mcp_annotations.read_only_hint);
+        assert!(drop.mcp_annotations.destructive_hint);
+        assert!(drop.mcp_annotations.open_world_hint);
+        // `||` is JS truthiness: an empty title falls through to the name.
+        assert_eq!(
+            drop.mcp_user_facing_name().as_deref(),
+            Some("docs - drop (MCP)")
+        );
+
+        // CC `McpAuthTool.ts:70`.
+        assert_eq!(
+            authenticate.mcp_user_facing_name().as_deref(),
+            Some(auth.user_facing_name())
+        );
     }
 }
 

@@ -148,15 +148,16 @@ impl StreamingToolExecutor {
 
         // Maps to: CC `services/tools/StreamingToolExecutor.ts:104-112`.
         // `safeParse(...).data`, not the raw model JSON, owns the
-        // concurrency decision for this streaming queue entry.
-        let parsed_input = if tool_definition.is_mcp {
-            block.input.clone()
+        // concurrency decision for this streaming queue entry. An MCP tool's
+        // `inputSchema` is MCPTool's `z.object({}).passthrough()`
+        // (`MCPTool.ts:14`), which asks only for an object; its
+        // `isConcurrencySafe()` is `annotations?.readOnlyHint ?? false`.
+        let is_concurrency_safe = if tool_definition.is_mcp {
+            block.input.is_object() && tool_definition.mcp_annotations.read_only_hint
         } else {
-            find_tool_call(&tool_definition.name)
+            let parsed_input = find_tool_call(&tool_definition.name)
                 .map(|tool| tool.normalize_input_with_context(&block.input, &self.tool_use_context))
-                .unwrap_or_else(|| block.input.clone())
-        };
-        let is_concurrency_safe =
+                .unwrap_or_else(|| block.input.clone());
             crate::services::tools::tool_execution::validate_tool_input_against_schema(
                 &tool_definition.name,
                 &parsed_input,
@@ -164,18 +165,11 @@ impl StreamingToolExecutor {
             )
             .is_ok()
                 && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if tool_definition.is_mcp {
-                        crate::services::mcp::client::mcp_tool_snapshot_for_invocation(
-                            &tool_definition.name,
-                            &self.tool_use_context.mcp_state,
-                        )
-                        .is_some_and(|tool| tool.read_only_hint)
-                    } else {
-                        find_tool_call(&tool_definition.name)
-                            .is_some_and(|tool| tool.is_concurrency_safe(&parsed_input))
-                    }
+                    find_tool_call(&tool_definition.name)
+                        .is_some_and(|tool| tool.is_concurrency_safe(&parsed_input))
                 }))
-                .unwrap_or(false);
+                .unwrap_or(false)
+        };
         self.tools.push(TrackedTool {
             id: block.id.0.clone(),
             block,
@@ -1303,6 +1297,54 @@ mod tests {
         };
         executor.add_tool(invalid.clone(), assistant_with_block(invalid));
         assert!(!executor.tools[1].is_concurrency_safe);
+    }
+
+    /// CC MCP tool `isConcurrencySafe()` is the server tool's `readOnlyHint`
+    /// (`client.ts:1795-1797`), read off the tool: the context carries no MCP
+    /// state to look it up in.
+    #[test]
+    fn streaming_add_tool_classifies_mcp_tools_by_read_only_hint() {
+        let mut server =
+            crate::services::mcp::client::McpConnectionDiscovery::pending("docs").server;
+        server.client.status = crate::services::mcp::types::McpServerConnectionType::Connected;
+        for (name, read_only_hint) in [("lookup", true), ("write", false)] {
+            server
+                .tools
+                .push(crate::services::mcp::types::McpToolSnapshot {
+                    name: name.to_string(),
+                    display_name: None,
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    read_only_hint,
+                    destructive_hint: false,
+                    open_world_hint: false,
+                });
+        }
+        let mut state = crate::state::app_state_store::McpState {
+            clients: vec![server],
+            ..Default::default()
+        };
+        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
+        let context = ToolUseContext::with_permission_context(ToolPermissionContext::default())
+            .with_tools(state.tools.clone());
+        let mut executor = StreamingToolExecutor::new(context.tools.clone(), context);
+        // MCPTool's schema is a passthrough object: any object parses, a
+        // non-object does not.
+        for (name, input) in [
+            ("mcp__docs__lookup", serde_json::json!({})),
+            ("mcp__docs__write", serde_json::json!({})),
+            ("mcp__docs__lookup", serde_json::json!("not an object")),
+        ] {
+            let block = ToolUseBlock {
+                id: crate::types::ids::ToolUseId(format!("toolu_{}", executor.tools.len())),
+                name: name.to_string(),
+                input,
+            };
+            executor.add_tool(block.clone(), assistant_with_block(block));
+        }
+        assert!(executor.tools[0].is_concurrency_safe);
+        assert!(!executor.tools[1].is_concurrency_safe);
+        assert!(!executor.tools[2].is_concurrency_safe);
     }
 
     #[test]

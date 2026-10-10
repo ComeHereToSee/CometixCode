@@ -3448,8 +3448,9 @@ mod tests {
                 .clone(),
         );
         reset_sent_skill_names_for_test();
+        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`.
         let make_command = |name: &str| {
-            crate::commands::Command::from_mcp_prompt(
+            let mut command = crate::commands::Command::from_mcp_prompt(
                 crate::services::mcp::client::McpPromptCommandSnapshot {
                     name: name.to_string(),
                     description: format!("Use {name}"),
@@ -3458,7 +3459,9 @@ mod tests {
                     arg_names: Vec::new(),
                     source: "mcp",
                 },
-            )
+            );
+            command.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
+            command
         };
         let mut context = ToolUseContext::default();
         context.tools = vec![crate::tools::skill_tool::skill_tool_schema()];
@@ -3512,8 +3515,9 @@ mod tests {
         );
         reset_sent_skill_names_for_test();
 
+        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`.
         let make_command = |name: &str| {
-            crate::commands::Command::from_mcp_prompt(
+            let mut command = crate::commands::Command::from_mcp_prompt(
                 crate::services::mcp::client::McpPromptCommandSnapshot {
                     name: name.to_string(),
                     description: format!("Use {name}"),
@@ -3522,7 +3526,9 @@ mod tests {
                     arg_names: Vec::new(),
                     source: "mcp",
                 },
-            )
+            );
+            command.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
+            command
         };
         let mut live_state = crate::state::app_state_store::AppState::default();
         live_state.mcp = std::sync::Arc::new(crate::state::app_state_store::McpState {

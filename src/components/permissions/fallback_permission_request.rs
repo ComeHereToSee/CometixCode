@@ -165,9 +165,10 @@ fn original_cwd_for_label() -> String {
 /// `services::mcp::client::mcp_tool_user_facing_name`, keyed off the
 /// `mcp_info` this port already carries on the request (`Tool.mcpInfo`,
 /// `client.ts:1774`). PARTIAL: CC prefers `tool.annotations?.title` over
-/// `tool.name` for the display half (`client.ts:1973`); the title lives in the
-/// live `McpState`, which `PermissionRequestProps.toolUseContext` carries in CC
-/// but this port's dialog props do not, so the raw tool name is used.
+/// `tool.name` for the display half (`client.ts:1974`). The title travels on
+/// the `Tool` (`Tool::mcp_user_facing_name`), which CC hands the dialog as
+/// `toolUseConfirm.tool` but this port's dialog props do not carry, so the
+/// raw tool name is used.
 ///
 /// This used to be derived from `request.title`, a field whose only producer
 /// fabricated `"Claude wants to use {tool}"` — a string that does not exist
