@@ -161,30 +161,6 @@ impl McpServerConnectionType {
     }
 }
 
-/// A server's status line, flattened from [`McpServerConnection`] for the
-/// views that list servers before or apart from `AppState.mcp`. Each field is
-/// carried by only some of the official variants — `reconnectAttempt` /
-/// `maxReconnectAttempts` by `PendingMCPServer`, `error` by `FailedMCPServer`,
-/// `serverInfo.version` by `ConnectedMCPServer` — so they are all `Option`
-/// here.
-///
-/// The name follows CC's wire key, not a CC type: `systemInit.ts:63-66` emits
-/// `{ name: client.name, status: client.type }`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpClientSnapshot {
-    pub name: String,
-    pub status: McpServerConnectionType,
-    /// Maps to: CC `PendingMCPServer.reconnectAttempt`.
-    pub reconnect_attempt: Option<u32>,
-    /// Maps to: CC `PendingMCPServer.maxReconnectAttempts`.
-    pub max_reconnect_attempts: Option<u32>,
-    /// Already-known IDE display name from the MCP config. This mirrors
-    /// official sse-ide/ws-ide `config.ideName`.
-    pub ide_name: Option<String>,
-    pub server_version: Option<String>,
-    pub error: Option<String>,
-}
-
 /// Maps to: CC `MCPServerConnection` (`services/mcp/types.ts:221-226`), as
 /// stored in `AppState.mcp.clients` (`state/AppStateStore.ts:174`).
 ///

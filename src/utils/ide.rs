@@ -121,6 +121,42 @@ pub fn to_ide_display_name(terminal: Option<&str>) -> String {
     capitalize_ascii(terminal)
 }
 
+/// Maps to: CC `utils/ide.ts:271-285` `isSupportedTerminal`: the terminal is a
+/// supported VS Code or JetBrains one, or `FORCE_CODE_TERMINAL` is set.
+///
+/// CC reads the JetBrains half off `envDynamic.terminal`, which is not ported;
+/// both halves read `env.terminal` here. The two differ only off macOS when
+/// `TERMINAL_EMULATOR=JetBrains-JediTerm` and an earlier `detectTerminal`
+/// branch matched first (`CURSOR_TRACE_ID`, `VSCODE_GIT_ASKPASS_MAIN`,
+/// `__CFBundleIdentifier`, `VisualStudioVersion`): `envDynamic` then says
+/// `pycharm`. CC memoizes the result; it is computed on every call here.
+pub fn is_supported_terminal() -> bool {
+    use crate::utils::process_env::JsTruthy as _;
+    let terminal = crate::utils::env::get().terminal.as_deref();
+    is_vscode_ide(terminal)
+        || is_jetbrains_ide(terminal)
+        || crate::utils::process_env::var("FORCE_CODE_TERMINAL")
+            .truthy()
+            .is_some()
+}
+
+/// Maps to: CC `utils/ide.ts:1188-1196` `getIdeClientName`: an IDE
+/// transport's configured `ideName`, else the supported terminal's display
+/// name. The terminal is `env.terminal`, standing in for CC's
+/// `envDynamic.terminal` as in [`is_supported_terminal`].
+pub fn get_ide_client_name(
+    ide_client: Option<&crate::services::mcp::types::McpServerConnection>,
+) -> Option<String> {
+    use crate::services::mcp::types::Transport;
+    match ide_client.map(|client| client.config()) {
+        Some(config) if matches!(config.transport, Transport::SseIde | Transport::WsIde) => {
+            config.ide_name.clone()
+        }
+        _ => is_supported_terminal()
+            .then(|| to_ide_display_name(crate::utils::env::get().terminal.as_deref())),
+    }
+}
+
 /// Maps to: CC `components/IdeAutoConnectDialog.tsx`
 /// `shouldShowAutoConnectDialog`, with `isSupportedTerminal()` supplied as an
 /// already-known input.
@@ -170,6 +206,88 @@ pub fn ide_mention_shortcut(platform: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::mcp::types::{McpServerConnection, ScopedMcpServerConfig, Transport};
+
+    /// An `ide` record over `transport` that configures `ide_name`.
+    fn ide_client(transport: Transport, ide_name: Option<&str>) -> McpServerConnection {
+        let config = ScopedMcpServerConfig {
+            transport,
+            ide_name: ide_name.map(str::to_string),
+            ..ScopedMcpServerConfig::stdio_for_test("ide")
+        };
+        McpServerConnection::pending("ide", config)
+    }
+
+    /// CC `getIdeClientName`: an IDE transport's `ideName`, even when it has
+    /// none, whatever the terminal.
+    #[test]
+    fn ide_client_name_comes_from_an_ide_transports_config() {
+        assert_eq!(
+            get_ide_client_name(Some(&ide_client(Transport::WsIde, Some("Cursor")))),
+            Some("Cursor".to_string())
+        );
+        assert_eq!(
+            get_ide_client_name(Some(&ide_client(Transport::SseIde, Some("VS Code")))),
+            Some("VS Code".to_string())
+        );
+        assert_eq!(
+            get_ide_client_name(Some(&ide_client(Transport::SseIde, None))),
+            None
+        );
+    }
+
+    /// Any other transport ignores `ideName` and names the terminal, when it
+    /// is a supported one.
+    #[test]
+    fn ide_client_name_falls_back_to_a_supported_terminal() {
+        if !crate::utils::test_env::in_child_process(
+            module_path!(),
+            "ide_client_name_falls_back_to_a_supported_terminal",
+            &[
+                ("CURSOR_TRACE_ID", Some("1")),
+                ("FORCE_CODE_TERMINAL", None),
+            ],
+        ) {
+            return;
+        }
+        assert!(is_supported_terminal());
+        assert_eq!(
+            get_ide_client_name(Some(&ide_client(Transport::Stdio, Some("Foo")))),
+            Some("Cursor".to_string())
+        );
+        assert_eq!(get_ide_client_name(None), Some("Cursor".to_string()));
+    }
+
+    /// CC `Boolean(process.env.FORCE_CODE_TERMINAL)`: any non-empty value
+    /// makes an unsupported terminal count.
+    #[test]
+    fn force_code_terminal_makes_any_terminal_supported() {
+        if !crate::utils::test_env::in_child_process(
+            module_path!(),
+            "force_code_terminal_makes_any_terminal_supported",
+            &[
+                ("CURSOR_TRACE_ID", None),
+                ("VSCODE_GIT_ASKPASS_MAIN", None),
+                ("__CFBundleIdentifier", None),
+                ("VisualStudioVersion", None),
+                ("TERMINAL_EMULATOR", None),
+                ("TERM", Some("xterm-ghostty")),
+                ("FORCE_CODE_TERMINAL", None),
+            ],
+        ) {
+            return;
+        }
+        let _lock = crate::utils::test_env::TEST_ENV_LOCK.lock().unwrap();
+        assert!(!is_supported_terminal());
+        assert_eq!(get_ide_client_name(None), None);
+        {
+            let _empty = crate::utils::test_env::EnvVarGuard::set("FORCE_CODE_TERMINAL", "");
+            assert!(!is_supported_terminal());
+        }
+        let _forced = crate::utils::test_env::EnvVarGuard::set("FORCE_CODE_TERMINAL", "1");
+        assert!(is_supported_terminal());
+        assert_eq!(get_ide_client_name(None), Some("Ghostty".to_string()));
+    }
 
     #[test]
     fn ide_display_name_matches_official_supported_and_editor_fallbacks() {

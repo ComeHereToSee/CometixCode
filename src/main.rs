@@ -43,7 +43,6 @@ use crate::utils::settings::{
 };
 use crate::utils::settings::{SettingsJson, ValidationError};
 use crate::utils::status::StartupDiagnosticsSnapshot;
-use crate::utils::status::mcp_client_snapshots_from_config;
 use crate::utils::thinking::{
     ThinkingConfig, parse_js_decimal_i64, should_enable_thinking_by_default,
 };
@@ -610,17 +609,10 @@ pub fn seed_mcp_and_channel_permissions(store: &AppStore, startup: &McpStartupCo
 pub fn build_startup_diagnostics_snapshot(
     settings: &SettingsWithErrors,
 ) -> Arc<StartupDiagnosticsSnapshot> {
-    let global_config = load_global_config();
-    let current_project_config = std::env::current_dir()
-        .ok()
-        .map(|cwd| project_config_for_cwd(&global_config, &cwd))
-        .unwrap_or_default();
-    let mcp_clients = mcp_client_snapshots_from_config(&global_config, &current_project_config);
     Arc::new(StartupDiagnosticsSnapshot {
         settings_errors: settings.errors.clone(),
         installation_diagnostics: Vec::new(),
         doctor_diagnostics: Vec::new(),
-        mcp_clients,
         ide_installation_status: None,
     })
 }

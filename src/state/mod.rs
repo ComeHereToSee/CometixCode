@@ -7,11 +7,11 @@
 //!
 //! This file declares no items of its own, which is the point: CC's `state/`
 //! has no module-level implementation either. Everything that had accumulated
-//! here now lives with the CC file that owns it (#33) — MCP connection and
-//! snapshot types in `services/mcp/types.rs` (CC `services/mcp/types.ts`),
+//! here now lives with the CC file that owns it (#33) — MCP connection
+//! records in `services/mcp/types.rs` (CC `services/mcp/types.ts`),
 //! `McpState`/`McpWriter` in `app_state_store` (CC declares the bag inline at
-//! `AppStateStore.ts:173`), the Status-only client-summary builders in
-//! `utils/status.rs` beside the `StartupDiagnosticsSnapshot` they fill.
+//! `AppStateStore.ts:173`), the Status-only diagnostics in `utils/status.rs`
+//! with its `StartupDiagnosticsSnapshot`.
 //!
 //! Unified state loop (CC parity) — one Rust file per CC file, named after the
 //! CC file it maps to, not after the type it happens to define:

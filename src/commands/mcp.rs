@@ -8,11 +8,10 @@
 
 use crate::components::mcp::MCPSettings;
 use crate::components::mcp::mcp_reconnect::MCPReconnect;
-use crate::services::mcp::types::{McpClientSnapshot, McpServerConnectionType};
+use crate::services::mcp::types::{McpServerConnection, McpServerConnectionType};
 use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::constants::SettingSource;
 use crate::utils::settings::get_settings_file_path_for_source;
-use crate::utils::status::StartupDiagnosticsSnapshot;
 use iocraft::prelude::*;
 use serde_json::Value;
 
@@ -376,30 +375,30 @@ struct McpTogglePlan {
 fn mcp_toggle_plan_for_clients(
     action: &str,
     target: &str,
-    clients: &[McpClientSnapshot],
+    clients: &[McpServerConnection],
 ) -> McpTogglePlan {
     let is_enabling = action == "enable";
     let clients = clients
         .iter()
-        .filter(|client| client.name != "ide")
+        .filter(|client| client.name() != "ide")
         .collect::<Vec<_>>();
     let names = if target == "all" {
         clients
             .iter()
             .filter(|client| {
                 if is_enabling {
-                    client.status == McpServerConnectionType::Disabled
+                    client.connection_type() == McpServerConnectionType::Disabled
                 } else {
-                    client.status != McpServerConnectionType::Disabled
+                    client.connection_type() != McpServerConnectionType::Disabled
                 }
             })
-            .map(|client| client.name.clone())
+            .map(|client| client.name().to_owned())
             .collect::<Vec<_>>()
     } else {
         clients
             .iter()
-            .filter(|client| client.name == target)
-            .map(|client| client.name.clone())
+            .filter(|client| client.name() == target)
+            .map(|client| client.name().to_owned())
             .collect::<Vec<_>>()
     };
 
@@ -463,13 +462,10 @@ pub fn McpCommandPanel<'a>(
     // Maps to: CC `commands/mcp/mcp.tsx:20-21` — `useAppState(s => s.mcp.clients)`
     // for the read and `useMcpToggleEnabled()` for the write. There is no
     // `useMcp` at the source.
-    let runtime_mcp_clients =
-        crate::state::app_state::use_app_state(&mut hooks, |state| state.mcp.client_snapshots());
+    let mcp_clients =
+        crate::state::app_state::use_app_state(&mut hooks, |state| state.mcp.clients.clone());
     let toggle_mcp_server =
         crate::services::mcp::mcp_connection_manager::use_mcp_toggle_enabled(&mut hooks);
-    let runtime_config = hooks
-        .try_use_context::<StartupDiagnosticsSnapshot>()
-        .map(|ctx| (*ctx).clone());
     let mut pending_result = hooks.use_state(|| Option::<String>::None);
     let mut did_run_effect = hooks.use_state(|| false);
 
@@ -516,18 +512,7 @@ pub fn McpCommandPanel<'a>(
         } else {
             "all".to_string()
         };
-        // CC `commands/mcp/mcp.tsx:20` reads `s.mcp.clients` and has no fallback
-        // — the startup snapshot only covers the window before any client has
-        // been recorded in AppState.
-        let clients = if runtime_mcp_clients.is_empty() {
-            runtime_config
-                .as_ref()
-                .map(|ctx| ctx.mcp_clients.clone())
-                .unwrap_or_default()
-        } else {
-            runtime_mcp_clients.clone()
-        };
-        let plan = mcp_toggle_plan_for_clients(action, &target, &clients);
+        let plan = mcp_toggle_plan_for_clients(action, &target, &mcp_clients);
         if !did_run_effect.get() {
             did_run_effect.set(true);
             dispatch_mcp_toggle_plan(&plan, toggle_mcp_server);
@@ -574,6 +559,18 @@ mod tests {
 
     fn canvas_text(canvas: &Canvas) -> String {
         canvas.to_string()
+    }
+
+    fn app_state_with_mcp_clients(
+        clients: Vec<McpServerConnection>,
+    ) -> crate::state::app_state_store::AppState {
+        crate::state::app_state_store::AppState {
+            mcp: Arc::new(crate::state::app_state_store::McpState {
+                clients,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -657,34 +654,25 @@ mod tests {
 
     #[test]
     fn mcp_toggle_plan_matches_official_mcp_toggle_selection_and_copy() {
+        use crate::services::mcp::types::{ScopedMcpServerConfig, Transport};
+
+        let ide_config = ScopedMcpServerConfig {
+            transport: Transport::SseIde,
+            command: None,
+            url: Some("http://127.0.0.1:1234/sse".to_string()),
+            ide_name: Some("IDE".to_string()),
+            ..ScopedMcpServerConfig::stdio_for_test("unused")
+        };
         let clients = vec![
-            McpClientSnapshot {
-                name: "enabled".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            McpClientSnapshot {
-                name: "disabled".to_string(),
-                status: McpServerConnectionType::Disabled,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            McpClientSnapshot {
-                name: "ide".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: Some("IDE".to_string()),
-                server_version: None,
-                error: None,
-            },
+            McpServerConnection::connected_for_test(
+                "enabled",
+                ScopedMcpServerConfig::stdio_for_test("enabled-mcp"),
+            ),
+            McpServerConnection::disabled(
+                "disabled",
+                ScopedMcpServerConfig::stdio_for_test("disabled-mcp"),
+            ),
+            McpServerConnection::connected_for_test("ide", ide_config),
         ];
 
         assert_eq!(
@@ -714,27 +702,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mcp_panel_no_servers_completes_with_official_message_without_ui_only_panel() {
+    /// Renders `/mcp <args>` over the default AppState, which has no MCP
+    /// clients, and returns what it completed with and the last canvas.
+    fn render_panel_without_clients(args: &str) -> (Vec<String>, String) {
         let results = Arc::new(Mutex::new(Vec::<String>::new()));
         let results_for_handler = Arc::clone(&results);
         let last = Arc::new(Mutex::new(String::new()));
         let last_for_loop = Arc::clone(&last);
+        let args = args.to_string();
 
         futures::executor::block_on(async move {
             let current_theme = *theme::current();
             let mut app = element! {
                 ContextProvider(value: Context::owned(current_theme)) {
-                    // Default state IS the fixture: this asserts the
-                    // no-servers path completes, and default AppState has no
-                    // MCP clients.
                     crate::state::app_state::AppStateProvider(
                         children: crate::state::app_state::ProviderChildren::new(move || {
                             let results_for_handler = Arc::clone(&results_for_handler);
                             element! {
                                 crate::services::mcp::mcp_connection_manager::McpConnectionManager() {
                                     McpCommandPanel(
-                                        args: String::new(),
+                                        args: args.clone(),
                                         on_result: move |result: String| results_for_handler.lock().expect("results mutex").push(result),
                                     )
                                 }
@@ -759,13 +746,34 @@ mod tests {
             }
         });
 
+        let results = results.lock().expect("results mutex").clone();
         let last = last.lock().expect("last canvas mutex").clone();
-        assert_eq!(
-            results.lock().expect("results mutex").as_slice(),
-            &[NO_MCP_SERVERS_CONFIGURED.to_string()]
-        );
+        (results, last)
+    }
+
+    #[test]
+    fn mcp_panel_no_servers_completes_with_official_message_without_ui_only_panel() {
+        // A server configured but not in `mcp.clients` is not listed: the
+        // settings view reads AppState only, as CC's does.
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let mut global_config = crate::utils::config::GlobalConfig::default();
+        global_config.mcp_servers = Some(serde_json::json!({"docs":{"command":"docs-mcp"}}));
+        crate::utils::config::set_test_global_config(Some(global_config));
+
+        let (results, last) = render_panel_without_clients("");
+        crate::utils::config::set_test_global_config(None);
+
+        assert_eq!(results, [NO_MCP_SERVERS_CONFIGURED.to_string()]);
         assert!(!last.contains("UI-only build"), "canvas=\n{last}");
         assert!(!last.contains("Manage MCP servers"), "canvas=\n{last}");
+    }
+
+    /// CC `commands/mcp/mcp.tsx:20`: `/mcp enable|disable` reads
+    /// `s.mcp.clients` and nothing else.
+    #[test]
+    fn mcp_toggle_without_clients_reports_the_server_not_found() {
+        let (results, _) = render_panel_without_clients("disable docs");
+        assert_eq!(results, ["MCP server \"docs\" not found".to_string()]);
     }
 
     #[test]
@@ -775,38 +783,39 @@ mod tests {
             std::env::temp_dir().join(format!("cometix-mcp-panel-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        struct ProcessStateGuard(std::path::PathBuf);
-        impl Drop for ProcessStateGuard {
+        // MCPSettings reads agent definitions from the cwd; a scratch cwd keeps
+        // the repository's own `.claude/agents` out of the server list.
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
             fn drop(&mut self) {
                 let _ = std::env::set_current_dir(&self.0);
-                crate::utils::config::set_test_global_config(None);
             }
         }
 
-        let _process_state = ProcessStateGuard(std::env::current_dir().unwrap());
+        let _cwd = CwdGuard(std::env::current_dir().unwrap());
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let current_theme = *theme::current();
-        let mut global_config = crate::utils::config::GlobalConfig::default();
-        global_config.mcp_servers = Some(serde_json::json!({"docs":{"command":"docs-mcp"}}));
-        crate::utils::config::set_test_global_config(Some(global_config));
-        let runtime_config = crate::utils::status::StartupDiagnosticsSnapshot::default();
+        let initial_state = app_state_with_mcp_clients(vec![McpServerConnection::pending(
+            "docs",
+            crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("docs-mcp"),
+        )]);
 
         let canvas = element! {
             ContextProvider(value: Context::owned(current_theme)) {
-                ContextProvider(value: Context::owned(runtime_config)) {
-                    // AppStateProvider is OUTSIDE the manager, matching
-                    // production nesting (Provider -> REPL -> manager).
-                    // Default state is the fixture: the servers this test
-                    // asserts on come from the global config, not AppState.
-                    crate::state::app_state::AppStateProvider(
-                        children: crate::state::app_state::ProviderChildren::new(|| element! {
-                            crate::services::mcp::mcp_connection_manager::McpConnectionManager() {
-                                McpCommandPanel(args: "unexpected".to_string())
-                            }
-                        }.into_any()),
-                    )
-                }
+                // AppStateProvider is OUTSIDE the manager, matching
+                // production nesting (Provider -> REPL -> manager). The
+                // configured server is already a `pending` record in
+                // `mcp.clients`, as `initializeServersAsPending` leaves it
+                // before the settings view can render.
+                crate::state::app_state::AppStateProvider(
+                    initial_state: Some(initial_state),
+                    children: crate::state::app_state::ProviderChildren::new(|| element! {
+                        crate::services::mcp::mcp_connection_manager::McpConnectionManager() {
+                            McpCommandPanel(args: "unexpected".to_string())
+                        }
+                    }.into_any()),
+                )
             }
         }
         .render(Some(120));
@@ -832,18 +841,10 @@ mod tests {
         let close_for_handler = Arc::clone(&close_count);
         let results = Arc::new(Mutex::new(Vec::<String>::new()));
         let results_for_handler = Arc::clone(&results);
-        let diagnostics = StartupDiagnosticsSnapshot {
-            mcp_clients: vec![McpClientSnapshot {
-                name: "docs".to_string(),
-                status: McpServerConnectionType::Pending,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            }],
-            ..StartupDiagnosticsSnapshot::default()
-        };
+        let initial_state = app_state_with_mcp_clients(vec![McpServerConnection::pending(
+            "docs",
+            crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("docs-mcp"),
+        )]);
 
         futures::executor::block_on(async move {
             let mut app = element! {
@@ -851,30 +852,29 @@ mod tests {
                     crate::keybindings::keybinding_context::KeybindingRuntime::with_default_bindings()
                 )) {
                     ContextProvider(value: Context::owned(current_theme)) {
-                        ContextProvider(value: Context::owned(diagnostics)) {
-                            // Default state is the fixture: the pending client
-                            // this test drives Esc against comes from the
-                            // diagnostics snapshot above, not from AppState.
-                            crate::state::app_state::AppStateProvider(
-                                children: crate::state::app_state::ProviderChildren::new(move || {
-                                    let close_for_handler = Arc::clone(&close_for_handler);
-                                    let results_for_handler = Arc::clone(&results_for_handler);
-                                    element! {
-                                        crate::services::mcp::mcp_connection_manager::McpConnectionManager() {
-                                            McpCommandPanel(
-                                            args: String::new(),
-                                            on_close: move |_| {
-                                                *close_for_handler.lock().expect("close mutex") += 1;
-                                            },
-                                            on_result: move |result| {
-                                                results_for_handler.lock().expect("result mutex").push(result);
-                                            },
-                                            )
-                                        }
-                                    }.into_any()
-                                }),
-                            )
-                        }
+                        // The pending client this test drives Esc against is
+                        // a `mcp.clients` record, which is all the settings
+                        // view reads (CC `MCPSettings.tsx:32-34`).
+                        crate::state::app_state::AppStateProvider(
+                            initial_state: Some(initial_state),
+                            children: crate::state::app_state::ProviderChildren::new(move || {
+                                let close_for_handler = Arc::clone(&close_for_handler);
+                                let results_for_handler = Arc::clone(&results_for_handler);
+                                element! {
+                                    crate::services::mcp::mcp_connection_manager::McpConnectionManager() {
+                                        McpCommandPanel(
+                                        args: String::new(),
+                                        on_close: move |_| {
+                                            *close_for_handler.lock().expect("close mutex") += 1;
+                                        },
+                                        on_result: move |result| {
+                                            results_for_handler.lock().expect("result mutex").push(result);
+                                        },
+                                        )
+                                    }
+                                }.into_any()
+                            }),
+                        )
                     }
                 }
             };

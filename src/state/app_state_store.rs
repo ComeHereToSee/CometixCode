@@ -17,9 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::services::mcp::types::{
-    McpClientSnapshot, McpServerConnection, McpServerConnectionType, ServerResource,
-};
+use crate::services::mcp::types::{McpServerConnection, McpServerConnectionType, ServerResource};
 use crate::tool::ToolPermissionContext;
 
 /// Maps to: CC `AppState.expandedView: 'none' | 'tasks' | 'teammates'`.
@@ -305,37 +303,6 @@ pub struct McpState {
     pub tools: Vec<crate::types::tools::Tool>,
     pub commands: Vec<crate::commands::Command>,
     pub resources: std::collections::BTreeMap<String, Vec<ServerResource>>,
-}
-
-impl McpState {
-    pub fn client_snapshots(&self) -> Vec<McpClientSnapshot> {
-        self.clients
-            .iter()
-            .map(|server| {
-                let (reconnect_attempt, max_reconnect_attempts) = match server {
-                    McpServerConnection::Pending(pending) => {
-                        (pending.reconnect_attempt, pending.max_reconnect_attempts)
-                    }
-                    _ => (None, None),
-                };
-                McpClientSnapshot {
-                    name: server.name().to_owned(),
-                    status: server.connection_type(),
-                    reconnect_attempt,
-                    max_reconnect_attempts,
-                    ide_name: server.config().ide_name.clone(),
-                    server_version: server
-                        .as_connected()
-                        .and_then(|connected| connected.server_info.as_ref())
-                        .map(|info| info.version.clone()),
-                    error: match server {
-                        McpServerConnection::Failed(failed) => failed.error.clone(),
-                        _ => None,
-                    },
-                }
-            })
-            .collect()
-    }
 }
 
 /// Maps to: CC AppStateStore.ts:185-217 inline plugins state.
@@ -974,48 +941,6 @@ mod tests {
             id: None,
             plugin_source: None,
         }
-    }
-
-    /// Each variant's own fields reach its status line, and only its own.
-    #[test]
-    fn client_snapshots_project_each_variants_fields() {
-        let mut ide_config = stdio_scoped_config("ide");
-        ide_config.ide_name = Some("Cursor".to_string());
-        let mut connected = McpServerConnection::connected_for_test("ide", ide_config);
-        if let McpServerConnection::Connected(server) = &mut connected {
-            server.server_info = Some(rmcp::model::Implementation::new("ide", "2.0.1"));
-        }
-        let state = McpState {
-            clients: vec![
-                connected,
-                McpServerConnection::failed(
-                    "broken",
-                    stdio_scoped_config("broken"),
-                    Some("boom".to_string()),
-                ),
-                McpServerConnection::Pending(crate::services::mcp::types::PendingMcpServer {
-                    name: "retrying".to_string(),
-                    config: stdio_scoped_config("retrying"),
-                    reconnect_attempt: Some(2),
-                    max_reconnect_attempts: Some(5),
-                }),
-            ],
-            ..McpState::default()
-        };
-
-        let [ide, broken, retrying] = state.client_snapshots().try_into().unwrap();
-        assert_eq!(ide.status, McpServerConnectionType::Connected);
-        assert_eq!(ide.ide_name.as_deref(), Some("Cursor"));
-        assert_eq!(ide.server_version.as_deref(), Some("2.0.1"));
-        assert_eq!(ide.error, None);
-        assert_eq!(broken.status, McpServerConnectionType::Failed);
-        assert_eq!(broken.error.as_deref(), Some("boom"));
-        assert_eq!(broken.server_version, None);
-        assert_eq!(retrying.status, McpServerConnectionType::Pending);
-        assert_eq!(
-            (retrying.reconnect_attempt, retrying.max_reconnect_attempts),
-            (Some(2), Some(5))
-        );
     }
 
     /// Maps to: CC `useManageMCPConnections.ts#flushPendingUpdates`

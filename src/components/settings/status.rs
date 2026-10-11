@@ -6,7 +6,7 @@
 use crate::constants::figures::figures;
 use crate::constants::product;
 use crate::hooks::use_main_loop_model::use_main_loop_model;
-use crate::services::mcp::types::{McpClientSnapshot, McpServerConnectionType};
+use crate::services::mcp::types::{McpServerConnection, McpServerConnectionType};
 use crate::utils::claudemd::{ClaudeMdFile, discover_claude_md_files};
 use crate::utils::file::get_display_path;
 use crate::utils::format::format_number;
@@ -75,18 +75,16 @@ pub fn Status(props: &StatusProps, mut hooks: Hooks) -> impl Into<AnyElement<'st
         .unwrap_or_else(|| "/rename to add a name".to_string());
     let account_properties = build_account_properties();
     let api_provider_properties = build_api_provider_properties();
-    let empty_mcp_clients: &[McpClientSnapshot] = &[];
-    let mcp_clients = runtime_config
-        .as_ref()
-        .map(|context| context.mcp_clients.as_slice())
-        .unwrap_or(empty_mcp_clients);
+    // CC `useAppState(s => s.mcp)` (`Status.tsx:114`).
+    let mcp_clients =
+        crate::state::app_state::use_app_state(&mut hooks, |state| state.mcp.clients.clone());
     let ide_properties = ide_status_properties(
-        mcp_clients,
+        &mcp_clients,
         runtime_config
             .as_ref()
             .and_then(|context| context.ide_installation_status.as_ref()),
     );
-    let mcp_properties = mcp_status_properties(mcp_clients);
+    let mcp_properties = mcp_status_properties(&mcp_clients);
     let sandbox_properties = sandbox_status_properties(settings);
     let setting_sources = crate::utils::status::build_setting_sources_properties();
     let setting_sources_text = (!setting_sources.is_empty()).then(|| setting_sources.join(", "));
@@ -136,11 +134,12 @@ pub fn Status(props: &StatusProps, mut hooks: Hooks) -> impl Into<AnyElement<'st
     }
 }
 
+/// Maps to: CC `utils/status.tsx:69-146` `buildIDEProperties`.
 fn ide_status_properties(
-    mcp_clients: &[McpClientSnapshot],
+    mcp_clients: &[McpServerConnection],
     ide_installation_status: Option<&IDEExtensionInstallationStatus>,
 ) -> Vec<StatusPropertyData> {
-    let ide_client = mcp_clients.iter().find(|client| client.name == "ide");
+    let ide_client = mcp_clients.iter().find(|client| client.name() == "ide");
 
     if let Some(status) = ide_installation_status {
         let ide_name = ide_display_name(status.ide_type.as_deref());
@@ -172,12 +171,12 @@ fn ide_status_properties(
                 .map(str::trim)
                 .filter(|version| !version.is_empty())
                 .unwrap_or("unknown");
-            if let Some(client) =
-                ide_client.filter(|client| client.status == McpServerConnectionType::Connected)
-            {
-                if client
-                    .server_version
-                    .as_deref()
+            if let Some(client) = ide_client.and_then(McpServerConnection::as_connected) {
+                let server_version = client
+                    .server_info
+                    .as_ref()
+                    .map(|info| info.version.as_str());
+                if server_version
                     .map(str::trim)
                     .filter(|version| !version.is_empty())
                     .is_some_and(|server_version| server_version != installed_version)
@@ -186,7 +185,7 @@ fn ide_status_properties(
                         "IDE",
                         format!(
                             "Connected to {ide_name} {plugin_or_extension} version {installed_version} (server version: {})",
-                            client.server_version.as_deref().unwrap_or_default()
+                            server_version.unwrap_or_default()
                         ),
                     )];
                 }
@@ -203,13 +202,9 @@ fn ide_status_properties(
             )];
         }
     } else if let Some(client) = ide_client {
-        let ide_name = client
-            .ide_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .unwrap_or("IDE");
-        if client.status == McpServerConnectionType::Connected {
+        let ide_name = crate::utils::ide::get_ide_client_name(Some(client))
+            .unwrap_or_else(|| "IDE".to_string());
+        if client.connection_type() == McpServerConnectionType::Connected {
             return vec![status_property(
                 "IDE",
                 format!("Connected to {ide_name} extension"),
@@ -252,14 +247,15 @@ fn sandbox_status_properties_for_audience(
     )]
 }
 
-fn mcp_status_properties(mcp_clients: &[McpClientSnapshot]) -> Vec<StatusPropertyData> {
+/// Maps to: CC `utils/status.tsx:148-182` `buildMcpProperties`.
+fn mcp_status_properties(mcp_clients: &[McpServerConnection]) -> Vec<StatusPropertyData> {
     let mut connected = 0usize;
     let mut pending = 0usize;
     let mut needs_auth = 0usize;
     let mut failed = 0usize;
 
-    for client in mcp_clients.iter().filter(|client| client.name != "ide") {
-        match client.status {
+    for client in mcp_clients.iter().filter(|client| client.name() != "ide") {
+        match client.connection_type() {
             McpServerConnectionType::Connected => connected += 1,
             McpServerConnectionType::Pending => pending += 1,
             McpServerConnectionType::NeedsAuth => needs_auth += 1,
@@ -501,23 +497,51 @@ fn StatusProperty(props: &StatusPropertyProps, hooks: Hooks) -> impl Into<AnyEle
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::mcp::types::{McpClientSnapshot, McpServerConnectionType};
+    use crate::services::mcp::types::{ConfigScope, ScopedMcpServerConfig, Transport};
     use crate::utils::config::GlobalConfig;
     use crate::utils::ide::IDEExtensionInstallationStatus;
     use crate::utils::theme;
     use std::sync::Arc;
 
+    /// The `ide` client's config as the IDE integration builds it: an
+    /// `sse-ide` transport carrying the IDE's `ideName`, which is what CC
+    /// `getIdeClientName` (`utils/ide.ts:1188-1196`) reads.
+    fn ide_config(ide_name: &str) -> ScopedMcpServerConfig {
+        ScopedMcpServerConfig {
+            scope: ConfigScope::Dynamic,
+            transport: Transport::SseIde,
+            command: None,
+            url: Some("http://127.0.0.1:1234/sse".to_string()),
+            ide_name: Some(ide_name.to_string()),
+            ..ScopedMcpServerConfig::stdio_for_test("unused")
+        }
+    }
+
+    /// A connected `ide` client whose `serverInfo.version` is `server_version`.
+    fn connected_ide(ide_name: &str, server_version: &str) -> McpServerConnection {
+        let mut client = McpServerConnection::connected_for_test("ide", ide_config(ide_name));
+        if let McpServerConnection::Connected(connected) = &mut client {
+            connected.server_info = Some(rmcp::model::Implementation::new("ide", server_version));
+        }
+        client
+    }
+
+    fn stdio_client(name: &str, connection_type: McpServerConnectionType) -> McpServerConnection {
+        let config = ScopedMcpServerConfig::stdio_for_test(&format!("{name}-mcp"));
+        match connection_type {
+            McpServerConnectionType::Connected => {
+                McpServerConnection::connected_for_test(name, config)
+            }
+            McpServerConnectionType::Failed => McpServerConnection::failed(name, config, None),
+            McpServerConnectionType::NeedsAuth => McpServerConnection::needs_auth(name, config),
+            McpServerConnectionType::Pending => McpServerConnection::pending(name, config),
+            McpServerConnectionType::Disabled => McpServerConnection::disabled(name, config),
+        }
+    }
+
     #[test]
     fn ide_status_properties_match_official_installation_and_client_rows_readonly() {
-        let connected_ide = McpClientSnapshot {
-            name: "ide".to_string(),
-            status: McpServerConnectionType::Connected,
-            reconnect_attempt: None,
-            max_reconnect_attempts: None,
-            ide_name: Some("Cursor".to_string()),
-            server_version: Some("1.2.0".to_string()),
-            error: None,
-        };
+        let connected_ide = connected_ide("Cursor", "1.2.0");
         let status = IDEExtensionInstallationStatus {
             installed: true,
             error: None,
@@ -562,15 +586,7 @@ mod tests {
             )]
         );
 
-        let disconnected_ide = McpClientSnapshot {
-            name: "ide".to_string(),
-            status: McpServerConnectionType::Failed,
-            reconnect_attempt: None,
-            max_reconnect_attempts: None,
-            ide_name: Some("VS Code".to_string()),
-            server_version: None,
-            error: None,
-        };
+        let disconnected_ide = McpServerConnection::failed("ide", ide_config("VS Code"), None);
         assert_eq!(
             ide_status_properties(&[disconnected_ide], None),
             vec![status_property(
@@ -578,65 +594,22 @@ mod tests {
                 format!("{} Not connected to VS Code", figures().cross)
             )]
         );
+
+        assert_eq!(
+            ide_status_properties(std::slice::from_ref(&connected_ide), None),
+            vec![status_property("IDE", "Connected to Cursor extension")]
+        );
     }
 
     #[test]
     fn mcp_status_properties_match_official_summary_counts_readonly() {
         let rows = mcp_status_properties(&[
-            McpClientSnapshot {
-                name: "ide".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: Some("Cursor".to_string()),
-                server_version: Some("1.0".to_string()),
-                error: None,
-            },
-            McpClientSnapshot {
-                name: "memory".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            McpClientSnapshot {
-                name: "docs".to_string(),
-                status: McpServerConnectionType::NeedsAuth,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            McpClientSnapshot {
-                name: "repo".to_string(),
-                status: McpServerConnectionType::Pending,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            McpClientSnapshot {
-                name: "slack".to_string(),
-                status: McpServerConnectionType::Failed,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            McpClientSnapshot {
-                name: "old".to_string(),
-                status: McpServerConnectionType::Disabled,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
+            connected_ide("Cursor", "1.0"),
+            stdio_client("memory", McpServerConnectionType::Connected),
+            stdio_client("docs", McpServerConnectionType::NeedsAuth),
+            stdio_client("repo", McpServerConnectionType::Pending),
+            stdio_client("slack", McpServerConnectionType::Failed),
+            stdio_client("old", McpServerConnectionType::Disabled),
         ]);
 
         assert_eq!(
@@ -842,17 +815,16 @@ mod tests {
             settings_errors: Vec::new(),
             installation_diagnostics: vec!["Install setup warning".to_string()],
             doctor_diagnostics: vec!["Doctor health warning".to_string()],
-            mcp_clients: Vec::new(),
             ide_installation_status: None,
         };
 
         let text = element! {
             ContextProvider(value: Context::owned(*theme::current())) {
                 ContextProvider(value: Context::owned(runtime_config)) {
-                    // Status reads `state.settings` for the model row. Defaults
-                    // are the fixture: both tests using this harness assert on
-                    // the IDE/MCP/diagnostics summary, which comes from the
-                    // StartupDiagnosticsSnapshot above, not from AppState.
+                    // Status reads `state.settings` for the model row and
+                    // `state.mcp` for the IDE/MCP rows. Defaults are the
+                    // fixture: this test asserts on the diagnostics, which
+                    // come from the StartupDiagnosticsSnapshot above.
                     crate::state::app_state::AppStateProvider(
                         children: crate::state::app_state::ProviderChildren::new(|| element! {
                             Status(
@@ -873,40 +845,11 @@ mod tests {
     }
 
     #[test]
-    fn status_renders_readonly_ide_and_mcp_summary_from_runtime_snapshot() {
+    fn status_renders_readonly_ide_and_mcp_summary_from_app_state_clients() {
         let runtime_config = StartupDiagnosticsSnapshot {
             settings_errors: Vec::new(),
             installation_diagnostics: Vec::new(),
             doctor_diagnostics: Vec::new(),
-            mcp_clients: vec![
-                McpClientSnapshot {
-                    name: "ide".to_string(),
-                    status: McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: Some("Cursor".to_string()),
-                    server_version: Some("1.2.0".to_string()),
-                    error: None,
-                },
-                McpClientSnapshot {
-                    name: "memory".to_string(),
-                    status: McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                McpClientSnapshot {
-                    name: "repo".to_string(),
-                    status: McpServerConnectionType::Failed,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-            ],
             ide_installation_status: Some(IDEExtensionInstallationStatus {
                 installed: true,
                 error: None,
@@ -914,15 +857,25 @@ mod tests {
                 ide_type: Some("cursor".to_string()),
             }),
         };
+        // CC `Status.tsx:114` reads `useAppState(s => s.mcp)` and hands
+        // `mcp.clients` to both `buildIDEProperties` and `buildMcpProperties`.
+        let initial_state = crate::state::app_state_store::AppState {
+            mcp: Arc::new(crate::state::app_state_store::McpState {
+                clients: vec![
+                    connected_ide("Cursor", "1.2.0"),
+                    stdio_client("memory", McpServerConnectionType::Connected),
+                    stdio_client("repo", McpServerConnectionType::Failed),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
 
         let text = element! {
             ContextProvider(value: Context::owned(*theme::current())) {
                 ContextProvider(value: Context::owned(runtime_config)) {
-                    // Status reads `state.settings` for the model row. Defaults
-                    // are the fixture: both tests using this harness assert on
-                    // the IDE/MCP/diagnostics summary, which comes from the
-                    // StartupDiagnosticsSnapshot above, not from AppState.
                     crate::state::app_state::AppStateProvider(
+                        initial_state: Some(initial_state),
                         children: crate::state::app_state::ProviderChildren::new(|| element! {
                             Status(
                                 session_id: Some("session-123".to_string()),

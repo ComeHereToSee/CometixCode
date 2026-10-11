@@ -684,12 +684,7 @@ pub fn ManagePlugins(
     let snapshot = state.read().clone();
     let mcp = crate::state::app_state::use_app_state(&mut hooks, |s| s.mcp.clone());
     let errors = crate::state::app_state::use_app_state(&mut hooks, |s| s.plugins.errors.clone());
-    let clients = crate::components::mcp::mcp_settings::server_infos_from_mcp_state(
-        &crate::utils::config::GlobalConfig::default(),
-        &crate::utils::config::ProjectConfig::default(),
-        &mcp,
-        &[],
-    );
+    let clients = crate::components::mcp::mcp_settings::server_infos_from_mcp_state(&mcp);
     #[cfg(not(test))]
     let flagged = get_flagged_plugins();
     #[cfg(test)]

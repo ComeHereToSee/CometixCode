@@ -2539,7 +2539,7 @@ mod tests {
                 state.clients[1].connection_type(),
                 McpServerConnectionType::Pending
             );
-            assert_eq!(state.client_snapshots()[1].ide_name, None);
+            assert_eq!(state.clients[1].config().ide_name, None);
         });
     }
 

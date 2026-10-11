@@ -1,14 +1,11 @@
 //! Maps to: CC `utils/status.tsx`.
 
-use crate::services::mcp::types::{McpClientSnapshot, McpServerConnectionType};
-use crate::utils::config::{GlobalConfig, ProjectConfig};
 use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::constants::get_setting_source_display_name_capitalized;
 use crate::utils::settings::{
     SettingSource, SettingsJson, get_enabled_setting_sources, get_managed_file_settings_presence,
     get_settings_for_source,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 /// Startup-only diagnostics snapshot for Settings/Status surfaces. Read-only,
 /// built once at App mount and injected directly (no wrapper context class).
@@ -31,103 +28,9 @@ pub struct StartupDiagnosticsSnapshot {
     /// Already-known doctor warnings for Settings/Status diagnostics.
     /// Cometix does not run external doctor probes from the main-screen UI.
     pub doctor_diagnostics: Vec<String>,
-    /// Already-known MCP client snapshots for Settings/Status summaries.
-    /// Cometix never starts MCP clients from Status.
-    pub mcp_clients: Vec<McpClientSnapshot>,
     /// Already-known IDE installation status for Settings/Status summaries.
     /// Cometix never installs IDE extensions from Status.
     pub ide_installation_status: Option<crate::utils::ide::IDEExtensionInstallationStatus>,
-}
-
-fn project_mcp_disabled_names(project_config: &ProjectConfig) -> BTreeSet<String> {
-    project_config
-        .disabled_mcp_servers
-        .iter()
-        .flatten()
-        .chain(project_config.disabled_mcpjson_servers.iter().flatten())
-        .filter_map(|name| {
-            let trimmed = name.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .collect()
-}
-
-fn project_mcp_enabled_names(project_config: &ProjectConfig) -> BTreeSet<String> {
-    project_config
-        .enabled_mcp_servers
-        .iter()
-        .flatten()
-        .chain(project_config.enabled_mcpjson_servers.iter().flatten())
-        .filter_map(|name| {
-            let trimmed = name.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .collect()
-}
-
-fn insert_mcp_server_names(
-    clients: &mut BTreeMap<String, McpServerConnectionType>,
-    servers: Option<&serde_json::Value>,
-) {
-    if let Some(servers) = servers.and_then(serde_json::Value::as_object) {
-        for name in servers.keys() {
-            let trimmed = name.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            clients
-                .entry(trimmed.to_string())
-                .or_insert(McpServerConnectionType::Pending);
-        }
-    }
-}
-
-/// Builds read-only MCP client summaries from global and current project config.
-/// This mirrors Status' need for already-known MCP client snapshots without
-/// starting MCP clients, authenticating, opening sockets, or writing settings.
-///
-/// Rust-only, no CC counterpart: upstream reads live connections off
-/// `AppState.mcp.clients`, which Status can do because MCP is already running
-/// by then. This fills `StartupDiagnosticsSnapshot.mcp_clients` above, which is
-/// why it lives here rather than in `state/`.
-pub fn mcp_client_snapshots_from_config(
-    global_config: &GlobalConfig,
-    project_config: &ProjectConfig,
-) -> Vec<McpClientSnapshot> {
-    let disabled = project_mcp_disabled_names(project_config);
-    let enabled = project_mcp_enabled_names(project_config);
-    let mut clients = BTreeMap::<String, McpServerConnectionType>::new();
-
-    insert_mcp_server_names(&mut clients, global_config.mcp_servers.as_ref());
-    insert_mcp_server_names(&mut clients, project_config.mcp_servers.as_ref());
-
-    for name in enabled {
-        clients
-            .entry(name)
-            .or_insert(McpServerConnectionType::Pending);
-    }
-    for name in disabled {
-        clients.insert(name, McpServerConnectionType::Disabled);
-    }
-
-    clients
-        .into_iter()
-        .map(|(name, status)| McpClientSnapshot {
-            ide_name: (name == "ide").then(|| "IDE".to_string()),
-            name,
-            status,
-            reconnect_attempt: None,
-            max_reconnect_attempts: None,
-            server_version: None,
-            error: None,
-        })
-        .collect()
-}
-
-pub fn mcp_client_snapshots_from_project_config(
-    project_config: &ProjectConfig,
-) -> Vec<McpClientSnapshot> {
-    mcp_client_snapshots_from_config(&GlobalConfig::default(), project_config)
 }
 
 /// Returns the value projection of CC's `Property[]`; the owning iocraft
@@ -308,57 +211,6 @@ pub fn build_api_provider_properties() -> Vec<Property> {
 mod tests {
     use super::*;
     use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
-
-    #[test]
-    fn mcp_client_snapshots_from_project_config_builds_readonly_pending_snapshots() {
-        let mut project_config = ProjectConfig::default();
-        project_config.mcp_servers = Some(serde_json::json!({"alpha":{},"ide":{},"zeta":{}}));
-        project_config.enabled_mcp_servers = Some(vec!["beta".to_string()]);
-        project_config.disabled_mcp_servers = Some(vec!["zeta".to_string(), "gamma".to_string()]);
-
-        let clients = mcp_client_snapshots_from_project_config(&project_config);
-
-        assert_eq!(
-            clients
-                .iter()
-                .map(|client| (
-                    client.name.as_str(),
-                    client.status,
-                    client.ide_name.as_deref()
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                ("alpha", McpServerConnectionType::Pending, None),
-                ("beta", McpServerConnectionType::Pending, None),
-                ("gamma", McpServerConnectionType::Disabled, None),
-                ("ide", McpServerConnectionType::Pending, Some("IDE")),
-                ("zeta", McpServerConnectionType::Disabled, None),
-            ]
-        );
-    }
-
-    #[test]
-    fn mcp_client_snapshots_from_config_reads_global_and_project_mcp_without_starting_clients() {
-        let mut global_config = GlobalConfig::default();
-        global_config.mcp_servers = Some(serde_json::json!({"global":{},"shared":{}}));
-        let mut project_config = ProjectConfig::default();
-        project_config.mcp_servers = Some(serde_json::json!({"project":{},"shared":{}}));
-        project_config.disabled_mcp_servers = Some(vec!["global".to_string()]);
-
-        let clients = mcp_client_snapshots_from_config(&global_config, &project_config);
-
-        assert_eq!(
-            clients
-                .iter()
-                .map(|client| (client.name.as_str(), client.status))
-                .collect::<Vec<_>>(),
-            vec![
-                ("global", McpServerConnectionType::Disabled),
-                ("project", McpServerConnectionType::Pending),
-                ("shared", McpServerConnectionType::Pending),
-            ]
-        );
-    }
 
     #[test]
     fn build_api_provider_properties_matches_official_process_rows() {
