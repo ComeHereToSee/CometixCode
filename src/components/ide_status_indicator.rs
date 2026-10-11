@@ -230,9 +230,6 @@ mod tests {
                 },
                 config: None,
                 supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
             }
         }
         let state_for = |clients: Vec<McpServerSnapshot>| McpState {

@@ -51,7 +51,6 @@ use crate::services::mcp::elicitation_handler::{
     ElicitationAction, ElicitationRequestParams, ElicitationWaitingDismissAction,
     url_retry_waiting_dismiss_result,
 };
-use crate::services::mcp::types::McpPromptSnapshot;
 use crate::services::tools::tool_execution::{
     check_permissions_and_call_tool, check_permissions_and_call_tool_with_response,
 };
@@ -1590,10 +1589,10 @@ struct McpPromptSlashCommandSubmit {
     input: String,
     turn_id: String,
     command: McpPromptCommandSnapshot,
-    /// The client the prompt command was fetched from (CC's command record
-    /// closes over it).
+    /// The client the prompt command was fetched from, and the server's own
+    /// prompt name (CC's command record closes over both).
     server: crate::services::mcp::types::McpServerSnapshot,
-    prompt: McpPromptSnapshot,
+    prompt_name: String,
     args: String,
     tool_permission_context: ToolPermissionContext,
 }
@@ -5832,8 +5831,8 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             async move {
                 let blocks = match crate::services::mcp::client::get_mcp_prompt_for_command(
                 &submit.server,
-                &submit.prompt.name,
-                &submit.prompt.arg_names,
+                &submit.prompt_name,
+                &submit.command.arg_names,
                 &submit.args,
             )
             .await
@@ -7127,7 +7126,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             .map(|context| context.current())
             .unwrap_or_default();
         if let Some(parsed) = crate::utils::slash_command_parsing::parse_slash_command(&text) {
-            if let Some((server, prompt)) =
+            if let Some((server, command, prompt_name)) =
                 crate::services::mcp::client::resolve_mcp_prompt_command_invocation(
                     &parsed.name,
                     &runtime_mcp_state_for_submit,
@@ -7135,16 +7134,12 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             {
                 // MCP prompt slash commands dispatch a query now (REPL.tsx:4525).
                 clear_ide_selection_for_submit();
-                let command = crate::services::mcp::client::mcp_prompt_command_snapshot(
-                    &server.client.name,
-                    &prompt,
-                );
                 mcp_prompt_submit_action(McpPromptSlashCommandSubmit {
                     input: text,
                     turn_id: Uuid::new_v4().to_string(),
                     command,
                     server,
-                    prompt,
+                    prompt_name,
                     args: parsed.args,
                     tool_permission_context: tool_permission_context_for_submit,
                 });

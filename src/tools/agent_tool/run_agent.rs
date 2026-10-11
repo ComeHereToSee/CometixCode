@@ -390,7 +390,7 @@ async fn initialize_agent_mcp_servers(
         if is_newly_created {
             cleanup.connecting = Some((name.clone(), config.clone()));
         }
-        let mut client = crate::services::mcp::client::connect_to_server(&name, &config).await;
+        let client = crate::services::mcp::client::connect_to_server(&name, &config).await;
         if is_newly_created {
             cleanup.connecting = None;
             cleanup.newly_created_clients.push(client.clone());
@@ -411,15 +411,14 @@ async fn initialize_agent_mcp_servers(
                 .iter()
                 .any(|server| server.client.name == name)
             {
-                upsert_mcp_server_snapshot(&mut state, client);
+                state.clients.push(client);
             }
             continue;
         }
         // CC `fetchToolsForClient(client)`: memoized by name and refreshed on
         // `list_changed`, so a shared connection's tools are the parent's
         // current ones.
-        client.tools = crate::services::mcp::client::fetch_tools_for_client(&client).await;
-        let server_tools = crate::services::mcp::client::mcp_tools_for_server_snapshot(&client);
+        let server_tools = crate::services::mcp::client::fetch_tools_for_client(&client).await;
         tracing::debug!(
             agent_type = %agent_definition.agent_type,
             server = %name,
@@ -445,13 +444,6 @@ async fn initialize_agent_mcp_servers(
         tools,
         cleanup,
     }
-}
-
-fn upsert_mcp_server_snapshot(
-    state: &mut crate::state::app_state_store::McpState,
-    server: crate::services::mcp::types::McpServerSnapshot,
-) {
-    crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(state, server);
 }
 
 fn merge_agent_mcp_tools(mut resolved_tools: Vec<Tool>, agent_mcp_tools: Vec<Tool>) -> Vec<Tool> {
@@ -2955,9 +2947,6 @@ mod tests {
                 },
                 config: None,
                 supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
             }],
             ..crate::state::app_state_store::McpState::default()
         };

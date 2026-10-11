@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn tool_search_uses_runtime_mcp_tools_and_reports_pending_servers_like_official() {
-        let mut mcp_state = crate::state::app_state_store::McpState {
+        let mcp_state = crate::state::app_state_store::McpState {
             clients: vec![
                 crate::services::mcp::types::McpServerSnapshot {
                     connection_id: None,
@@ -680,17 +680,6 @@ mod tests {
                     },
                     config: None,
                     supports_resources: false,
-                    tools: vec![crate::services::mcp::types::McpToolSnapshot {
-                        name: "Create Issue".to_string(),
-                        display_name: Some("Create Issue".to_string()),
-                        description: Some("Create a GitHub issue".to_string()),
-                        input_schema: serde_json::json!({"type":"object"}),
-                        read_only_hint: false,
-                        destructive_hint: false,
-                        open_world_hint: true,
-                    }],
-                    prompts: Vec::new(),
-                    resources: Vec::new(),
                 },
                 crate::services::mcp::types::McpServerSnapshot {
                     connection_id: None,
@@ -705,14 +694,19 @@ mod tests {
                     },
                     config: None,
                     supports_resources: false,
-                    tools: Vec::new(),
-                    prompts: Vec::new(),
-                    resources: Vec::new(),
                 },
             ],
+            tools: vec![crate::services::mcp::client::mcp_tool_for_test(
+                "GitHub Server",
+                serde_json::json!({
+                    "name": "Create Issue",
+                    "description": "Create a GitHub issue",
+                    "inputSchema": {"type": "object"},
+                    "annotations": {"title": "Create Issue", "openWorldHint": true}
+                }),
+            )],
             ..crate::state::app_state_store::McpState::default()
         };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut mcp_state);
         let tools = vec![super::tool_search_tool_schema()];
 
         let matched = super::tool_search_output_from_tools_and_mcp_state(

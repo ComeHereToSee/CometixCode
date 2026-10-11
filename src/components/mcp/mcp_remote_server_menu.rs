@@ -368,23 +368,12 @@ pub fn MCPRemoteServerMenu<'a>(
                         };
                         crate::services::mcp::client::clear_server_cache(&server.name, Some(&server_ref))
                             .await;
-                        {
-                            let base = runtime_mcp
-                                .current()
-                                .clients
-                                .into_iter()
-                                .find(|candidate| candidate.client.name == server.name)
-                                .unwrap_or_else(|| {
-                                    crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
-                                        &server.name,
-                                        &server.config,
-                                    )
-                                    .server
-                                });
-                            runtime_mcp.apply_server_update(
-                                crate::services::mcp::use_manage_mcp_connections::clear_authentication_server_update(&base),
-                            );
-                        }
+                        runtime_mcp.update(|mcp| {
+                            crate::services::mcp::use_manage_mcp_connections::clear_authentication_state(
+                                mcp,
+                                &server.name,
+                            )
+                        });
                         pending_runtime_result.set(Some(format!(
                             "Authentication cleared for {}.",
                             server.name
@@ -480,23 +469,12 @@ pub fn MCPRemoteServerMenu<'a>(
                         };
                         crate::services::mcp::client::clear_server_cache(&server.name, Some(&server_ref))
                             .await;
-                        {
-                            let base = runtime_mcp
-                                .current()
-                                .clients
-                                .into_iter()
-                                .find(|candidate| candidate.client.name == server.name)
-                                .unwrap_or_else(|| {
-                                    crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
-                                        &server.name,
-                                        &server.config,
-                                    )
-                                    .server
-                                });
-                            runtime_mcp.apply_server_update(
-                                crate::services::mcp::use_manage_mcp_connections::claude_ai_clear_authentication_server_update(&base),
-                            );
-                        }
+                        runtime_mcp.update(|mcp| {
+                            crate::services::mcp::use_manage_mcp_connections::claude_ai_clear_authentication_state(
+                                mcp,
+                                &server.name,
+                            )
+                        });
                         is_claude_ai_clearing_auth.set(false);
                         claude_ai_clear_auth_browser_opened.set(false);
                         pending_runtime_result.set(Some(format!(

@@ -2403,7 +2403,7 @@ mod mcp_server_status_tests {
     use super::*;
     use crate::services::mcp::types::{
         ConfigScope, McpClientSnapshot, McpServerConnectionType, McpServerSnapshot,
-        McpToolSnapshot, ScopedMcpServerConfig, Transport,
+        ScopedMcpServerConfig, Transport,
     };
 
     fn config(transport: Transport) -> ScopedMcpServerConfig {
@@ -2444,18 +2444,26 @@ mod mcp_server_status_tests {
             },
             config: Some(config(transport)),
             supports_resources: false,
-            tools: vec![McpToolSnapshot {
-                name: "search".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            }],
-            prompts: Vec::new(),
-            resources: Vec::new(),
         }
+    }
+
+    /// The server's connection attempt with its one read-only `search` tool.
+    fn attempt(
+        server: McpServerSnapshot,
+        description: Option<&str>,
+    ) -> crate::services::mcp::client::McpConnectionDiscovery {
+        let tool = crate::services::mcp::client::mcp_tool_for_test(
+            &server.client.name,
+            serde_json::json!({
+                "name": "search",
+                "description": description,
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": true}
+            }),
+        );
+        let mut attempt = crate::services::mcp::client::McpConnectionDiscovery::from(server);
+        attempt.tools = vec![tool];
+        attempt
     }
 
     #[test]
@@ -2467,13 +2475,12 @@ mod mcp_server_status_tests {
             ],
             ..Default::default()
         };
-        let mut fast = server(
+        let fast = server(
             "a-fast",
             McpServerConnectionType::Connected,
             Transport::Stdio,
         );
-        fast.tools[0].description = Some("first".into());
-        apply_headless_mcp_connection_attempt(&mut state, fast.clone());
+        apply_headless_mcp_connection_attempt(&mut state, attempt(fast.clone(), Some("first")));
         assert_eq!(
             state.clients[0].client.status,
             McpServerConnectionType::Pending
@@ -2485,10 +2492,13 @@ mod mcp_server_status_tests {
         let fast_name = state.tools[0].name.clone();
         apply_headless_mcp_connection_attempt(
             &mut state,
-            server(
-                "z-slow",
-                McpServerConnectionType::Connected,
-                Transport::Stdio,
+            attempt(
+                server(
+                    "z-slow",
+                    McpServerConnectionType::Connected,
+                    Transport::Stdio,
+                ),
+                None,
             ),
         );
         assert_eq!(
@@ -2504,8 +2514,7 @@ mod mcp_server_status_tests {
             state.tools[0].name, fast_name,
             "tools follow completion callbacks, clients retain pending positions"
         );
-        fast.tools[0].description = Some("later".into());
-        apply_headless_mcp_connection_attempt(&mut state, fast);
+        apply_headless_mcp_connection_attempt(&mut state, attempt(fast, Some("later")));
         assert_eq!(state.tools.len(), 2);
         assert_eq!(
             state.tools[0].description, "first",
@@ -2544,17 +2553,17 @@ mod mcp_server_status_tests {
     }
 
     fn statuses(servers: Vec<McpServerSnapshot>) -> Vec<serde_json::Value> {
-        // `mcp.tools` is each server's projected tools, as the connection
-        // flush writes it.
-        let tools = servers
-            .iter()
-            .flat_map(crate::services::mcp::client::mcp_tools_for_server_snapshot)
-            .collect();
-        let state = crate::state::app_state_store::McpState {
-            clients: servers,
-            tools,
-            ..Default::default()
-        };
+        // Each server's attempt goes through the connection flush, which
+        // writes `mcp.tools`. Every status gets the tool, including ones CC
+        // never fetches tools for, so the connected-only gate in
+        // `build_mcp_server_statuses` is what the failed-server test checks.
+        let mut state = crate::state::app_state_store::McpState::default();
+        for server in servers {
+            crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
+                &mut state,
+                attempt(server, None),
+            );
+        }
         build_mcp_server_statuses(&state, &Default::default())
     }
 

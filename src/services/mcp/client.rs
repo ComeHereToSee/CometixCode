@@ -17,8 +17,8 @@ use super::elicitation_handler::{
     url_elicitation_required_result_message,
 };
 use super::types::{
-    McpClientSnapshot, McpPromptSnapshot, McpServerConnectionType, McpServerSnapshot,
-    McpToolSnapshot, ScopedMcpServerConfig, ServerResource, Transport,
+    McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, ScopedMcpServerConfig,
+    ServerResource, Transport,
 };
 use crate::state::app_state_store::McpState;
 #[cfg(test)]
@@ -555,75 +555,88 @@ fn truncate_mcp_description(description: Option<String>) -> String {
     }
 }
 
-fn server_tools_are_model_visible(status: McpServerConnectionType) -> bool {
-    matches!(
-        status,
-        McpServerConnectionType::Connected | McpServerConnectionType::NeedsAuth
-    )
-}
-
-/// Maps to: CC `services/mcp/client.ts` `isIncludedMcpTool(...)`.
-fn is_included_mcp_tool_full_name(full_tool_name: &str) -> bool {
+/// Maps to: CC `isIncludedMcpTool` (`client.ts:569-573`), which
+/// `fetchToolsForClient` applies to each finished tool (`:1990`), so to its
+/// final name.
+fn is_included_mcp_tool(tool: &crate::types::tools::Tool) -> bool {
     const ALLOWED_IDE_TOOLS: &[&str] = &["mcp__ide__executeCode", "mcp__ide__getDiagnostics"];
-    !full_tool_name.starts_with("mcp__ide__") || ALLOWED_IDE_TOOLS.contains(&full_tool_name)
+    !tool.name.starts_with("mcp__ide__") || ALLOWED_IDE_TOOLS.contains(&tool.name.as_str())
 }
 
-/// Projects only server-defined MCP tools. Resource helper tools are synced
-/// separately from the server capability bit so zero-resource servers remain
-/// capable. Callback-local helper injection belongs to discovery/reconnect,
-/// not to this raw server-tool projection.
-fn project_mcp_server_tools(
-    clients: &[super::types::McpServerSnapshot],
+/// Maps to: CC `fetchToolsForClient`'s `skipPrefix` (`client.ts:1761-1763`):
+/// an SDK server's tools keep their own names under
+/// `CLAUDE_AGENT_SDK_MCP_NO_PREFIX`.
+fn skips_mcp_tool_prefix(config: &ScopedMcpServerConfig) -> bool {
+    config.transport == Transport::Sdk
+        && crate::utils::env_utils::is_env_truthy(
+            crate::utils::process_env::var("CLAUDE_AGENT_SDK_MCP_NO_PREFIX").as_deref(),
+        )
+}
+
+/// Maps to: CC `fetchToolsForClient`'s per-tool map (`client.ts:1767-1988`):
+/// the server's tool as an `mcp.tools` entry. Resource helper tools are added
+/// by the discovery and reconnect callers, not here.
+fn mcp_tool_from_server_tool(
+    server_name: &str,
+    skip_prefix: bool,
+    tool: rmcp::model::Tool,
+) -> crate::types::tools::Tool {
+    let annotations = tool.annotations.unwrap_or_default();
+    let tool_name = tool.name.to_string();
+    let description = tool.description.map(|description| description.to_string());
+    crate::types::tools::Tool {
+        name: if skip_prefix {
+            tool_name.clone()
+        } else {
+            crate::services::mcp::mcp_string_utils::build_mcp_tool_name(server_name, &tool_name)
+        },
+        description: truncate_mcp_description(description.clone()),
+        input_schema: Value::Object((*tool.input_schema).clone()),
+        is_mcp: true,
+        // Maps to: CC `client.ts:1774` — populated for both prefixed and
+        // skip-prefix tools, so permission rule matching can rebuild the
+        // qualified name either way.
+        mcp_info: Some(crate::types::tools::McpToolInfo {
+            server_name: server_name.to_string(),
+            tool_name,
+        }),
+        // CC reads `tool.annotations?.title` only (`client.ts:1974`), not the
+        // tool's top-level `title`.
+        mcp_annotations: crate::types::tools::McpToolAnnotations {
+            title: annotations.title,
+            read_only_hint: annotations.read_only_hint.unwrap_or(false),
+            destructive_hint: annotations.destructive_hint.unwrap_or(false),
+            open_world_hint: annotations.open_world_hint.unwrap_or(false),
+        },
+        mcp_description: description.unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// Maps to: CC `fetchToolsForClient`'s result (`client.ts:1766-1990`): one
+/// `tools/list`'s tools, mapped and filtered by `isIncludedMcpTool`.
+fn mcp_tools_from_server_tools(
+    server_name: &str,
+    config: &ScopedMcpServerConfig,
+    tools: Vec<rmcp::model::Tool>,
 ) -> Vec<crate::types::tools::Tool> {
-    clients
-        .iter()
-        .filter(|server| server_tools_are_model_visible(server.client.status))
-        .flat_map(|server| {
-            server.tools.iter().filter_map(move |tool| {
-                let full_name = crate::services::mcp::mcp_string_utils::build_mcp_tool_name(
-                    &server.client.name,
-                    &tool.name,
-                );
-                is_included_mcp_tool_full_name(&full_name).then(|| {
-                    // Maps to: CC `fetchToolsForClient(...)` local `skipPrefix`
-                    // for SDK MCP servers gated by `CLAUDE_AGENT_SDK_MCP_NO_PREFIX`.
-                    let skip_prefix = server
-                        .config
-                        .as_ref()
-                        .is_some_and(|config| config.transport == Transport::Sdk)
-                        && crate::utils::env_utils::is_env_truthy(
-                            crate::utils::process_env::var("CLAUDE_AGENT_SDK_MCP_NO_PREFIX")
-                                .as_deref(),
-                        );
-                    crate::types::tools::Tool {
-                        name: if skip_prefix {
-                            tool.name.clone()
-                        } else {
-                            full_name
-                        },
-                        description: truncate_mcp_description(tool.description.clone()),
-                        input_schema: tool.input_schema.clone(),
-                        is_mcp: true,
-                        // Maps to: CC `client.ts:1774` — populated for both
-                        // prefixed and skip-prefix tools, so permission rule
-                        // matching can rebuild the qualified name either way.
-                        mcp_info: Some(crate::types::tools::McpToolInfo {
-                            server_name: server.client.name.clone(),
-                            tool_name: tool.name.clone(),
-                        }),
-                        mcp_annotations: crate::types::tools::McpToolAnnotations {
-                            title: tool.display_name.clone(),
-                            read_only_hint: tool.read_only_hint,
-                            destructive_hint: tool.destructive_hint,
-                            open_world_hint: tool.open_world_hint,
-                        },
-                        mcp_description: tool.description.clone().unwrap_or_default(),
-                        ..Default::default()
-                    }
-                })
-            })
-        })
+    let skip_prefix = skips_mcp_tool_prefix(config);
+    tools
+        .into_iter()
+        .map(|tool| mcp_tool_from_server_tool(server_name, skip_prefix, tool))
+        .filter(is_included_mcp_tool)
         .collect()
+}
+
+/// A server tool as `fetchToolsForClient` makes it, from the `tools/list`
+/// entry's JSON, for tests that need an `mcp.tools` entry.
+#[cfg(test)]
+pub(crate) fn mcp_tool_for_test(server_name: &str, tool: Value) -> crate::types::tools::Tool {
+    mcp_tool_from_server_tool(
+        server_name,
+        false,
+        serde_json::from_value(tool).expect("an MCP tool"),
+    )
 }
 
 /// Maps to: CC `options.hasPendingMCPServers` request option.
@@ -710,81 +723,88 @@ pub struct McpPromptCommandSnapshot {
     pub source: &'static str,
 }
 
-fn project_mcp_prompt_commands_from_clients(
-    clients: &[super::types::McpServerSnapshot],
-) -> Vec<McpPromptCommandSnapshot> {
-    clients
-        .iter()
-        .filter(|server| server.client.status == McpServerConnectionType::Connected)
-        .flat_map(|server| {
-            server.prompts.iter().map(move |prompt| {
-                let description = prompt.description.clone().unwrap_or_default();
-                McpPromptCommandSnapshot {
-                    name: mcp_prompt_command_name(&server.client.name, &prompt.name),
-                    description: description.clone(),
-                    has_user_specified_description: !description.is_empty(),
-                    user_facing_name: mcp_prompt_user_facing_name(
-                        &server.client.name,
-                        &prompt.name,
-                    ),
-                    arg_names: prompt.arg_names.clone(),
-                    source: "mcp",
-                }
-            })
-        })
-        .collect()
-}
-
-/// Projects one connection update into the API-visible flat tool array.
-pub(crate) fn mcp_tools_for_server_snapshot(
-    server: &super::types::McpServerSnapshot,
-) -> Vec<crate::types::tools::Tool> {
-    project_mcp_server_tools(std::slice::from_ref(server))
-}
-
-/// Projects one connection update into the shared flat command protocol.
-pub(crate) fn mcp_commands_for_server_snapshot(
-    server: &super::types::McpServerSnapshot,
-) -> Vec<crate::commands::Command> {
-    project_mcp_prompt_commands_from_clients(std::slice::from_ref(server))
-        .into_iter()
-        .map(crate::commands::Command::from_mcp_prompt)
-        .collect()
-}
-
-pub fn mcp_prompt_command_snapshot(
+/// Maps to: CC `fetchCommandsForClient`'s per-prompt map
+/// (`client.ts:2054-2097`): the server's prompt as an `mcp.commands` entry.
+fn mcp_command_from_server_prompt(
     server_name: &str,
-    prompt: &McpPromptSnapshot,
-) -> McpPromptCommandSnapshot {
-    let description = prompt.description.clone().unwrap_or_default();
-    McpPromptCommandSnapshot {
-        name: mcp_prompt_command_name(server_name, &prompt.name),
-        description: description.clone(),
+    prompt_name: &str,
+    description: Option<&str>,
+    arg_names: Vec<String>,
+) -> crate::commands::Command {
+    let description = description.unwrap_or_default().to_string();
+    let mut command = crate::commands::Command::from_mcp_prompt(McpPromptCommandSnapshot {
+        name: mcp_prompt_command_name(server_name, prompt_name),
+        // `!!prompt.description`.
         has_user_specified_description: !description.is_empty(),
-        user_facing_name: mcp_prompt_user_facing_name(server_name, &prompt.name),
-        arg_names: prompt.arg_names.clone(),
+        description,
+        user_facing_name: mcp_prompt_user_facing_name(server_name, prompt_name),
+        arg_names,
+        source: "mcp",
+    });
+    command.mcp_prompt = Some(crate::commands::McpPromptBinding {
+        server_name: server_name.to_string(),
+        prompt_name: prompt_name.to_string(),
+    });
+    command
+}
+
+/// A server prompt as `fetchCommandsForClient` makes it, for tests that need
+/// an `mcp.commands` entry.
+#[cfg(test)]
+pub(crate) fn mcp_command_for_test(
+    server_name: &str,
+    prompt_name: &str,
+    description: Option<&str>,
+    arg_names: &[&str],
+) -> crate::commands::Command {
+    mcp_command_from_server_prompt(
+        server_name,
+        prompt_name,
+        description,
+        arg_names.iter().map(|name| name.to_string()).collect(),
+    )
+}
+
+/// The prompt-command record of an `mcp.commands` entry.
+fn mcp_prompt_command_snapshot(command: &crate::commands::Command) -> McpPromptCommandSnapshot {
+    McpPromptCommandSnapshot {
+        name: command.name.to_string(),
+        description: command.description.to_string(),
+        has_user_specified_description: command.has_user_specified_description,
+        user_facing_name: crate::commands::get_command_name(command).to_string(),
+        arg_names: command
+            .arg_names
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
         source: "mcp",
     }
 }
 
-/// Resolves a slash-command-facing `mcp__server__prompt` command back to the
-/// live MCP client and raw prompt. Maps to CC `fetchCommandsForClient(...)`
-/// prompt command records consumed by `processPromptSlashCommand(...)`; each
-/// record closes over the `client` it was fetched from.
+/// Resolves a slash-command-facing `mcp__server__prompt` command to its
+/// `mcp.commands` record, the client it was fetched from and the server's own
+/// prompt name. Maps to CC's prompt command records, consumed by
+/// `processPromptSlashCommand(...)`; each closes over the `client` and
+/// `prompt.name` it was fetched with, and its `getPromptForCommand` goes
+/// through `ensureConnectedClient` whatever the client's status. The client
+/// is the record that holds the command's server name.
 pub fn resolve_mcp_prompt_command_invocation(
     full_command_name: &str,
     state: &McpState,
-) -> Option<(McpServerSnapshot, McpPromptSnapshot)> {
-    state
+) -> Option<(McpServerSnapshot, McpPromptCommandSnapshot, String)> {
+    let command = state.commands.iter().find(|command| {
+        command.kind == crate::commands::CommandKind::Prompt && command.name == full_command_name
+    })?;
+    let binding = command.mcp_prompt.as_ref()?;
+    let server = state
         .clients
         .iter()
-        .filter(|server| server.client.status == McpServerConnectionType::Connected)
-        .find_map(|server| {
-            server.prompts.iter().find_map(|prompt| {
-                let candidate = mcp_prompt_command_name(&server.client.name, &prompt.name);
-                (candidate == full_command_name).then(|| (server.clone(), prompt.clone()))
-            })
-        })
+        .find(|server| server.client.name == binding.server_name)?;
+    Some((
+        server.clone(),
+        mcp_prompt_command_snapshot(command),
+        binding.prompt_name.clone(),
+    ))
 }
 
 /// Maps to: CC `client.ts:161-170` `McpSessionExpiredError` — the server
@@ -830,42 +850,20 @@ pub fn mcp_prompt_content_blocks_summary(blocks: &[Value]) -> String {
         .join("\n")
 }
 
-/// Resolves a model-facing `mcp__server__tool` name back to the live raw MCP
-/// server/tool names. Maps to CC `buildMcpToolName(...)` + `mcpInfo` carried on
-/// dynamic MCP tools from `fetchToolsForClient(...)`.
+/// Resolves a model-facing MCP tool name to the server and the server's own
+/// tool name, through the `mcpInfo` CC's `fetchToolsForClient(...)` puts on
+/// each `mcp.tools` entry (`client.ts:1774`).
 pub fn resolve_mcp_tool_invocation(
     full_tool_name: &str,
     state: &McpState,
 ) -> Option<(String, String)> {
     state
-        .clients
+        .tools
         .iter()
-        .filter(|server| server_tools_are_model_visible(server.client.status))
-        .find_map(|server| {
-            server.tools.iter().find_map(move |tool| {
-                let full_name = crate::services::mcp::mcp_string_utils::build_mcp_tool_name(
-                    &server.client.name,
-                    &tool.name,
-                );
-                // Maps to: CC `fetchToolsForClient(...)` local `skipPrefix`
-                // for SDK MCP servers gated by `CLAUDE_AGENT_SDK_MCP_NO_PREFIX`.
-                let skip_prefix = server
-                    .config
-                    .as_ref()
-                    .is_some_and(|config| config.transport == Transport::Sdk)
-                    && crate::utils::env_utils::is_env_truthy(
-                        crate::utils::process_env::var("CLAUDE_AGENT_SDK_MCP_NO_PREFIX")
-                            .as_deref(),
-                    );
-                let candidate = if skip_prefix {
-                    tool.name.clone()
-                } else {
-                    full_name.clone()
-                };
-                (candidate == full_tool_name && is_included_mcp_tool_full_name(&full_name))
-                    .then(|| (server.client.name.clone(), tool.name.clone()))
-            })
-        })
+        .find(|tool| tool.is_mcp && tool.name == full_tool_name)?
+        .mcp_info
+        .as_ref()
+        .map(|info| (info.server_name.clone(), info.tool_name.clone()))
 }
 
 /// Maps to the callback result of getMcpToolsCommandsAndResources and
@@ -879,13 +877,15 @@ pub struct McpConnectionDiscovery {
     pub resources: Option<Vec<super::types::ServerResource>>,
 }
 
+/// A connection with nothing fetched from it: CC's
+/// `onConnectionAttempt({ client, tools: [], commands: [] })`.
 impl From<McpServerSnapshot> for McpConnectionDiscovery {
     fn from(server: McpServerSnapshot) -> Self {
         Self {
-            tools: mcp_tools_for_server_snapshot(&server),
-            commands: mcp_commands_for_server_snapshot(&server),
-            resources: (!server.resources.is_empty()).then(|| server.resources.clone()),
             server,
+            tools: Vec::new(),
+            commands: Vec::new(),
+            resources: None,
         }
     }
 }
@@ -959,9 +959,6 @@ impl McpConnectionDiscovery {
             },
             config: Some(config.clone()),
             supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         })
     }
 
@@ -980,9 +977,6 @@ impl McpConnectionDiscovery {
             },
             config: None,
             supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         })
     }
 
@@ -1005,9 +999,6 @@ impl McpConnectionDiscovery {
             },
             config: Some(config.clone()),
             supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         })
     }
 
@@ -1030,9 +1021,6 @@ impl McpConnectionDiscovery {
             },
             config: Some(config.clone()),
             supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         })
     }
 
@@ -1040,10 +1028,10 @@ impl McpConnectionDiscovery {
     /// the connection plus `createMcpAuthTool(name, config)`.
     pub fn needs_auth(name: impl Into<String>, config: &ScopedMcpServerConfig) -> Self {
         let name = name.into();
-        let mut server = needs_auth_connection(&name, config);
-        server.tools =
-            vec![crate::tools::mcp_auth_tool::create_mcp_auth_tool(&name, config).snapshot()];
-        Self::from(server)
+        let mut discovery = Self::from(needs_auth_connection(&name, config));
+        discovery.tools =
+            vec![crate::tools::mcp_auth_tool::create_mcp_auth_tool(&name, config).tool()];
+        discovery
     }
 }
 
@@ -1063,9 +1051,6 @@ fn needs_auth_connection(name: &str, config: &ScopedMcpServerConfig) -> McpServe
         },
         config: Some(config.clone()),
         supports_resources: false,
-        tools: Vec::new(),
-        prompts: Vec::new(),
-        resources: Vec::new(),
     }
 }
 
@@ -3089,32 +3074,21 @@ mod runtime {
         })
     }
 
-    pub(super) fn tool_snapshot(tool: rmcp::model::Tool) -> McpToolSnapshot {
-        let annotations = tool.annotations.clone().unwrap_or_default();
-        McpToolSnapshot {
-            name: tool.name.to_string(),
-            // CC reads `tool.annotations?.title` only (`client.ts:1974`), not
-            // the tool's top-level `title`.
-            display_name: annotations.title,
-            description: tool.description.map(|value| value.to_string()),
-            input_schema: Value::Object((*tool.input_schema).clone()),
-            read_only_hint: annotations.read_only_hint.unwrap_or(false),
-            destructive_hint: annotations.destructive_hint.unwrap_or(false),
-            open_world_hint: annotations.open_world_hint.unwrap_or(false),
-        }
-    }
-
-    fn prompt_snapshot(prompt: rmcp::model::Prompt) -> McpPromptSnapshot {
-        McpPromptSnapshot {
-            name: prompt.name,
-            description: prompt.description,
-            arg_names: prompt
-                .arguments
-                .unwrap_or_default()
-                .into_iter()
-                .map(|argument| argument.name)
-                .collect(),
-        }
+    /// `fetchCommandsForClient`'s map over one `prompts/list` entry; `argNames`
+    /// is `Object.values(prompt.arguments ?? {}).map(k => k.name)`.
+    fn prompt_command(server_name: &str, prompt: rmcp::model::Prompt) -> crate::commands::Command {
+        let arg_names = prompt
+            .arguments
+            .unwrap_or_default()
+            .into_iter()
+            .map(|argument| argument.name)
+            .collect();
+        mcp_command_from_server_prompt(
+            server_name,
+            &prompt.name,
+            prompt.description.as_deref(),
+            arg_names,
+        )
     }
 
     /// Maps to: CC `client.ts:2017-2020` — the map inside
@@ -3257,11 +3231,11 @@ mod runtime {
     }
 
     /// Maps to: CC `client.ts:1743` `fetchToolsForClient`.
-    static FETCH_TOOLS_FOR_CLIENT: LazyLock<FetchForClient<McpToolSnapshot>> =
+    static FETCH_TOOLS_FOR_CLIENT: LazyLock<FetchForClient<crate::types::tools::Tool>> =
         LazyLock::new(|| memoize_fetch(fetch_tools));
 
     /// Maps to: CC `client.ts:2033` `fetchCommandsForClient`.
-    static FETCH_COMMANDS_FOR_CLIENT: LazyLock<FetchForClient<McpPromptSnapshot>> =
+    static FETCH_COMMANDS_FOR_CLIENT: LazyLock<FetchForClient<crate::commands::Command>> =
         LazyLock::new(|| memoize_fetch(fetch_commands));
 
     /// Maps to: CC `client.ts:2000` `fetchResourcesForClient`.
@@ -3322,7 +3296,7 @@ mod runtime {
 
     /// Maps to: CC `client.ts:1743-1998` `fetchToolsForClient`'s request: one
     /// `tools/list`, no cursor; a failure is logged and yields `[]`.
-    async fn fetch_tools(client: McpFetchClient) -> Vec<McpToolSnapshot> {
+    async fn fetch_tools(client: McpFetchClient) -> Vec<crate::types::tools::Tool> {
         if !client
             .peer
             .peer_info()
@@ -3337,7 +3311,7 @@ mod runtime {
         });
         match request_with_default_timeout(&client.peer, request).await {
             Ok(rmcp::model::ServerResult::ListToolsResult(result)) => {
-                result.tools.into_iter().map(tool_snapshot).collect()
+                mcp_tools_from_server_tools(&client.name, &client.config, result.tools)
             }
             Ok(_) => {
                 tracing::warn!(server = %client.name, "unexpected response to MCP tools/list");
@@ -3389,7 +3363,7 @@ mod runtime {
 
     /// Maps to: CC `client.ts:2033-2107` `fetchCommandsForClient`'s request:
     /// one `prompts/list`.
-    async fn fetch_commands(client: McpFetchClient) -> Vec<McpPromptSnapshot> {
+    async fn fetch_commands(client: McpFetchClient) -> Vec<crate::commands::Command> {
         if !client
             .peer
             .peer_info()
@@ -3404,9 +3378,11 @@ mod runtime {
                 extensions: Default::default(),
             });
         match request_with_default_timeout(&client.peer, request).await {
-            Ok(rmcp::model::ServerResult::ListPromptsResult(result)) => {
-                result.prompts.into_iter().map(prompt_snapshot).collect()
-            }
+            Ok(rmcp::model::ServerResult::ListPromptsResult(result)) => result
+                .prompts
+                .into_iter()
+                .map(|prompt| prompt_command(&client.name, prompt))
+                .collect(),
             Ok(_) => {
                 tracing::warn!(server = %client.name, "unexpected response to MCP prompts/list");
                 Vec::new()
@@ -3421,16 +3397,19 @@ mod runtime {
     }
 
     /// Maps to: CC `client.ts:1743` `fetchToolsForClient(client)`.
-    pub async fn fetch_tools_for_client(client: &McpServerSnapshot) -> Vec<McpToolSnapshot> {
+    pub async fn fetch_tools_for_client(
+        client: &McpServerSnapshot,
+    ) -> Vec<crate::types::tools::Tool> {
         let Some(client) = McpFetchClient::connected(client) else {
             return Vec::new();
         };
         fetch_through_cache(&FETCH_TOOLS_FOR_CLIENT, client, fetch_tools).await
     }
 
-    /// Maps to: CC `client.ts:2033` `fetchCommandsForClient(client)`. Cometix
-    /// keeps the prompts; the commands are projected from them.
-    pub async fn fetch_commands_for_client(client: &McpServerSnapshot) -> Vec<McpPromptSnapshot> {
+    /// Maps to: CC `client.ts:2033` `fetchCommandsForClient(client)`.
+    pub async fn fetch_commands_for_client(
+        client: &McpServerSnapshot,
+    ) -> Vec<crate::commands::Command> {
         let Some(client) = McpFetchClient::connected(client) else {
             return Vec::new();
         };
@@ -3448,7 +3427,9 @@ mod runtime {
     /// Maps to: CC `fetchToolsForClient.cache.delete(client.name);
     /// fetchToolsForClient(client)` in the `tools/list_changed` handler
     /// (`useManageMCPConnections.ts:631-632`).
-    pub async fn refresh_mcp_tools_for_client(name: &str) -> anyhow::Result<Vec<McpToolSnapshot>> {
+    pub async fn refresh_mcp_tools_for_client(
+        name: &str,
+    ) -> anyhow::Result<Vec<crate::types::tools::Tool>> {
         let client = McpFetchClient::registered(name)?;
         FETCH_TOOLS_FOR_CLIENT.cache.delete(name);
         Ok(fetch_through_cache(&FETCH_TOOLS_FOR_CLIENT, client, fetch_tools).await)
@@ -3459,7 +3440,7 @@ mod runtime {
     /// (`useManageMCPConnections.ts:681-683`).
     pub async fn refresh_mcp_prompts_for_client(
         name: &str,
-    ) -> anyhow::Result<Vec<McpPromptSnapshot>> {
+    ) -> anyhow::Result<Vec<crate::commands::Command>> {
         let client = McpFetchClient::registered(name)?;
         FETCH_COMMANDS_FOR_CLIENT.cache.delete(name);
         Ok(fetch_through_cache(&FETCH_COMMANDS_FOR_CLIENT, client, fetch_commands).await)
@@ -4088,9 +4069,6 @@ mod runtime {
             },
             config: Some(config),
             supports_resources,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         }
     }
 
@@ -4157,7 +4135,7 @@ mod runtime {
                             service,
                             false,
                         );
-                        let mut server = McpServerSnapshot {
+                        let server = McpServerSnapshot {
                             connection_id: Some(connection_id),
                             client: McpClientSnapshot {
                                 name,
@@ -4170,29 +4148,34 @@ mod runtime {
                             },
                             config: Some(connected_config),
                             supports_resources,
-                            tools: Vec::new(),
-                            prompts: Vec::new(),
-                            resources: Vec::new(),
                         };
                         // CC `fetchToolsForClient(connectedClient)` when the
-                        // server has tools.
-                        if has_tools {
-                            server.tools = fetch_tools_for_client(&server).await;
-                        }
-                        server
+                        // server has tools (`client.ts:3312-3317`).
+                        let tools = if has_tools {
+                            fetch_tools_for_client(&server).await
+                        } else {
+                            Vec::new()
+                        };
+                        (server, tools)
                     }
                     Err(error) => {
                         tracing::warn!(error = %error, server = %name, "failed to connect SDK MCP server");
                         let mut failed_config = config.clone();
                         failed_config.scope = crate::services::mcp::types::ConfigScope::User;
-                        McpConnectionDiscovery::failed(name, &failed_config, error.to_string())
-                            .server
+                        let server =
+                            McpConnectionDiscovery::failed(name, &failed_config, error.to_string())
+                                .server;
+                        (server, Vec::new())
                     }
                 }
             }
         })).await;
-        let tools = project_mcp_server_tools(&clients);
-        SdkMcpClientsSetup { clients, tools }
+        // CC `:3338-3343`: every client, and every client's tools.
+        let (clients, tools): (Vec<_>, Vec<_>) = clients.into_iter().unzip();
+        SdkMcpClientsSetup {
+            clients,
+            tools: tools.into_iter().flatten().collect(),
+        }
     }
 
     /// Maps to: CC `client.ts:2137-2210` `reconnectMcpServerImpl`: clear the
@@ -4204,14 +4187,15 @@ mod runtime {
         // Re-read credentials another process may have changed.
         crate::utils::secure_storage::mac_os_keychain_helpers::clear_keychain_cache();
         clear_server_cache(name, Some(config)).await;
-        let mut client = connect_to_server(name, config).await;
-        if client.client.status == McpServerConnectionType::Connected {
+        let client = connect_to_server(name, config).await;
+        let mut result = if client.client.status == McpServerConnectionType::Connected {
             if config.transport == Transport::ClaudeAiProxy {
                 mark_claude_ai_mcp_connected(name);
             }
-            fetch_connected_capabilities(&mut client).await;
-        }
-        let mut result = McpConnectionDiscovery::from(client);
+            fetch_connected_capabilities(client).await
+        } else {
+            McpConnectionDiscovery::from(client)
+        };
         result.add_reconnect_resource_tools();
         result
     }
@@ -4219,22 +4203,25 @@ mod runtime {
     /// The fetches CC's `processServer` (`client.ts:2344-2355`) and
     /// `reconnectMcpServerImpl` (`:2171-2178`) both make for a connected
     /// client: tools and prompts, and resources when it supports them.
-    async fn fetch_connected_capabilities(client: &mut McpServerSnapshot) {
-        let supports_resources = client.supports_resources;
-        let (tools, prompts, resources) = tokio::join!(
-            fetch_tools_for_client(client),
-            fetch_commands_for_client(client),
+    async fn fetch_connected_capabilities(client: McpServerSnapshot) -> McpConnectionDiscovery {
+        let (tools, commands, resources) = tokio::join!(
+            fetch_tools_for_client(&client),
+            fetch_commands_for_client(&client),
             async {
-                if supports_resources {
-                    fetch_resources_for_client(client).await
+                if client.supports_resources {
+                    fetch_resources_for_client(&client).await
                 } else {
                     Vec::new()
                 }
             },
         );
-        client.tools = tools;
-        client.prompts = prompts;
-        client.resources = resources;
+        McpConnectionDiscovery {
+            server: client,
+            tools,
+            commands,
+            // `resources.length > 0 ? resources : undefined` (`:2197`, `:2370`).
+            resources: (!resources.is_empty()).then_some(resources),
+        }
     }
 
     /// Maps to: CC `markClaudeAiMcpConnected(name)`; a failed config write is
@@ -4258,14 +4245,13 @@ mod runtime {
         {
             return McpConnectionDiscovery::needs_auth(name, &config);
         }
-        let mut client = connect_to_server(&name, &config).await;
+        let client = connect_to_server(&name, &config).await;
         match client.client.status {
             McpServerConnectionType::Connected => {
                 if config.transport == Transport::ClaudeAiProxy {
                     mark_claude_ai_mcp_connected(&name);
                 }
-                fetch_connected_capabilities(&mut client).await;
-                McpConnectionDiscovery::from(client)
+                fetch_connected_capabilities(client).await
             }
             McpServerConnectionType::NeedsAuth => McpConnectionDiscovery::needs_auth(name, &config),
             _ => McpConnectionDiscovery::from(client),
@@ -5320,13 +5306,43 @@ mod tests {
         (format!("http://{address}"), worker)
     }
 
-    fn state_with_clients(clients: Vec<McpServerSnapshot>) -> McpState {
-        let mut state = McpState {
-            clients,
-            ..McpState::default()
-        };
-        refresh_flat_mcp_capabilities(&mut state);
+    /// `AppState.mcp` after each update went through the connection flush.
+    fn state_with_clients<T>(updates: Vec<T>) -> McpState
+    where
+        T: Into<crate::services::mcp::use_manage_mcp_connections::McpPendingUpdate>,
+    {
+        let mut state = McpState::default();
+        for update in updates {
+            crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
+                &mut state, update,
+            );
+        }
         state
+    }
+
+    /// A connected server's connection attempt with what was fetched from it.
+    fn connected_attempt(
+        name: &str,
+        tools: Vec<crate::types::tools::Tool>,
+        commands: Vec<crate::commands::Command>,
+    ) -> McpConnectionDiscovery {
+        let mut attempt = McpConnectionDiscovery::from(McpServerSnapshot {
+            connection_id: None,
+            client: McpClientSnapshot {
+                name: name.to_string(),
+                status: McpServerConnectionType::Connected,
+                reconnect_attempt: None,
+                max_reconnect_attempts: None,
+                ide_name: None,
+                server_version: None,
+                error: None,
+            },
+            config: None,
+            supports_resources: false,
+        });
+        attempt.tools = tools;
+        attempt.commands = commands;
+        attempt
     }
 
     #[test]
@@ -5758,48 +5774,17 @@ mod tests {
     #[test]
     fn connection_update_writes_flat_mcp_commands_for_connected_clients() {
         let state = state_with_clients(vec![
-            McpServerSnapshot {
-                connection_id: None,
-                client: McpClientSnapshot {
-                    name: "docs".to_string(),
-                    status: McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: vec![McpPromptSnapshot {
-                    name: "summarize".to_string(),
-                    description: Some("Summarize docs".to_string()),
-                    arg_names: vec!["path".to_string()],
-                }],
-                resources: Vec::new(),
-            },
-            McpServerSnapshot {
-                connection_id: None,
-                client: McpClientSnapshot {
-                    name: "pending".to_string(),
-                    status: McpServerConnectionType::Pending,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: vec![McpPromptSnapshot {
-                    name: "hidden".to_string(),
-                    description: None,
-                    arg_names: Vec::new(),
-                }],
-                resources: Vec::new(),
-            },
+            connected_attempt(
+                "docs",
+                Vec::new(),
+                vec![mcp_command_for_test(
+                    "docs",
+                    "summarize",
+                    Some("Summarize docs"),
+                    &["path"],
+                )],
+            ),
+            McpConnectionDiscovery::pending("pending"),
         ]);
 
         assert_eq!(state.commands.len(), 1);
@@ -5815,22 +5800,60 @@ mod tests {
             state.commands[0].source,
             crate::commands::CommandSource::Mcp
         );
-        let (server, prompt) =
+        let (server, command, prompt_name) =
             resolve_mcp_prompt_command_invocation("mcp__docs__summarize", &state)
                 .expect("the prompt resolves");
         assert_eq!(server.client.name, "docs");
-        assert_eq!(
-            prompt,
-            McpPromptSnapshot {
-                name: "summarize".to_string(),
-                description: Some("Summarize docs".to_string()),
-                arg_names: vec!["path".to_string()],
-            }
+        assert_eq!(prompt_name, "summarize");
+        assert_eq!(command.arg_names, vec!["path".to_string()]);
+        assert_eq!(command.user_facing_name, "docs:summarize (MCP)");
+
+        // A reconnecting server keeps its commands (CC's flush only replaces
+        // a dimension the update supplies), and the command still resolves to
+        // the server it was fetched from, now pending.
+        let mut state = state;
+        crate::services::mcp::use_manage_mcp_connections::apply_mcp_client_update(
+            &mut state,
+            McpConnectionDiscovery::pending("docs").server,
         );
-        assert_eq!(
-            resolve_mcp_prompt_command_invocation("mcp__pending__hidden", &state),
-            None
-        );
+        assert_eq!(state.commands.len(), 1);
+        let (server, _, prompt_name) =
+            resolve_mcp_prompt_command_invocation("mcp__docs__summarize", &state)
+                .expect("the prompt still resolves while the server reconnects");
+        assert_eq!(server.client.name, "docs");
+        assert_eq!(server.client.status, McpServerConnectionType::Pending);
+        assert_eq!(prompt_name, "summarize");
+    }
+
+    #[test]
+    fn prompt_commands_resolve_through_their_binding_not_their_name() {
+        // CC's prompt command closes over its client and `prompt.name`, so
+        // nothing is parsed back out of `mcp__<server>__<prompt>`: a server
+        // name containing `__` or one that normalization rewrites still
+        // resolves to its own server and prompt.
+        let state = state_with_clients(vec![
+            connected_attempt(
+                "a__b",
+                Vec::new(),
+                vec![mcp_command_for_test("a__b", "x__y", None, &[])],
+            ),
+            connected_attempt(
+                "My Server",
+                Vec::new(),
+                vec![mcp_command_for_test("My Server", "report", None, &[])],
+            ),
+        ]);
+
+        let (server, _, prompt_name) =
+            resolve_mcp_prompt_command_invocation("mcp__a__b__x__y", &state)
+                .expect("server a__b's prompt resolves");
+        assert_eq!(server.client.name, "a__b");
+        assert_eq!(prompt_name, "x__y");
+        let (server, _, prompt_name) =
+            resolve_mcp_prompt_command_invocation("mcp__My_Server__report", &state)
+                .expect("the normalized server's prompt resolves");
+        assert_eq!(server.client.name, "My Server");
+        assert_eq!(prompt_name, "report");
     }
 
     #[test]
@@ -5838,7 +5861,9 @@ mod tests {
         let mut server = McpConnectionDiscovery::pending("empty-resources").server;
         server.client.status = McpServerConnectionType::Connected;
         server.supports_resources = true;
-        let state = state_with_clients(vec![server]);
+        let mut discovery = McpConnectionDiscovery::from(server);
+        discovery.add_discovery_resource_tools(&std::sync::atomic::AtomicBool::new(false));
+        let state = state_with_clients(vec![discovery]);
         let names = state
             .tools
             .iter()
@@ -5870,48 +5895,20 @@ mod tests {
     #[test]
     fn runtime_mcp_state_projects_model_tools_and_resolves_raw_invocation() {
         let state = state_with_clients(vec![
-            McpServerSnapshot {
-                connection_id: None,
-                client: McpClientSnapshot {
-                    name: "GitHub Server".to_string(),
-                    status: McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: Some("1.0.0".to_string()),
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-                tools: vec![McpToolSnapshot {
-                    name: "Create Issue".to_string(),
-                    display_name: Some("Create Issue".to_string()),
-                    description: Some("Create a GitHub issue".to_string()),
-                    input_schema: serde_json::json!({"type":"object"}),
-                    read_only_hint: false,
-                    destructive_hint: false,
-                    open_world_hint: true,
-                }],
-                prompts: Vec::new(),
-                resources: Vec::new(),
-            },
-            McpServerSnapshot {
-                connection_id: None,
-                client: McpClientSnapshot {
-                    name: "pending".to_string(),
-                    status: McpServerConnectionType::Pending,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
-            },
+            connected_attempt(
+                "GitHub Server",
+                vec![mcp_tool_for_test(
+                    "GitHub Server",
+                    serde_json::json!({
+                        "name": "Create Issue",
+                        "description": "Create a GitHub issue",
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"title": "Create Issue", "openWorldHint": true}
+                    }),
+                )],
+                Vec::new(),
+            ),
+            McpConnectionDiscovery::pending("pending"),
         ]);
 
         let tools = &state.tools;
@@ -6075,8 +6072,6 @@ mod tests {
             client.config.as_ref().map(|config| config.scope),
             Some(crate::services::mcp::types::ConfigScope::Dynamic)
         );
-        assert_eq!(client.tools.len(), 1);
-        assert_eq!(client.tools[0].name, "echo");
         // CC `ensureConnectedClient` returns an SDK client as it is
         // (`client.ts:1692-1694`).
         assert_eq!(
@@ -6138,36 +6133,30 @@ mod tests {
             id: None,
             plugin_source: None,
         };
-        let mut state = state_with_clients(vec![McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: "sdk server".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: Some("1.0.0".to_string()),
-                error: None,
-            },
-            config: Some(sdk_config),
-            supports_resources: false,
-            tools: vec![McpToolSnapshot {
-                name: "Read".to_string(),
-                display_name: None,
-                description: Some("SDK read".to_string()),
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            }],
-            prompts: Vec::new(),
-            resources: Vec::new(),
-        }]);
+        // One `tools/list` entry, mapped as `fetchToolsForClient` maps it.
+        let fetched = || {
+            mcp_tools_from_server_tools(
+                "sdk server",
+                &sdk_config,
+                vec![
+                    serde_json::from_value(serde_json::json!({
+                        "name": "Read",
+                        "description": "SDK read",
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"readOnlyHint": true}
+                    }))
+                    .unwrap(),
+                ],
+            )
+        };
+        let state_with_tools = |tools| McpState {
+            tools,
+            ..McpState::default()
+        };
 
         let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let key = "CLAUDE_AGENT_SDK_MCP_NO_PREFIX";
         let _prefix = EnvVarGuard::unset(key);
-        refresh_flat_mcp_capabilities(&mut state);
 
         // Maps to: CC `client.ts:1774` — `mcpInfo` holds the unnormalized server
         // and tool names and is set regardless of `skipPrefix`.
@@ -6176,7 +6165,8 @@ mod tests {
             tool_name: "Read".to_string(),
         });
 
-        let prefixed = state.tools.clone();
+        let prefixed = fetched();
+        let state = state_with_tools(prefixed.clone());
         assert_eq!(prefixed[0].name, "mcp__sdk_server__Read");
         assert_eq!(prefixed[0].mcp_info, expected_mcp_info);
         assert_eq!(
@@ -6185,8 +6175,8 @@ mod tests {
         );
 
         crate::utils::process_env::set(key, "1");
-        refresh_flat_mcp_capabilities(&mut state);
-        let unprefixed = state.tools.clone();
+        let unprefixed = fetched();
+        let state = state_with_tools(unprefixed.clone());
         assert_eq!(unprefixed[0].name, "Read");
         assert_eq!(unprefixed[0].mcp_info, expected_mcp_info);
         assert_eq!(
@@ -6204,51 +6194,41 @@ mod tests {
 
     #[test]
     fn ide_mcp_tools_are_filtered_like_official_fetch_tools_for_client() {
-        let state = state_with_clients(vec![McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: "ide".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: Some("IDE".to_string()),
-                server_version: Some("1.0.0".to_string()),
-                error: None,
-            },
-            config: None,
-            supports_resources: false,
-            tools: vec![
-                McpToolSnapshot {
-                    name: "executeCode".to_string(),
-                    display_name: None,
-                    description: Some("Execute code".to_string()),
-                    input_schema: serde_json::json!({"type":"object"}),
-                    read_only_hint: false,
-                    destructive_hint: false,
-                    open_world_hint: false,
-                },
-                McpToolSnapshot {
-                    name: "getDiagnostics".to_string(),
-                    display_name: None,
-                    description: Some("Get diagnostics".to_string()),
-                    input_schema: serde_json::json!({"type":"object"}),
-                    read_only_hint: true,
-                    destructive_hint: false,
-                    open_world_hint: false,
-                },
-                McpToolSnapshot {
-                    name: "openFile".to_string(),
-                    display_name: None,
-                    description: Some("Open file".to_string()),
-                    input_schema: serde_json::json!({"type":"object"}),
-                    read_only_hint: true,
-                    destructive_hint: false,
-                    open_world_hint: false,
-                },
-            ],
-            prompts: Vec::new(),
-            resources: Vec::new(),
-        }]);
+        let config = ScopedMcpServerConfig {
+            name: None,
+            scope: crate::services::mcp::types::ConfigScope::Dynamic,
+            transport: Transport::SseIde,
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: Some("http://127.0.0.1:1/sse".to_string()),
+            headers: BTreeMap::new(),
+            headers_helper: None,
+            oauth: None,
+            ide_running_in_windows: None,
+            ide_name: Some("IDE".to_string()),
+            auth_token: None,
+            id: None,
+            plugin_source: None,
+        };
+        let tool = |name: &str| {
+            serde_json::from_value::<rmcp::model::Tool>(
+                serde_json::json!({"name": name, "inputSchema": {"type": "object"}}),
+            )
+            .unwrap()
+        };
+        let state = McpState {
+            tools: mcp_tools_from_server_tools(
+                "ide",
+                &config,
+                vec![
+                    tool("executeCode"),
+                    tool("getDiagnostics"),
+                    tool("openFile"),
+                ],
+            ),
+            ..McpState::default()
+        };
 
         let tools = state
             .tools
@@ -6293,7 +6273,7 @@ mod tests {
             plugin_source: None,
         };
         let discovery = McpConnectionDiscovery::needs_auth("docs", &config);
-        let state = state_with_clients(vec![discovery.server]);
+        let state = state_with_clients(vec![discovery]);
 
         let tools = &state.tools;
         assert_eq!(tools.len(), 1);
@@ -6741,8 +6721,7 @@ rl.on('line', line => {
                     discovery.server.client.status,
                     McpServerConnectionType::Connected
                 );
-                assert_eq!(discovery.server.tools.len(), 1);
-                assert_eq!(discovery.server.tools[0].name, "login");
+                assert_eq!(tool_names(&discovery.tools), vec!["login"]);
 
                 let call = tokio::spawn(async {
                     runtime::call_mcp_tool(SERVER, "login", Map::new()).await
@@ -6797,8 +6776,16 @@ rl.on('line', line => {
         runtime::registered_connection_id(name)
     }
 
-    fn tool_names(tools: &[McpToolSnapshot]) -> Vec<&str> {
-        tools.iter().map(|tool| tool.name.as_str()).collect()
+    /// The server's own names of fetched MCP tools (`mcpInfo.toolName`).
+    fn tool_names(tools: &[crate::types::tools::Tool]) -> Vec<&str> {
+        tools
+            .iter()
+            .map(|tool| {
+                tool.mcp_info
+                    .as_ref()
+                    .map_or(tool.name.as_str(), |info| info.tool_name.as_str())
+            })
+            .collect()
     }
 
     /// CC `connectToServer` is memoized by `getServerCacheKey(name,
@@ -6827,7 +6814,6 @@ rl.on('line', line => {
             assert_eq!(third.connection_id, first.connection_id);
             assert_eq!(registered_connection_id(SERVER), first.connection_id);
             assert_eq!(fixture.count("initialize"), 1);
-            assert!(first.tools.is_empty());
             assert_eq!(fixture.count("tools/list"), 0);
 
             runtime::clear_server_cache(SERVER, Some(&config)).await;
@@ -7349,7 +7335,7 @@ rl.on('line', line => {
                     discovery.server.client.status,
                     McpServerConnectionType::Connected
                 );
-                assert_eq!(discovery.server.tools[0].name, "first");
+                assert_eq!(tool_names(&discovery.tools), vec!["first"]);
 
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
@@ -7368,8 +7354,7 @@ rl.on('line', line => {
                 let refreshed = runtime::refresh_mcp_tools_for_client(SERVER)
                     .await
                     .expect("tools refresh should use the connected peer");
-                assert_eq!(refreshed.len(), 1);
-                assert_eq!(refreshed[0].name, "second");
+                assert_eq!(tool_names(&refreshed), vec!["second"]);
                 runtime::clear_server_cache(SERVER, None).await;
                 let _ = runtime::drain_mcp_connection_callback_observations().await;
             });
@@ -7485,8 +7470,14 @@ rl.on('line', line => {
                     discovery.server.client.status,
                     McpServerConnectionType::Connected
                 );
-                assert_eq!(discovery.server.prompts[0].name, "first_prompt");
-                assert_eq!(discovery.server.resources[0].name, "first_resource");
+                assert_eq!(
+                    discovery.commands[0].name,
+                    mcp_prompt_command_name(SERVER, "first_prompt")
+                );
+                assert_eq!(
+                    discovery.resources.as_ref().expect("resources")[0].name,
+                    "first_resource"
+                );
 
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     let mut saw_prompts = false;
@@ -7518,7 +7509,10 @@ rl.on('line', line => {
                     .await
                     .expect("prompts refresh should use the connected peer");
                 assert_eq!(refreshed_prompts.len(), 1);
-                assert_eq!(refreshed_prompts[0].name, "second_prompt");
+                assert_eq!(
+                    refreshed_prompts[0].name,
+                    mcp_prompt_command_name(SERVER, "second_prompt")
+                );
                 assert_eq!(refreshed_prompts[0].arg_names, vec!["topic"]);
 
                 let refreshed_resources = runtime::refresh_mcp_resources_for_client(SERVER)
@@ -7633,8 +7627,9 @@ rl.on('line', line => {
                     discovery.server.client.status,
                     McpServerConnectionType::Connected
                 );
-                assert_eq!(discovery.server.resources.len(), 1);
-                assert_eq!(discovery.server.resources[0].uri, uri);
+                let resources = discovery.resources.as_ref().expect("resources");
+                assert_eq!(resources.len(), 1);
+                assert_eq!(resources[0].uri, uri);
 
                 let value = runtime::read_mcp_resource(SERVER, None, uri)
                     .await
@@ -7724,7 +7719,8 @@ rl.on('line', line => {
                     discovery.server.client.status,
                     McpServerConnectionType::Connected
                 );
-                assert!(discovery.server.resources.is_empty());
+                // `resources.length > 0 ? resources : undefined`.
+                assert!(discovery.resources.is_none());
 
                 let error = runtime::read_mcp_resource(SERVER, None, "file:///tmp/missing.txt")
                     .await
@@ -7826,9 +7822,12 @@ rl.on('line', line => {
                 discovery.server.client.status,
                 McpServerConnectionType::Connected
             );
-            assert_eq!(discovery.server.prompts.len(), 1);
-            assert_eq!(discovery.server.prompts[0].name, "daily");
-            assert_eq!(discovery.server.prompts[0].arg_names, vec!["topic"]);
+            assert_eq!(discovery.commands.len(), 1);
+            assert_eq!(
+                discovery.commands[0].name,
+                mcp_prompt_command_name(SERVER, "daily")
+            );
+            assert_eq!(discovery.commands[0].arg_names, vec!["topic"]);
 
             let blocks = runtime::get_mcp_prompt_for_command(
                 &discovery.server,
@@ -7993,12 +7992,8 @@ rl.on('line', line => {
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.server.client.server_version.as_deref(), Some("1.0.0"));
-                assert_eq!(discovery.server.tools.len(), 1);
-                assert_eq!(discovery.server.tools[0].name, "lookup");
-                assert_eq!(
-                    discovery.server.tools[0].description.as_deref(),
-                    Some("Lookup docs over HTTP MCP")
-                );
+                assert_eq!(tool_names(&discovery.tools), vec!["lookup"]);
+                assert_eq!(discovery.tools[0].mcp_description, "Lookup docs over HTTP MCP");
                 assert_eq!(discovery.server.config.as_ref().unwrap().transport, Transport::Http);
                 runtime::clear_server_cache(SERVER, None).await;
                 let _requests = server.await.expect("fixture server task");
@@ -8182,12 +8177,8 @@ rl.on('line', line => {
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.server.client.server_version.as_deref(), Some("1.0.0"));
-                assert_eq!(discovery.server.tools.len(), 1);
-                assert_eq!(discovery.server.tools[0].name, "search");
-                assert_eq!(
-                    discovery.server.tools[0].description.as_deref(),
-                    Some("Search docs over SSE MCP")
-                );
+                assert_eq!(tool_names(&discovery.tools), vec!["search"]);
+                assert_eq!(discovery.tools[0].mcp_description, "Search docs over SSE MCP");
                 assert_eq!(discovery.server.config.as_ref().unwrap().transport, Transport::Sse);
                 runtime::clear_server_cache(SERVER, None).await;
                 let _requests = server.await.expect("fixture server task");
@@ -8346,11 +8337,10 @@ rl.on('line', line => {
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.server.client.server_version.as_deref(), Some("1.0.0"));
-                assert_eq!(discovery.server.tools.len(), 1);
-                assert_eq!(discovery.server.tools[0].name, "inspect");
+                assert_eq!(tool_names(&discovery.tools), vec!["inspect"]);
                 assert_eq!(
-                    discovery.server.tools[0].description.as_deref(),
-                    Some("Inspect docs over WebSocket MCP")
+                    discovery.tools[0].mcp_description,
+                    "Inspect docs over WebSocket MCP"
                 );
                 assert_eq!(discovery.server.config.as_ref().unwrap().transport, Transport::Ws);
                 runtime::clear_server_cache(SERVER, None).await;
@@ -8445,7 +8435,6 @@ rl.on('line', line => {
                         crate::constants::oauth::OAUTH_CREDENTIAL_SIDE_EFFECTS_UNAVAILABLE_MESSAGE
                     )
                 );
-                assert!(client.tools.is_empty());
                 server.await.expect("fixture server task");
                 let _ = runtime::drain_mcp_connection_callback_observations().await;
                 assert!(!config_home.join(".credentials.json").exists());
@@ -8616,7 +8605,7 @@ rl.on('line', line => {
                     discovery.server.client.status,
                     McpServerConnectionType::Connected
                 );
-                assert_eq!(discovery.server.tools.len(), 1);
+                assert_eq!(discovery.tools.len(), 1);
                 let value = runtime::call_mcp_tool_with_meta(
                     SERVER,
                     "lookup",
@@ -8736,30 +8725,43 @@ rl.on('line', line => {
             discoveries[0].server.client.status,
             McpServerConnectionType::NeedsAuth
         );
-        assert_eq!(discoveries[0].server.tools[0].name, "authenticate");
+        assert_eq!(tool_names(&discoveries[0].tools), vec!["authenticate"]);
+        assert_eq!(discoveries[0].tools[0].name, "mcp__docs__authenticate");
     }
 
     /// CC's `userFacingName()` reads `tool.annotations?.title` only
     /// (`client.ts:1974`); the tool's top-level `title` is not a fallback.
     #[test]
-    fn tool_snapshot_takes_the_title_from_annotations_only() {
-        let tool = |value| serde_json::from_value::<rmcp::model::Tool>(value).unwrap();
-        let top_level_only = runtime::tool_snapshot(tool(serde_json::json!({
-            "name": "lookup",
-            "title": "Top Level",
-            "inputSchema": {"type": "object"},
-            "annotations": {"readOnlyHint": true}
-        })));
-        assert_eq!(top_level_only.display_name, None);
-        assert!(top_level_only.read_only_hint);
-        let annotated = runtime::tool_snapshot(tool(serde_json::json!({
-            "name": "lookup",
-            "title": "Top Level",
-            "inputSchema": {"type": "object"},
-            "annotations": {"title": "Annotated"}
-        })));
-        assert_eq!(annotated.display_name.as_deref(), Some("Annotated"));
-        assert!(!annotated.read_only_hint);
+    fn mcp_tools_take_the_title_from_annotations_only() {
+        let top_level_only = mcp_tool_for_test(
+            "docs",
+            serde_json::json!({
+                "name": "lookup",
+                "title": "Top Level",
+                "inputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": true}
+            }),
+        );
+        assert_eq!(top_level_only.mcp_annotations.title, None);
+        assert!(top_level_only.mcp_annotations.read_only_hint);
+        assert_eq!(
+            top_level_only.mcp_user_facing_name().as_deref(),
+            Some("docs - lookup (MCP)")
+        );
+        let annotated = mcp_tool_for_test(
+            "docs",
+            serde_json::json!({
+                "name": "lookup",
+                "title": "Top Level",
+                "inputSchema": {"type": "object"},
+                "annotations": {"title": "Annotated"}
+            }),
+        );
+        assert_eq!(
+            annotated.mcp_annotations.title.as_deref(),
+            Some("Annotated")
+        );
+        assert!(!annotated.mcp_annotations.read_only_hint);
     }
 
     /// Every `mcp.tools` entry answers what CC's per-tool closures do
@@ -8767,19 +8769,25 @@ rl.on('line', line => {
     /// `prompt()` cut at MAX_MCP_DESCRIPTION_LENGTH, the three annotation
     /// methods, and `userFacingName()` from `annotations.title || tool.name`.
     #[test]
-    fn projected_mcp_tools_carry_the_server_tool_metadata() {
+    fn fetched_mcp_tools_carry_the_server_tool_metadata() {
         let raw = "metadata ".repeat(MAX_MCP_DESCRIPTION_LENGTH + 1);
-        let tool = |name: &str, title: Option<&str>, description: Option<String>| {
-            crate::services::mcp::types::McpToolSnapshot {
-                name: name.into(),
-                display_name: title.map(str::to_string),
-                description,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: name == "read",
-                destructive_hint: name == "drop",
-                open_world_hint: name == "drop",
-            }
-        };
+        let read = mcp_tool_for_test(
+            "docs",
+            serde_json::json!({
+                "name": "read",
+                "description": raw,
+                "inputSchema": {"type": "object"},
+                "annotations": {"title": "Read Docs", "readOnlyHint": true}
+            }),
+        );
+        let drop = mcp_tool_for_test(
+            "docs",
+            serde_json::json!({
+                "name": "drop",
+                "inputSchema": {"type": "object"},
+                "annotations": {"title": "", "destructiveHint": true, "openWorldHint": true}
+            }),
+        );
         let auth = crate::tools::mcp_auth_tool::create_mcp_auth_tool(
             "docs",
             &ScopedMcpServerConfig {
@@ -8800,32 +8808,8 @@ rl.on('line', line => {
                 plugin_source: None,
             },
         );
-        let server = McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: "docs".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            config: None,
-            supports_resources: false,
-            tools: vec![
-                tool("read", Some("Read Docs"), Some(raw.clone())),
-                tool("drop", Some(""), None),
-                auth.snapshot(),
-            ],
-            prompts: Vec::new(),
-            resources: Vec::new(),
-        };
+        let authenticate = auth.tool();
 
-        let tools = project_mcp_server_tools(std::slice::from_ref(&server));
-        let [read, drop, authenticate] = tools.as_slice() else {
-            panic!("three tools: {tools:?}");
-        };
         assert_eq!(read.mcp_description, raw);
         assert_eq!(read.description, truncate_mcp_description(Some(raw)));
         assert!(read.mcp_annotations.read_only_hint);
@@ -8850,26 +8834,5 @@ rl.on('line', line => {
             authenticate.mcp_user_facing_name().as_deref(),
             Some(auth.user_facing_name())
         );
-    }
-}
-
-/// Test fixture for callback-built state. Production must retain the actual
-/// connection callback arrays instead of reconstructing them from snapshots.
-#[cfg(test)]
-pub fn refresh_flat_mcp_capabilities(state: &mut McpState) {
-    let added = std::sync::atomic::AtomicBool::new(false);
-    state.tools.clear();
-    state.commands.clear();
-    state.resources.clear();
-    for server in &state.clients {
-        let mut discovery = McpConnectionDiscovery::from(server.clone());
-        discovery.add_discovery_resource_tools(&added);
-        state.tools.extend(discovery.tools);
-        state.commands.extend(discovery.commands);
-        if let Some(resources) = discovery.resources {
-            state
-                .resources
-                .insert(server.client.name.clone(), resources);
-        }
     }
 }

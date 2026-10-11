@@ -115,6 +115,16 @@ pub struct PluginInfo {
     pub repository: String,
 }
 
+/// The server and prompt an MCP prompt command was fetched for: what CC's
+/// prompt command closes over (`services/mcp/client.ts:2054-2097`, `client`
+/// and `prompt.name`). The server is held by name; the connection handle
+/// itself is not carried yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpPromptBinding {
+    pub server_name: String,
+    pub prompt_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Command {
     pub name: Cow<'static, str>,
@@ -164,6 +174,9 @@ pub struct Command {
     /// getPromptForCommand closure. Domain logic stays in loadPluginCommands.
     pub plugin_context:
         Option<Arc<crate::utils::plugins::load_plugin_commands::PluginCommandContext>>,
+    /// An MCP prompt command's server and prompt; `None` for every other
+    /// command.
+    pub mcp_prompt: Option<McpPromptBinding>,
 }
 
 impl PartialEq for Command {
@@ -199,6 +212,7 @@ impl PartialEq for Command {
             && self.prompt_command == other.prompt_command
             && self.plugin_info == other.plugin_info
             && self.plugin_context == other.plugin_context
+            && self.mcp_prompt == other.mcp_prompt
     }
 }
 
@@ -238,6 +252,7 @@ impl Command {
             prompt_command: None,
             plugin_info: None,
             plugin_context: None,
+            mcp_prompt: None,
         }
     }
 
@@ -372,6 +387,7 @@ impl Command {
             prompt_command: None,
             plugin_info: None,
             plugin_context: None,
+            mcp_prompt: None,
         }
     }
 
@@ -431,6 +447,7 @@ impl Command {
             prompt_command: Some(skill),
             plugin_info: None,
             plugin_context: None,
+            mcp_prompt: None,
         }
     }
 }

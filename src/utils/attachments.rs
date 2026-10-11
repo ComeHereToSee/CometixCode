@@ -1193,12 +1193,12 @@ async fn process_mcp_resource_attachments(
                 && server.client.status
                     == crate::services::mcp::types::McpServerConnectionType::Connected
         })?;
+        // CC `toolUseContext.options.mcpResources?.[serverName]` only.
         let resource = context
             .mcp_state
             .resources
             .get(server_name)
-            .and_then(|resources| resources.iter().find(|resource| resource.uri == uri))
-            .or_else(|| server.resources.iter().find(|resource| resource.uri == uri))?;
+            .and_then(|resources| resources.iter().find(|resource| resource.uri == uri))?;
         let name = if resource.name.is_empty() {
             uri.to_string()
         } else {
@@ -4172,9 +4172,6 @@ mod tests {
                 },
                 config: None,
                 supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
             }],
             ..Default::default()
         };
@@ -4212,9 +4209,6 @@ mod tests {
                 },
                 config: None,
                 supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
             }],
             ..Default::default()
         };

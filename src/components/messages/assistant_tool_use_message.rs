@@ -132,22 +132,20 @@ pub fn AssistantToolUseMessage(
         .try_use_context::<crate::state::store::AppStore>()
         .and_then(|store| {
             let state = store.get();
-            let (server_name, raw_tool_name) =
-                crate::services::mcp::client::resolve_mcp_tool_invocation(
-                    &props.tool_name,
-                    &state.mcp,
-                )?;
-            if raw_tool_name != "authenticate" {
+            let tool = state
+                .mcp
+                .tools
+                .iter()
+                .find(|tool| tool.is_mcp && tool.name == props.tool_name)?;
+            let Some(crate::types::tools::McpToolConnection::Authenticate {
+                server_name,
+                config,
+            }) = &tool.mcp_connection
+            else {
                 return None;
-            }
-            let server = state.mcp.clients.iter().find(|server| {
-                server.client.name == server_name
-                    && server.client.status
-                        == crate::services::mcp::types::McpServerConnectionType::NeedsAuth
-            })?;
-            let config = server.config.as_ref()?;
+            };
             Some(crate::tools::mcp_auth_tool::create_mcp_auth_tool(
-                &server_name,
+                server_name,
                 config,
             ))
         });

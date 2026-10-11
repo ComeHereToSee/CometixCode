@@ -185,43 +185,13 @@ pub struct McpClientSnapshot {
     pub error: Option<String>,
 }
 
-/// NO official counterpart type: CC's `fetchToolsForClient`
-/// (`services/mcp/client.ts:1743`) returns `Promise<Tool[]>` directly, and
-/// `AppState.mcp.tools` is a plain `Tool[]`. This is the Rust intermediate
-/// representation held per-server before projection into
-/// `crate::types::tools::Tool`, which TypeScript does not need because it
-/// builds the final `Tool` objects inline.
-#[derive(Clone, Debug, PartialEq)]
-pub struct McpToolSnapshot {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub description: Option<String>,
-    pub input_schema: serde_json::Value,
-    pub read_only_hint: bool,
-    pub destructive_hint: bool,
-    pub open_world_hint: bool,
-}
-
-/// NO official counterpart type, for the same reason as `McpToolSnapshot`:
-/// `fetchCommandsForClient` (`services/mcp/client.ts:2033`) returns
-/// `Promise<Command[]>` and `AppState.mcp.commands` is a plain `Command[]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpPromptSnapshot {
-    pub name: String,
-    pub description: Option<String>,
-    pub arg_names: Vec<String>,
-}
-
 /// Maps to: CC `MCPServerConnection` as stored in `AppState.mcp.clients`
 /// (`state/AppStateStore.ts:174`), consumed by `components/mcp/MCPSettings.tsx`.
 ///
-/// Two deviations, in opposite directions. Both matter; this doc used to record
-/// only the first.
-///
-/// **Stores more**: the official variants carry NO `tools` / `prompts` /
-/// `resources` fields — CC re-derives them by calling the memoized
-/// `fetch*ForClient` helpers. Rust materializes them on the connection record
-/// instead, so render/query consumers read them directly.
+/// Like CC's, the record carries no tools, prompts or resources: those live in
+/// `AppState.mcp.tools` / `.commands` / `.resources`, and views pick a
+/// server's share out of them (`filterToolsByServer`,
+/// `commandBelongsToServer`, `resources[name]`).
 ///
 /// **Stores less**: `ConnectedMCPServer.capabilities` — the whole
 /// `ServerCapabilities` object — is reduced here to the single
@@ -251,9 +221,6 @@ pub struct McpServerSnapshot {
     /// state, not a projection of the current resource list: a capable server
     /// with zero resources must still expose List/ReadMcpResourceTool.
     pub supports_resources: bool,
-    pub tools: Vec<McpToolSnapshot>,
-    pub prompts: Vec<McpPromptSnapshot>,
-    pub resources: Vec<ServerResource>,
 }
 
 /// Maps to: CC `services/mcp/types.ts:28-35#McpStdioServerConfigSchema`.

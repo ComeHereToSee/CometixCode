@@ -447,9 +447,6 @@ mod tests {
                 },
                 config: None,
                 supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
             }],
             ..crate::state::app_state_store::McpState::default()
         };

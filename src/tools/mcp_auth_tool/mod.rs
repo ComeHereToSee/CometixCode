@@ -21,7 +21,7 @@ pub struct McpAuthOutput {
 pub struct McpAuthTool {
     server_name: String,
     config: crate::services::mcp::types::ScopedMcpServerConfig,
-    snapshot: crate::services::mcp::types::McpToolSnapshot,
+    tool: crate::types::tools::Tool,
     user_facing_name: String,
     tool_use_message: String,
 }
@@ -49,32 +49,40 @@ pub fn create_mcp_auth_tool(
         config: config.clone(),
         user_facing_name: format!("{server_name} - authenticate (MCP)"),
         tool_use_message: format!("Authenticate {server_name} MCP server"),
-        snapshot: crate::services::mcp::types::McpToolSnapshot {
-            // `services/mcp/client.rs` adds the canonical server prefix when it
-            // materializes this server-local registry snapshot.
-            name: "authenticate".to_string(),
-            // No title: the projected tool's `userFacingName()` is then
-            // `${serverName} - authenticate (MCP)`, CC's
-            // (`McpAuthTool.ts:70`).
-            display_name: None,
-            description: Some(description),
+        // CC `:62-84`: always the prefixed name; `description()` and
+        // `prompt()` both return the description; `isReadOnly()` and
+        // `isConcurrencySafe()` are false. No title, so
+        // `mcp_user_facing_name()` is `:70`'s string.
+        tool: crate::types::tools::Tool {
+            name: crate::services::mcp::mcp_string_utils::build_mcp_tool_name(
+                server_name,
+                "authenticate",
+            ),
+            description: description.clone(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false,
             }),
-            read_only_hint: false,
-            destructive_hint: false,
-            open_world_hint: false,
+            is_mcp: true,
+            mcp_info: Some(crate::types::tools::McpToolInfo {
+                server_name: server_name.to_string(),
+                tool_name: "authenticate".to_string(),
+            }),
+            mcp_description: description,
+            mcp_connection: Some(crate::types::tools::McpToolConnection::Authenticate {
+                server_name: server_name.to_string(),
+                config: config.clone(),
+            }),
+            ..Default::default()
         },
     }
 }
 
 impl McpAuthTool {
-    /// Registry carrier for the descriptor fields created by
-    /// `createMcpAuthTool`; it owns no discovery or policy.
-    pub fn snapshot(&self) -> crate::services::mcp::types::McpToolSnapshot {
-        self.snapshot.clone()
+    /// The tool object `createMcpAuthTool` returns, as it joins `mcp.tools`.
+    pub fn tool(&self) -> crate::types::tools::Tool {
+        self.tool.clone()
     }
 
     /// Maps to: CC `tools/McpAuthTool/McpAuthTool.ts:70`
@@ -326,17 +334,21 @@ mod tests {
             plugin_source: None,
         };
         let tool = create_mcp_auth_tool("linear", &config);
-        let snapshot = tool.snapshot();
-        assert_eq!(snapshot.name, "authenticate");
-        assert_eq!(snapshot.display_name, None);
+        let descriptor = tool.tool();
+        assert_eq!(descriptor.name, "mcp__linear__authenticate");
+        assert!(descriptor.is_mcp);
         assert!(
-            snapshot
+            descriptor
                 .description
-                .as_deref()
-                .unwrap()
                 .contains("http at https://mcp.example.com")
         );
+        assert_eq!(descriptor.mcp_description, descriptor.description);
+        assert!(!descriptor.mcp_annotations.read_only_hint);
         assert_eq!(tool.user_facing_name(), "linear - authenticate (MCP)");
+        assert_eq!(
+            descriptor.mcp_user_facing_name().as_deref(),
+            Some(tool.user_facing_name())
+        );
         assert_eq!(
             tool.render_tool_use_message(),
             "Authenticate linear MCP server"

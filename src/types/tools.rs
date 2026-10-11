@@ -106,6 +106,18 @@ pub struct McpToolInfo {
     pub tool_name: String,
 }
 
+/// What an MCP tool's `call` closes over instead of being looked up by name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpToolConnection {
+    /// `createMcpAuthTool(serverName, config)`'s capture
+    /// (`tools/McpAuthTool/McpAuthTool.ts:49-52`): its `call` starts the
+    /// server's OAuth flow whatever the client's status is now.
+    Authenticate {
+        server_name: String,
+        config: crate::services::mcp::types::ScopedMcpServerConfig,
+    },
+}
+
 /// The server tool's MCP `annotations`, which the per-tool closures of CC's
 /// `fetchToolsForClient` read (`services/mcp/client.ts:1795-1809,1972-1976`).
 /// A missing hint is `false`, as their `?? false` makes it.
@@ -164,6 +176,10 @@ pub struct Tool {
     /// `prompt()` returns, cut at `MAX_MCP_DESCRIPTION_LENGTH`.
     #[serde(skip)]
     pub mcp_description: String,
+    /// What the MCP tool's `call` closes over; `None` for a tool dispatched
+    /// by name.
+    #[serde(skip)]
+    pub mcp_connection: Option<McpToolConnection>,
     /// Maps to: CC `Tool.strict` after model/gate filtering in `toolToAPISchema`.
     pub strict: Option<bool>,
 }

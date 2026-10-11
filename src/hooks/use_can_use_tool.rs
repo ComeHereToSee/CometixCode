@@ -2079,48 +2079,26 @@ mod tests {
 
     #[test]
     fn auto_mode_denial_matches_official_mcp_description_and_user_facing_name() {
-        use crate::services::mcp::types::{
-            McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, McpToolSnapshot,
-        };
         // CC client.ts:1786-1788 supplies untruncated description; :1972-1974
         // supplies the server/title user-facing name used by the notification.
         // Both come off the tool: no server is in the context's state.
         let raw = "original MCP description ".repeat(250);
         let mut context = crate::tool::ToolUseContext::default();
-        let server = McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: "docs".into(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            config: None,
-            supports_resources: false,
-            tools: vec![McpToolSnapshot {
-                name: "read".into(),
-                display_name: Some("Read Docs".into()),
-                description: Some(raw.clone()),
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            }],
-            prompts: vec![],
-            resources: vec![],
-        };
         let notifications = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = notifications.clone();
         context.add_notification =
             crate::tool::AddNotification(Some(std::sync::Arc::new(move |notification| {
                 captured.lock().unwrap().push(notification)
             })));
-        let mut tool = crate::services::mcp::client::mcp_tools_for_server_snapshot(&server)
-            .pop()
-            .expect("the projected tool");
+        let mut tool = crate::services::mcp::client::mcp_tool_for_test(
+            "docs",
+            serde_json::json!({
+                "name": "read",
+                "description": raw,
+                "inputSchema": {"type": "object"},
+                "annotations": {"title": "Read Docs", "readOnlyHint": true}
+            }),
+        );
         assert_ne!(tool.description, raw, "the model prompt is truncated");
         tool.name = "read".into(); // SDK skip-prefix case still carries mcpInfo.
         let tool_use = ToolUsePermissionRequest {

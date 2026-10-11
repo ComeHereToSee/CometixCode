@@ -3,11 +3,11 @@
 //! This slice ports read-only path/label/string/config-projection helpers. It
 //! does not start clients, mutate app state, or perform network/auth work.
 
-use super::client::McpPromptCommandSnapshot;
 use super::mcp_string_utils::mcp_info_from_string;
 use super::normalization::normalize_name_for_mcp;
 use super::types::McpServerSnapshot;
 use super::types::{ConfigScope, ScopedMcpServerConfig, ServerResource, Transport};
+use crate::commands::Command;
 use crate::components::mcp::types::AgentMcpServerInfo;
 use crate::state::app_state_store::McpState;
 use crate::tools::agent_tool::load_agents_dir::{AgentDefinition, AgentMcpServerSpec};
@@ -162,10 +162,7 @@ pub fn command_belongs_to_server(command_name: &str, server_name: &str) -> bool 
 }
 
 /// Maps to: CC `services/mcp/utils.ts#filterCommandsByServer`.
-pub fn filter_commands_by_server(
-    commands: &[McpPromptCommandSnapshot],
-    server_name: &str,
-) -> Vec<McpPromptCommandSnapshot> {
+pub fn filter_commands_by_server(commands: &[Command], server_name: &str) -> Vec<Command> {
     commands
         .iter()
         .filter(|command| command_belongs_to_server(&command.name, server_name))
@@ -173,15 +170,19 @@ pub fn filter_commands_by_server(
         .collect()
 }
 
-/// Maps to: CC `services/mcp/utils.ts#filterMcpPromptsByServer`.
-pub fn filter_mcp_prompts_by_server(
-    commands: &[McpPromptCommandSnapshot],
-    server_name: &str,
-) -> Vec<McpPromptCommandSnapshot> {
-    // Rust's `McpPromptCommandSnapshot` is the MCP prompt-only projection from
-    // `fetchCommandsForClient(...)`; MCP skills are not represented by this
-    // type, matching the official helper's `loadedFrom !== 'mcp'` exclusion.
-    filter_commands_by_server(commands, server_name)
+/// Maps to: CC `services/mcp/utils.ts:85-94#filterMcpPromptsByServer`: the
+/// server's commands that are not MCP skills (`loadedFrom === 'mcp'`).
+pub fn filter_mcp_prompts_by_server(commands: &[Command], server_name: &str) -> Vec<Command> {
+    commands
+        .iter()
+        .filter(|command| {
+            command_belongs_to_server(&command.name, server_name)
+                && !(command.kind == crate::commands::CommandKind::Prompt
+                    && command.loaded_from
+                        == Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Maps to: CC `services/mcp/utils.ts#filterResourcesByServer`.
@@ -197,10 +198,7 @@ pub fn filter_resources_by_server(
 }
 
 /// Maps to: CC `services/mcp/utils.ts#excludeCommandsByServer`.
-pub fn exclude_commands_by_server(
-    commands: &[McpPromptCommandSnapshot],
-    server_name: &str,
-) -> Vec<McpPromptCommandSnapshot> {
+pub fn exclude_commands_by_server(commands: &[Command], server_name: &str) -> Vec<Command> {
     commands
         .iter()
         .filter(|command| !command_belongs_to_server(&command.name, server_name))
@@ -233,9 +231,10 @@ pub fn is_mcp_tool(tool: &Tool) -> bool {
     is_mcp_tool_name(&tool.name) || tool.is_mcp
 }
 
-/// Maps to: CC `services/mcp/utils.ts#isMcpCommand`.
-pub fn is_mcp_command(command: &McpPromptCommandSnapshot) -> bool {
-    command.name.starts_with("mcp__") || command.source == "mcp"
+/// Maps to: CC `services/mcp/utils.ts:254-256#isMcpCommand`; `isMcp` is
+/// the MCP command source here.
+pub fn is_mcp_command(command: &Command) -> bool {
+    command.name.starts_with("mcp__") || command.source == crate::commands::CommandSource::Mcp
 }
 
 /// Maps to: CC `services/mcp/utils.ts#getMcpServerScopeFromToolName`.
@@ -424,20 +423,15 @@ pub fn exclude_stale_plugin_clients(
         .map(|server| server.client.name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     let mut next = state.clone();
-    let stale_tool_names = stale
-        .iter()
-        .flat_map(crate::services::mcp::client::mcp_tools_for_server_snapshot)
-        .map(|tool| tool.name)
-        .collect::<std::collections::HashSet<_>>();
+    // CC `excludeToolsByServer`: by the server's `mcp__<name>__` prefix.
     let stale_prefixes = stale
         .iter()
         .map(|server| format!("mcp__{}__", normalize_name_for_mcp(&server.client.name)))
         .collect::<Vec<_>>();
     next.tools.retain(|tool| {
-        !stale_tool_names.contains(&tool.name)
-            && !stale_prefixes
-                .iter()
-                .any(|prefix| tool.name.starts_with(prefix))
+        !stale_prefixes
+            .iter()
+            .any(|prefix| tool.name.starts_with(prefix))
     });
     next.commands.retain(|command| {
         !stale
@@ -723,16 +717,24 @@ mod tests {
         assert_eq!(
             filter_commands_by_server(&commands, "docs server")
                 .iter()
-                .map(|command| command.name.as_str())
+                .map(|command| command.name.as_ref())
                 .collect::<Vec<_>>(),
             vec!["mcp__docs_server__summarize", "docs_server:skill"]
         );
         assert_eq!(
             filter_mcp_prompts_by_server(&commands, "other")
                 .iter()
-                .map(|command| command.name.as_str())
+                .map(|command| command.name.as_ref())
                 .collect::<Vec<_>>(),
             vec!["mcp__other__summarize"]
+        );
+        // CC `utils.ts:89-93`: an MCP skill (`loadedFrom === 'mcp'`) is not
+        // one of the server's prompts.
+        let mut skill = mcp_prompt_command("mcp__other__skill");
+        skill.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
+        assert_eq!(
+            filter_mcp_prompts_by_server(&[commands[2].clone(), skill], "other").len(),
+            1
         );
         assert_eq!(
             exclude_commands_by_server(&commands, "docs server").len(),
@@ -905,15 +907,15 @@ mod tests {
         assert_eq!(ProjectMcpServerStatus::Pending.as_str(), "pending");
     }
 
-    fn mcp_prompt_command(name: &str) -> McpPromptCommandSnapshot {
-        McpPromptCommandSnapshot {
+    fn mcp_prompt_command(name: &str) -> Command {
+        Command::from_mcp_prompt(crate::services::mcp::client::McpPromptCommandSnapshot {
             name: name.to_string(),
             description: String::new(),
             has_user_specified_description: false,
             user_facing_name: name.to_string(),
             arg_names: Vec::new(),
             source: "mcp",
-        }
+        })
     }
 
     fn server_resource(server: &str, uri: &str) -> ServerResource {

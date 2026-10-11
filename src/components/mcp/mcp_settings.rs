@@ -132,13 +132,13 @@ pub fn server_infos_from_server_snapshots(
     runtime_servers: &[McpServerSnapshot],
     fallback_clients: &[crate::services::mcp::types::McpClientSnapshot],
 ) -> Vec<ServerInfo> {
-    server_infos_from_capability_arrays(
+    server_infos_from_mcp_state(
         global_config,
         project_config,
-        runtime_servers,
-        None,
-        None,
-        None,
+        &crate::state::app_state_store::McpState {
+            clients: runtime_servers.to_vec(),
+            ..Default::default()
+        },
         fallback_clients,
     )
 }
@@ -155,9 +155,9 @@ pub fn server_infos_from_mcp_state(
         global_config,
         project_config,
         &mcp.clients,
-        Some(&mcp.tools),
-        Some(&mcp.commands),
-        Some(&mcp.resources),
+        &mcp.tools,
+        &mcp.commands,
+        &mcp.resources,
         fallback_clients,
     )
 }
@@ -169,9 +169,9 @@ fn server_infos_from_capability_arrays(
     global_config: &GlobalConfig,
     project_config: &ProjectConfig,
     runtime_servers: &[McpServerSnapshot],
-    runtime_tools: Option<&[crate::types::tools::Tool]>,
-    runtime_commands: Option<&[crate::commands::Command]>,
-    runtime_resources: Option<&BTreeMap<String, Vec<crate::services::mcp::types::ServerResource>>>,
+    runtime_tools: &[crate::types::tools::Tool],
+    runtime_commands: &[crate::commands::Command],
+    runtime_resources: &BTreeMap<String, Vec<crate::services::mcp::types::ServerResource>>,
     fallback_clients: &[crate::services::mcp::types::McpClientSnapshot],
 ) -> Vec<ServerInfo> {
     let mut configs = all_configured_mcp_servers_readonly(global_config, project_config);
@@ -239,26 +239,12 @@ fn server_infos_from_capability_arrays(
                 .map(|server| server.client.status)
                 .or_else(|| client_statuses.get(&name).copied())
                 .unwrap_or(McpServerConnectionType::Pending);
-            let tools = if let Some(runtime_tools) = runtime_tools {
-                crate::services::mcp::utils::filter_tools_by_server(runtime_tools, &name)
-                    .iter()
-                    .map(McpToolInfo::from)
-                    .collect::<Vec<_>>()
-            } else {
-                runtime
-                    .map(|server| {
-                        crate::services::mcp::client::mcp_tools_for_server_snapshot(server)
-                            .iter()
-                            .map(McpToolInfo::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            };
+            let tools = crate::services::mcp::utils::filter_tools_by_server(runtime_tools, &name)
+                .iter()
+                .map(McpToolInfo::from)
+                .collect::<Vec<_>>();
             let client_type = status;
-            let resources_count = runtime_resources
-                .and_then(|resources| resources.get(&name))
-                .map(Vec::len)
-                .unwrap_or_else(|| runtime.map(|server| server.resources.len()).unwrap_or(0));
+            let resources_count = runtime_resources.get(&name).map_or(0, Vec::len);
             let client = mcp_client_state_from_parts(
                 client_type,
                 tools.clone(),
@@ -272,19 +258,11 @@ fn server_infos_from_capability_arrays(
                 client_type,
                 tools.len(),
             );
-            let prompts_count = runtime_commands
-                .map(|commands| {
-                    commands
-                        .iter()
-                        .filter(|command| {
-                            crate::services::mcp::utils::command_belongs_to_server(
-                                command.name.as_ref(),
-                                &name,
-                            )
-                        })
-                        .count()
-                })
-                .unwrap_or_else(|| runtime.map(|server| server.prompts.len()).unwrap_or(0));
+            // CC's server menus count `filterMcpPromptsByServer(mcp.commands,
+            // name)` (`MCPRemoteServerMenu.tsx:277`, `MCPStdioServerMenu.tsx:75`).
+            let prompts_count =
+                crate::services::mcp::utils::filter_mcp_prompts_by_server(runtime_commands, &name)
+                    .len();
             ServerInfo {
                 name,
                 client,
@@ -338,13 +316,9 @@ pub fn MCPSettings(props: &MCPSettingsProps, mut hooks: Hooks) -> impl Into<AnyE
         // carries only the startup fallback client list.
         let global_config = crate::utils::config::load_global_config();
         let project_config = project_config_for_current_cwd(&global_config);
-        // This replaced a two-branch form whose second arm ran
-        // `server_infos_from_client_snapshots` when no store was present. That
-        // arm is gone with the strict read, and it was equivalent: it passed
-        // `runtime_servers = &[]` with `None` capability arrays, while an empty
-        // `McpState` passes `&[]` with `Some(&[])`. Both bottom out empty —
-        // `Some(&[])` filters an empty tool list, and the `None` arm's
-        // per-server lookup finds nothing to fall back to (`:232-268`).
+        // Without a store the state is empty: no clients, and empty
+        // `mcp.tools` / `.commands` / `.resources`, so every configured
+        // server shows with no capabilities.
         server_infos_from_mcp_state(
             &global_config,
             &project_config,
@@ -530,9 +504,7 @@ pub fn MCPSettings(props: &MCPSettingsProps, mut hooks: Hooks) -> impl Into<AnyE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::mcp::types::{
-        McpClientSnapshot, McpPromptSnapshot, McpServerSnapshot, McpToolSnapshot, ServerResource,
-    };
+    use crate::services::mcp::types::{McpClientSnapshot, McpServerSnapshot, ServerResource};
     use crate::utils::test_env::TEST_ENV_LOCK;
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
@@ -623,26 +595,20 @@ mod tests {
             },
             config: Some(config),
             supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         };
-        // The flat `mcp.tools` entry, as the projection makes it; the nested
-        // list on the server stays empty.
-        let mut with_tools = server.clone();
-        with_tools.tools.push(McpToolSnapshot {
-            name: "search".to_string(),
-            display_name: Some("Search Docs".to_string()),
-            description: Some("Search docs".to_string()),
-            input_schema: serde_json::json!({"type":"object"}),
-            read_only_hint: true,
-            destructive_hint: false,
-            open_world_hint: false,
-        });
         let state = crate::state::app_state_store::McpState {
             plugin_reconnect_key: 0,
             clients: vec![server],
-            tools: crate::services::mcp::client::mcp_tools_for_server_snapshot(&with_tools),
+            // The flat `mcp.tools` entry, as `fetchToolsForClient` makes it.
+            tools: vec![crate::services::mcp::client::mcp_tool_for_test(
+                "docs",
+                serde_json::json!({
+                    "name": "search",
+                    "description": "Search docs",
+                    "inputSchema": {"type": "object"},
+                    "annotations": {"title": "Search Docs", "readOnlyHint": true}
+                }),
+            )],
             commands: vec![crate::commands::Command::from_mcp_prompt(
                 crate::services::mcp::client::McpPromptCommandSnapshot {
                     name: "mcp__docs__summarize".to_string(),
@@ -776,9 +742,6 @@ mod tests {
             },
             config: Some(config),
             supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         }];
         let infos = server_infos_from_server_snapshots(
             &GlobalConfig::default(),
@@ -830,36 +793,44 @@ mod tests {
                 plugin_source: None,
             }),
             supports_resources: true,
-            tools: vec![McpToolSnapshot {
-                name: "create_issue".to_string(),
-                display_name: Some("Create issue".to_string()),
-                description: Some("Create an issue".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "required": ["title"],
-                    "properties": {
-                        "title": { "type": "string", "description": "Issue title" }
-                    }
-                }),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: true,
-            }],
-            prompts: vec![McpPromptSnapshot {
-                name: "triage".to_string(),
-                description: Some("Triage issue".to_string()),
-                arg_names: vec!["issue".to_string()],
-            }],
-            resources: vec![ServerResource {
-                server: "github".to_string(),
-                uri: "repo://issues".to_string(),
-                name: "issues".to_string(),
-                description: None,
-                mime_type: None,
-            }],
         }];
+        let state = crate::state::app_state_store::McpState {
+            clients: runtime_servers,
+            tools: vec![crate::services::mcp::client::mcp_tool_for_test(
+                "github",
+                serde_json::json!({
+                    "name": "create_issue",
+                    "description": "Create an issue",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["title"],
+                        "properties": {
+                            "title": { "type": "string", "description": "Issue title" }
+                        }
+                    },
+                    "annotations": {"title": "Create issue", "openWorldHint": true}
+                }),
+            )],
+            commands: vec![crate::services::mcp::client::mcp_command_for_test(
+                "github",
+                "triage",
+                Some("Triage issue"),
+                &["issue"],
+            )],
+            resources: BTreeMap::from([(
+                "github".to_string(),
+                vec![ServerResource {
+                    server: "github".to_string(),
+                    uri: "repo://issues".to_string(),
+                    name: "issues".to_string(),
+                    description: None,
+                    mime_type: None,
+                }],
+            )]),
+            ..Default::default()
+        };
 
-        let infos = server_infos_from_server_snapshots(&global, &project, &runtime_servers, &[]);
+        let infos = server_infos_from_mcp_state(&global, &project, &state, &[]);
         let github = infos
             .iter()
             .find(|server| server.name == "github")
@@ -876,7 +847,7 @@ mod tests {
         // Re-derived 2026-08-26 (#128): this asserted the bare annotation title.
         // CC's dynamic MCP tool exposes
         // `` `${client.name} - ${tool.annotations?.title || tool.name} (MCP)` ``
-        // (`services/mcp/client.ts:1971-1975`), and `MCPToolListView.tsx:37-42`
+        // (`services/mcp/client.ts:1972-1976`), and `MCPToolListView.tsx:37-42`
         // runs `extractMcpToolDisplayName` over exactly that string to recover
         // `Create issue`. With the bare title there was nothing for
         // `mcp_string_utils::extract_mcp_tool_display_name` to strip — the
@@ -900,10 +871,10 @@ mod tests {
             McpServerConnectionType::Connected
         );
 
-        let runtime_only_infos = server_infos_from_server_snapshots(
+        let runtime_only_infos = server_infos_from_mcp_state(
             &GlobalConfig::default(),
             &ProjectConfig::default(),
-            &runtime_servers,
+            &state,
             &[],
         );
         assert_eq!(runtime_only_infos.len(), 1);
@@ -1009,9 +980,6 @@ mod tests {
                 plugin_source: None,
             }),
             supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
         }];
 
         let infos = server_infos_from_server_snapshots(
@@ -1060,23 +1028,21 @@ mod tests {
                 plugin_source: None,
             }),
             supports_resources: false,
-            tools: vec![McpToolSnapshot {
-                name: "lookup".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({ "type": "object" }),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            }],
-            prompts: Vec::new(),
-            resources: Vec::new(),
         }];
+        // CC `MCPSettings.tsx:80`: connected with tools in `mcp.tools`.
+        let state = crate::state::app_state_store::McpState {
+            clients: runtime_servers,
+            tools: vec![crate::services::mcp::client::mcp_tool_for_test(
+                "docs",
+                serde_json::json!({"name": "lookup", "inputSchema": {"type": "object"}}),
+            )],
+            ..Default::default()
+        };
 
-        let infos = server_infos_from_server_snapshots(
+        let infos = server_infos_from_mcp_state(
             &GlobalConfig::default(),
             &ProjectConfig::default(),
-            &runtime_servers,
+            &state,
             &[],
         );
         let docs = infos.iter().find(|server| server.name == "docs").unwrap();

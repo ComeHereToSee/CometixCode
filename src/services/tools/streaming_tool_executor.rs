@@ -1304,29 +1304,21 @@ mod tests {
     /// state to look it up in.
     #[test]
     fn streaming_add_tool_classifies_mcp_tools_by_read_only_hint() {
-        let mut server =
-            crate::services::mcp::client::McpConnectionDiscovery::pending("docs").server;
-        server.client.status = crate::services::mcp::types::McpServerConnectionType::Connected;
-        for (name, read_only_hint) in [("lookup", true), ("write", false)] {
-            server
-                .tools
-                .push(crate::services::mcp::types::McpToolSnapshot {
-                    name: name.to_string(),
-                    display_name: None,
-                    description: None,
-                    input_schema: serde_json::json!({"type": "object"}),
-                    read_only_hint,
-                    destructive_hint: false,
-                    open_world_hint: false,
-                });
-        }
-        let mut state = crate::state::app_state_store::McpState {
-            clients: vec![server],
-            ..Default::default()
-        };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
+        let tools = [("lookup", true), ("write", false)]
+            .into_iter()
+            .map(|(name, read_only_hint)| {
+                crate::services::mcp::client::mcp_tool_for_test(
+                    "docs",
+                    serde_json::json!({
+                        "name": name,
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"readOnlyHint": read_only_hint}
+                    }),
+                )
+            })
+            .collect();
         let context = ToolUseContext::with_permission_context(ToolPermissionContext::default())
-            .with_tools(state.tools.clone());
+            .with_tools(tools);
         let mut executor = StreamingToolExecutor::new(context.tools.clone(), context);
         // MCPTool's schema is a passthrough object: any object parses, a
         // non-object does not.

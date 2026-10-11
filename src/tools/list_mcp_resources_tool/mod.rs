@@ -394,9 +394,6 @@ mod tests {
                 },
                 config: None,
                 supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
             }],
             ..crate::state::app_state_store::McpState::default()
         };
@@ -508,16 +505,17 @@ rl.on('line', line => {
                         client: discovery.server.client.clone(),
                         config: Some(config.clone()),
                         supports_resources: true,
-                        tools: Vec::new(),
-                        prompts: Vec::new(),
-                        resources: vec![crate::services::mcp::types::ServerResource {
+                    }],
+                    resources: std::collections::BTreeMap::from([(
+                        SERVER.to_string(),
+                        vec![crate::services::mcp::types::ServerResource {
                             server: SERVER.to_string(),
                             uri: "file:///tmp/stale.txt".to_string(),
                             name: "stale".to_string(),
                             description: Some("Stale cached resource".to_string()),
                             mime_type: Some("text/plain".to_string()),
                         }],
-                    }],
+                    )]),
                     ..crate::state::app_state_store::McpState::default()
                 };
 

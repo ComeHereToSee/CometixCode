@@ -493,6 +493,17 @@ impl McpWriter {
         });
     }
 
+    /// Maps to: CC `setAppState(prev => ({ ...prev, mcp: ... }))` writers
+    /// that rewrite `AppState.mcp` directly rather than through
+    /// `updateServer` (`MCPRemoteServerMenu.tsx`'s clear-auth paths).
+    pub fn update(&self, mutator: impl FnOnce(&mut McpState)) {
+        self.store.replace_with(|app| {
+            let mut state = (*app.mcp).clone();
+            mutator(&mut state);
+            app.mcp = Arc::new(state);
+        });
+    }
+
     /// Maps to an official client-only `updateServer` patch (for example a
     /// reconnecting `pending` status) that preserves existing capabilities.
     pub fn apply_client_update(&self, server: McpServerSnapshot) {
@@ -500,51 +511,6 @@ impl McpWriter {
             let mut state = (*app.mcp).clone();
             crate::services::mcp::use_manage_mcp_connections::apply_mcp_client_update(
                 &mut state, server,
-            );
-            app.mcp = Arc::new(state);
-        });
-    }
-
-    /// Maps to MCP tools/list_changed `updateServer({ ...client, tools })`
-    /// (CC `useManageMCPConnections.ts:656`); unrelated command/resource
-    /// ordering is preserved.
-    ///
-    /// The update carries the FULL client captured by the notification
-    /// handler; CC's batched flush (:222-289) has NO `return prevState`
-    /// branch — a missing client is APPENDED (:250-253) and a fresh root is
-    /// always installed. (2026-08-02 2nd addendum: the earlier F-A1
-    /// "return prevState" provenance here was false and is retracted.)
-    pub fn apply_tools_list_changed(&self, update: McpServerSnapshot) {
-        self.store.replace_with(|app| {
-            let mut state = (*app.mcp).clone();
-            crate::services::mcp::use_manage_mcp_connections::apply_mcp_tools_list_changed(
-                &mut state, update,
-            );
-            app.mcp = Arc::new(state);
-        });
-    }
-
-    /// Maps to MCP prompts/list_changed `updateServer({ ...client, commands })`
-    /// (CC `useManageMCPConnections.ts:688-691`); same full-client
-    /// append-when-missing flush semantics as tools above.
-    pub fn apply_prompts_list_changed(&self, update: McpServerSnapshot) {
-        self.store.replace_with(|app| {
-            let mut state = (*app.mcp).clone();
-            crate::services::mcp::use_manage_mcp_connections::apply_mcp_prompts_list_changed(
-                &mut state, update,
-            );
-            app.mcp = Arc::new(state);
-        });
-    }
-
-    /// Maps to MCP resources/list_changed `updateServer({ ...client, resources })`
-    /// (CC `useManageMCPConnections.ts:741`, non-`MCP_SKILLS` branch); same
-    /// full-client append-when-missing flush semantics as tools above.
-    pub fn apply_resources_list_changed(&self, update: McpServerSnapshot) {
-        self.store.replace_with(|app| {
-            let mut state = (*app.mcp).clone();
-            crate::services::mcp::use_manage_mcp_connections::apply_mcp_resources_list_changed(
-                &mut state, update,
             );
             app.mcp = Arc::new(state);
         });
@@ -967,8 +933,7 @@ impl AppState {
 mod tests {
     use super::{AppState, McpState, McpWriter};
     use crate::services::mcp::types::{
-        McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, McpToolSnapshot,
-        ServerResource,
+        McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, ServerResource,
     };
     use std::sync::Arc;
 
@@ -1003,22 +968,22 @@ mod tests {
     fn resolved_servers_apply_in_one_transition_like_official_flush() {
         let store = crate::state::store::AppStore::new(AppState::default(), None);
         let writer = McpWriter::new(store.clone());
-        let server = |name: &str| McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: name.to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            config: None,
-            supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
+        // A resolved server's connection attempt.
+        let server = |name: &str| {
+            crate::services::mcp::client::McpConnectionDiscovery::from(McpServerSnapshot {
+                connection_id: None,
+                client: McpClientSnapshot {
+                    name: name.to_string(),
+                    status: McpServerConnectionType::Connected,
+                    reconnect_attempt: None,
+                    max_reconnect_attempts: None,
+                    ide_name: None,
+                    server_version: None,
+                    error: None,
+                },
+                config: None,
+                supports_resources: false,
+            })
         };
 
         let baseline = store.revision();
@@ -1041,7 +1006,9 @@ mod tests {
         // CC `:219` `if (updates.length === 0) return` — an empty flush is not
         // a transition at all.
         let after = store.revision();
-        writer.apply_server_updates(Vec::<McpServerSnapshot>::new());
+        writer.apply_server_updates(
+            Vec::<crate::services::mcp::client::McpConnectionDiscovery>::new(),
+        );
         assert_eq!(store.revision(), after);
     }
 
@@ -1097,35 +1064,39 @@ mod tests {
             config("docs-mcp"),
         )]));
         // "docs" resolves with a tool.
-        writer.apply_server_update(McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: "docs".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
+        writer.apply_server_update(
+            crate::services::mcp::use_manage_mcp_connections::McpPendingUpdate {
+                server: McpServerSnapshot {
+                    connection_id: None,
+                    client: McpClientSnapshot {
+                        name: "docs".to_string(),
+                        status: McpServerConnectionType::Connected,
+                        reconnect_attempt: None,
+                        max_reconnect_attempts: None,
+                        ide_name: None,
+                        server_version: None,
+                        error: None,
+                    },
+                    // Carry the config forward: `exclude_stale_plugin_clients`
+                    // hashes it, and a mismatch legitimately marks the server
+                    // stale, which CC re-adds as `pending` (:786-789). This
+                    // test is about the merge, not the stale path.
+                    config: Some(stdio_scoped_config("docs-mcp")),
+                    supports_resources: false,
+                },
+                tools: Some(vec![crate::services::mcp::client::mcp_tool_for_test(
+                    "docs",
+                    serde_json::json!({
+                        "name": "search",
+                        "description": "Search docs",
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"readOnlyHint": true}
+                    }),
+                )]),
+                commands: None,
+                resources: None,
             },
-            // Carry the config forward: `exclude_stale_plugin_clients` hashes
-            // it, and a mismatch legitimately marks the server stale, which CC
-            // re-adds as `pending` (:786-789). This test is about the merge,
-            // not the stale path.
-            config: Some(stdio_scoped_config("docs-mcp")),
-            supports_resources: false,
-            tools: vec![McpToolSnapshot {
-                name: "search".to_string(),
-                display_name: None,
-                description: Some("Search docs".to_string()),
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            }],
-            prompts: Vec::new(),
-            resources: Vec::new(),
-        });
+        );
         assert_eq!(writer.current().tools.len(), 1);
 
         // A later seed that adds a DIFFERENT server must not wipe "docs".

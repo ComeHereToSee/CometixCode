@@ -1201,10 +1201,9 @@ fn live_tool_permission_context(
 /// ```
 ///
 /// `McpState.tools` is this port's `currentAppState.mcp.tools` — the same
-/// flat, model-facing projection, materialized by
-/// `client.rs#refresh_flat_mcp_capabilities` → `project_mcp_server_tools`,
-/// which already applies the visible-status filter and builds
-/// `mcp__server__tool` names. So the scan is CC's scan, one field, one loop.
+/// flat, model-facing list the connection flush writes, with the
+/// `mcp__server__tool` names `fetchToolsForClient` builds. So the scan is
+/// CC's scan, one field, one loop.
 ///
 /// This used to walk `mcp_state.clients` and then MERGE `context.tools` as a
 /// "fallback for tests/headless call sites". That merge defeated the poll it
@@ -2914,42 +2913,46 @@ mod tests {
         assert!(cwd_override_path_for_agent_tool(None, None).is_none());
     }
 
-    /// `McpServerSnapshot` fixture for the `requiredMcpServers` chain. A
-    /// `Pending` server carries no tools, mirroring a real connection that has
-    /// not finished — which is exactly why CC waits for it instead of failing.
+    /// A connection attempt for the `requiredMcpServers` chain: the server and
+    /// the tools fetched from it (CC `onConnectionAttempt({ client, tools })`).
+    /// A `Pending` server carries no tools, mirroring a real connection that
+    /// has not finished — which is exactly why CC waits for it instead of
+    /// failing.
     fn mcp_server_fixture(
         name: &str,
         status: crate::services::mcp::types::McpServerConnectionType,
         tool_names: &[&str],
-    ) -> crate::services::mcp::types::McpServerSnapshot {
-        crate::services::mcp::types::McpServerSnapshot {
-            connection_id: None,
-            client: crate::services::mcp::types::McpClientSnapshot {
-                name: name.to_string(),
-                status,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
+    ) -> crate::services::mcp::client::McpConnectionDiscovery {
+        let mut discovery = crate::services::mcp::client::McpConnectionDiscovery::from(
+            crate::services::mcp::types::McpServerSnapshot {
+                connection_id: None,
+                client: crate::services::mcp::types::McpClientSnapshot {
+                    name: name.to_string(),
+                    status,
+                    reconnect_attempt: None,
+                    max_reconnect_attempts: None,
+                    ide_name: None,
+                    server_version: None,
+                    error: None,
+                },
+                config: None,
+                supports_resources: false,
             },
-            config: None,
-            supports_resources: false,
-            tools: tool_names
-                .iter()
-                .map(|tool_name| crate::services::mcp::types::McpToolSnapshot {
-                    name: (*tool_name).to_string(),
-                    display_name: None,
-                    description: None,
-                    input_schema: serde_json::json!({"type":"object"}),
-                    read_only_hint: true,
-                    destructive_hint: false,
-                    open_world_hint: false,
-                })
-                .collect(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
-        }
+        );
+        discovery.tools = tool_names
+            .iter()
+            .map(|tool_name| {
+                crate::services::mcp::client::mcp_tool_for_test(
+                    name,
+                    serde_json::json!({
+                        "name": tool_name,
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"readOnlyHint": true}
+                    }),
+                )
+            })
+            .collect();
+        discovery
     }
 
     fn agent_requiring_mcp_servers(
@@ -3161,23 +3164,24 @@ mod tests {
         assert!(with_server.contains("- issue-filer: file issues"));
     }
 
-    /// The availability scan reads the flat `McpState.tools` projection (CC
+    /// The availability scan reads the flat `McpState.tools` (CC
     /// `currentAppState.mcp.tools`), so fixtures must build it the way
-    /// production does — `refresh_flat_mcp_capabilities` — not hand-fill
-    /// `clients` alone.
+    /// production does — each connection attempt through the flush — not
+    /// hand-fill `clients` alone.
     fn mcp_state_with_servers(
-        clients: Vec<crate::services::mcp::types::McpServerSnapshot>,
+        attempts: Vec<crate::services::mcp::client::McpConnectionDiscovery>,
     ) -> crate::state::app_state_store::McpState {
-        let mut state = crate::state::app_state_store::McpState {
-            clients,
-            ..Default::default()
-        };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
+        let mut state = crate::state::app_state_store::McpState::default();
+        for attempt in attempts {
+            crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
+                &mut state, attempt,
+            );
+        }
         state
     }
 
     fn store_with_mcp_clients(
-        clients: Vec<crate::services::mcp::types::McpServerSnapshot>,
+        clients: Vec<crate::services::mcp::client::McpConnectionDiscovery>,
     ) -> crate::state::store::AppStore {
         let mut initial = crate::state::app_state_store::AppState::default();
         initial.mcp = std::sync::Arc::new(mcp_state_with_servers(clients));
@@ -3299,11 +3303,11 @@ mod tests {
         use crate::services::mcp::types::McpServerConnectionType;
         let agent = agent_requiring_mcp_servers(&["docs"]);
         let mut context = crate::tool::ToolUseContext::default();
-        context.mcp_state.clients = vec![mcp_server_fixture(
+        context.mcp_state = mcp_state_with_servers(vec![mcp_server_fixture(
             "company-docs",
             McpServerConnectionType::Pending,
             &[],
-        )];
+        )]);
         assert!(!context.app_store.is_some());
 
         let started = std::time::Instant::now();

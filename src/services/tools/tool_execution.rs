@@ -1874,6 +1874,23 @@ async fn dynamic_mcp_tool_result(
     request: &PermissionRequest,
     context: &crate::tool::ToolUseContext,
 ) -> Option<RenderableMessage> {
+    // CC `createMcpAuthTool`'s `call` (`McpAuthTool.ts:85-206`): the tool
+    // carries its server and config, and runs OAuth whatever the client's
+    // status is now.
+    if let Some(crate::types::tools::McpToolConnection::Authenticate {
+        server_name,
+        config,
+    }) = context
+        .mcp_state
+        .tools
+        .iter()
+        .find(|tool| tool.is_mcp && tool.name == request.tool_name)
+        .and_then(|tool| tool.mcp_connection.as_ref())
+    {
+        let tool = crate::tools::mcp_auth_tool::create_mcp_auth_tool(server_name, config);
+        let output = tool.call(context).await;
+        return Some(tool.map_tool_result_to_tool_result_block_param(request, output));
+    }
     // Maps to: CC dynamic MCP Tool.call created by
     // `services/mcp/client.ts#fetchToolsForClient`.
     let (server_name, tool_name) = crate::services::mcp::client::resolve_mcp_tool_invocation(
@@ -1885,22 +1902,6 @@ async fn dynamic_mcp_tool_result(
         .clients
         .iter()
         .find(|server| server.client.name == server_name);
-    if tool_name == "authenticate"
-        && server.map(|server| server.client.status)
-            == Some(crate::services::mcp::types::McpServerConnectionType::NeedsAuth)
-    {
-        let Some(config) = server.and_then(|server| server.config.as_ref()).cloned() else {
-            return Some(tool_error_result(
-                request,
-                format!(
-                    "<tool_use_error>Error: MCP server configuration was not found for {server_name}</tool_use_error>"
-                ),
-            ));
-        };
-        let tool = crate::tools::mcp_auth_tool::create_mcp_auth_tool(&server_name, &config);
-        let output = tool.call(context).await;
-        return Some(tool.map_tool_result_to_tool_result_block_param(request, output));
-    }
     let args = match parse_request_input(request) {
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),
@@ -10417,7 +10418,7 @@ rl.on('line', line => {
                     discovery.server.client.status,
                     crate::services::mcp::types::McpServerConnectionType::Connected
                 );
-                assert_eq!(discovery.server.tools.len(), 1);
+                assert_eq!(discovery.tools.len(), 1);
 
                 let tool_name =
                     crate::services::mcp::mcp_string_utils::build_mcp_tool_name(SERVER, "echo");
@@ -10429,14 +10430,8 @@ rl.on('line', line => {
                     serde_json::json!({"query": "docs"}),
                     PermissionMode::Default,
                 );
-                let context = crate::tool::ToolUseContext::default().with_mcp_state({
-                    let mut state = crate::state::app_state_store::McpState {
-                        clients: vec![discovery.server],
-                        ..crate::state::app_state_store::McpState::default()
-                    };
-                    crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
-                    state
-                });
+                let context = crate::tool::ToolUseContext::default()
+                    .with_mcp_state(mcp_state_after_attempt(discovery));
 
                 let message = LocalToolExecutor
                     .result_after_permission(
@@ -10479,11 +10474,13 @@ rl.on('line', line => {
     /// A tool request for `server`'s `tool`, with the server's discovered
     /// snapshot as the only client in the context.
     fn dynamic_mcp_tool_call(
-        server: crate::services::mcp::types::McpServerSnapshot,
+        discovery: crate::services::mcp::client::McpConnectionDiscovery,
         tool: &str,
     ) -> (PermissionRequest, crate::tool::ToolUseContext) {
-        let tool_name =
-            crate::services::mcp::mcp_string_utils::build_mcp_tool_name(&server.client.name, tool);
+        let tool_name = crate::services::mcp::mcp_string_utils::build_mcp_tool_name(
+            &discovery.server.client.name,
+            tool,
+        );
         let request = mock_permission_request_with_input(
             "perm-dynamic-mcp".to_string(),
             "toolu_dynamic_mcp".to_string(),
@@ -10492,15 +10489,20 @@ rl.on('line', line => {
             serde_json::json!({}),
             PermissionMode::Default,
         );
-        let context = crate::tool::ToolUseContext::default().with_mcp_state({
-            let mut state = crate::state::app_state_store::McpState {
-                clients: vec![server],
-                ..crate::state::app_state_store::McpState::default()
-            };
-            crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
-            state
-        });
+        let context = crate::tool::ToolUseContext::default()
+            .with_mcp_state(mcp_state_after_attempt(discovery));
         (request, context)
+    }
+
+    /// `AppState.mcp` after one connection attempt went through the flush.
+    fn mcp_state_after_attempt(
+        discovery: crate::services::mcp::client::McpConnectionDiscovery,
+    ) -> crate::state::app_state_store::McpState {
+        let mut state = crate::state::app_state_store::McpState::default();
+        crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
+            &mut state, discovery,
+        );
+        state
     }
 
     /// CC's MCP tool `call` gets its client from `ensureConnectedClient`
@@ -10522,7 +10524,7 @@ rl.on('line', line => {
                 let config = fixture.config(&[]);
                 let discovery =
                     crate::services::mcp::client::reconnect_mcp_server_impl(SERVER, &config).await;
-                let (request, context) = dynamic_mcp_tool_call(discovery.server, "lookup_1");
+                let (request, context) = dynamic_mcp_tool_call(discovery, "lookup_1");
 
                 for expected_initializes in [1, 2] {
                     // The fixture answers each tool call, then exits.
@@ -10590,7 +10592,7 @@ rl.on('line', line => {
                     discovery.server.client.error
                 );
                 let first_connection = discovery.server.connection_id;
-                let (request, context) = dynamic_mcp_tool_call(discovery.server, "lookup");
+                let (request, context) = dynamic_mcp_tool_call(discovery, "lookup");
                 let message = LocalToolExecutor
                     .result_after_permission(
                         &request,
@@ -10652,7 +10654,7 @@ rl.on('line', line => {
                 let config = fixture.config();
                 let discovery =
                     crate::services::mcp::client::reconnect_mcp_server_impl(SERVER, &config).await;
-                let (request, context) = dynamic_mcp_tool_call(discovery.server, "lookup");
+                let (request, context) = dynamic_mcp_tool_call(discovery, "lookup");
                 let message = LocalToolExecutor
                     .result_after_permission(
                         &request,

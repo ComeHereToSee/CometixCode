@@ -307,7 +307,7 @@ pub async fn toggle_mcp_server_from_manager(
             // The pending row installed above must not be left hanging when the
             // toggle threw; the source's catch path leaves AppState as the
             // manager last wrote it, which for a throw is the failed client.
-            runtime_mcp.apply_server_update(
+            runtime_mcp.apply_client_update(
                 crate::services::mcp::client::McpConnectionDiscovery::failed(
                     server_name,
                     &config,

@@ -18,10 +18,7 @@ use super::client::{
     refresh_mcp_tools_for_client,
 };
 use super::config::{is_mcp_server_disabled, set_mcp_server_enabled};
-use super::types::{
-    McpPromptSnapshot, McpServerConnectionType, McpServerSnapshot, McpToolSnapshot,
-    ScopedMcpServerConfig, ServerResource, Transport,
-};
+use super::types::{McpServerConnectionType, McpServerSnapshot, ScopedMcpServerConfig, Transport};
 use crate::state::app_state_store::{McpState, McpWriter};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -145,33 +142,42 @@ pub fn pending_reconnect_server_update(
 }
 
 /// Maps to: CC `updateServer({ ...client, type: 'failed' })` reconnect final
-/// failure branch. `updateServer` clears tools/commands/resources for failed
-/// clients, so the aggregate runtime snapshot clears capabilities here too.
+/// failure branch. The flush clears a failed client's tools and commands; its
+/// resources key stays (`useManageMCPConnections.ts:270-277`).
 pub fn failed_reconnect_server_update(server: &McpServerSnapshot) -> McpServerSnapshot {
     let mut updated = server.clone();
     updated.client.status = McpServerConnectionType::Failed;
     updated.client.reconnect_attempt = None;
     updated.client.max_reconnect_attempts = None;
     updated.client.error = None;
-    updated.tools.clear();
-    updated.prompts.clear();
-    updated.resources.clear();
     updated
 }
 
-/// Maps to: CC `MCPRemoteServerMenu.tsx#handleClearAuth` AppState update:
-/// mark the regular remote client failed and remove that server's tools,
-/// prompt commands, and resources after revoking tokens and clearing cache.
-pub fn clear_authentication_server_update(server: &McpServerSnapshot) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.client.status = McpServerConnectionType::Failed;
-    updated.client.reconnect_attempt = None;
-    updated.client.max_reconnect_attempts = None;
-    updated.client.error = None;
-    updated.tools.clear();
-    updated.prompts.clear();
-    updated.resources.clear();
-    updated
+/// The `setAppState` both of `MCPRemoteServerMenu`'s clear-auth paths make:
+/// the server's existing client takes `status` and keeps every other field
+/// (`clients.map(c => ... { ...c, type })`, never an append), and its tools,
+/// commands and resources go (`excludeToolsByServer`,
+/// `excludeCommandsByServer`, `excludeResourcesByServer`).
+fn exclude_server_after_clearing_auth(
+    state: &mut McpState,
+    server_name: &str,
+    status: McpServerConnectionType,
+) {
+    for server in &mut state.clients {
+        if server.client.name == server_name {
+            server.client.status = status;
+        }
+    }
+    state.tools = super::utils::exclude_tools_by_server(&state.tools, server_name);
+    state.commands = super::utils::exclude_commands_by_server(&state.commands, server_name);
+    state.resources = super::utils::exclude_resources_by_server(&state.resources, server_name);
+}
+
+/// Maps to: CC `MCPRemoteServerMenu.tsx:443-469` `handleClearAuth`'s
+/// `setAppState`, after the tokens are revoked and the cache cleared: the
+/// client is marked failed ("a misnomer here") and loses its capabilities.
+pub fn clear_authentication_state(state: &mut McpState, server_name: &str) {
+    exclude_server_after_clearing_auth(state, server_name, McpServerConnectionType::Failed);
 }
 
 /// Maps to CC `MCPRemoteServerMenu.tsx#handleAuthenticate` result copy.
@@ -230,55 +236,12 @@ pub async fn authenticate_remote_mcp_server_once(
     Ok((updated, message))
 }
 
-/// Maps to CC `MCPRemoteServerMenu.tsx#handleClaudeAIClearAuthComplete` AppState
-/// update: mark the Claude.ai proxy client as needs-auth and remove tools,
-/// prompt commands, and resources.
-pub fn claude_ai_clear_authentication_server_update(
-    server: &McpServerSnapshot,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.client.status = McpServerConnectionType::NeedsAuth;
-    updated.client.reconnect_attempt = None;
-    updated.client.max_reconnect_attempts = None;
-    updated.client.error = None;
-    updated.tools.clear();
-    updated.prompts.clear();
-    updated.resources.clear();
-    updated
-}
-
-/// Maps to: CC `updateServer({ ...client, tools: newTools })` in the
-/// `tools/list_changed` notification handler.
-pub fn tools_list_changed_server_update(
-    server: &McpServerSnapshot,
-    tools: Vec<McpToolSnapshot>,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.tools = tools;
-    updated
-}
-
-/// Maps to: CC `updateServer({ ...client, commands: [...] })` in the
-/// `prompts/list_changed` notification handler. Cometix stores MCP prompt
-/// commands in `McpServerSnapshot.prompts`.
-pub fn prompts_list_changed_server_update(
-    server: &McpServerSnapshot,
-    prompts: Vec<McpPromptSnapshot>,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.prompts = prompts;
-    updated
-}
-
-/// Maps to: CC `updateServer({ ...client, resources: newResources })` in the
-/// non-`MCP_SKILLS` `resources/list_changed` branch.
-pub fn resources_list_changed_server_update(
-    server: &McpServerSnapshot,
-    resources: Vec<ServerResource>,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.resources = resources;
-    updated
+/// Maps to: CC `MCPRemoteServerMenu.tsx:166-190`
+/// `handleClaudeAIClearAuthComplete`'s `setAppState`, after the cache is
+/// cleared: the claude.ai proxy client becomes needs-auth and loses its
+/// capabilities.
+pub fn claude_ai_clear_authentication_state(state: &mut McpState, server_name: &str) {
+    exclude_server_after_clearing_auth(state, server_name, McpServerConnectionType::NeedsAuth);
 }
 
 /// Maps to: CC `client.client.onclose` branch ordering: disabled servers stop,
@@ -348,7 +311,7 @@ pub async fn handle_mcp_server_closed_event(
         ClosedServerReconnectDecision::SkipDisabled => {}
         ClosedServerReconnectDecision::MarkFailed => {
             let base = reconnect_base_server(&name, &config, runtime_mcp.clone());
-            runtime_mcp.apply_server_update(failed_reconnect_server_update(&base));
+            runtime_mcp.apply_client_update(failed_reconnect_server_update(&base));
         }
         ClosedServerReconnectDecision::StartAutomaticReconnect => {
             start_automatic_mcp_reconnect(name, config, runtime_mcp).await;
@@ -386,9 +349,12 @@ fn resolve_list_changed_client_base(name: &str, runtime_mcp: &McpWriter) -> McpS
 pub async fn handle_mcp_tools_list_changed_event(name: String, runtime_mcp: McpWriter) {
     match refresh_mcp_tools_for_client(&name).await {
         Ok(tools) => {
-            let mut update = resolve_list_changed_client_base(&name, &runtime_mcp);
-            update.tools = tools;
-            runtime_mcp.apply_tools_list_changed(update);
+            runtime_mcp.apply_server_update(McpPendingUpdate {
+                server: resolve_list_changed_client_base(&name, &runtime_mcp),
+                tools: Some(tools),
+                commands: None,
+                resources: None,
+            });
         }
         Err(error) => {
             tracing::warn!(server = %name, error = %error, "failed to refresh MCP tools after list_changed notification")
@@ -401,10 +367,13 @@ pub async fn handle_mcp_tools_list_changed_event(name: String, runtime_mcp: McpW
 /// (`updateServer({ ...client, commands: [...] })`, :688-691).
 pub async fn handle_mcp_prompts_list_changed_event(name: String, runtime_mcp: McpWriter) {
     match refresh_mcp_prompts_for_client(&name).await {
-        Ok(prompts) => {
-            let mut update = resolve_list_changed_client_base(&name, &runtime_mcp);
-            update.prompts = prompts;
-            runtime_mcp.apply_prompts_list_changed(update);
+        Ok(commands) => {
+            runtime_mcp.apply_server_update(McpPendingUpdate {
+                server: resolve_list_changed_client_base(&name, &runtime_mcp),
+                tools: None,
+                commands: Some(commands),
+                resources: None,
+            });
         }
         Err(error) => {
             tracing::warn!(server = %name, error = %error, "failed to refresh MCP prompts after list_changed notification")
@@ -419,9 +388,12 @@ pub async fn handle_mcp_prompts_list_changed_event(name: String, runtime_mcp: Mc
 pub async fn handle_mcp_resources_list_changed_event(name: String, runtime_mcp: McpWriter) {
     match refresh_mcp_resources_for_client(&name).await {
         Ok(resources) => {
-            let mut update = resolve_list_changed_client_base(&name, &runtime_mcp);
-            update.resources = resources;
-            runtime_mcp.apply_resources_list_changed(update);
+            runtime_mcp.apply_server_update(McpPendingUpdate {
+                server: resolve_list_changed_client_base(&name, &runtime_mcp),
+                tools: None,
+                commands: None,
+                resources: Some(resources),
+            });
         }
         Err(error) => {
             tracing::warn!(server = %name, error = %error, "failed to refresh MCP resources after list_changed notification")
@@ -1073,7 +1045,9 @@ pub fn initialize_servers_as_pending(
             McpConnectionDiscovery::pending_with_config(name, config).server
         };
         new_clients.push(name.to_owned());
-        apply_mcp_server_update(&mut state, server);
+        // CC `:833` `clients: [...mcpWithoutStale.clients, ...newClients]`:
+        // appended as they are, through no flush.
+        state.clients.push(server);
     }
     InitializeServersAsPendingResult {
         state,
@@ -1685,28 +1659,17 @@ impl From<McpConnectionDiscovery> for McpPendingUpdate {
     }
 }
 
-// Native full-snapshot callers provide all dimensions; callback callers retain
-// their actual supplied tools (including the source-positioned resource helpers).
-impl From<McpServerSnapshot> for McpPendingUpdate {
-    fn from(server: McpServerSnapshot) -> Self {
-        Self {
-            tools: Some(super::client::mcp_tools_for_server_snapshot(&server)),
-            commands: Some(super::client::mcp_commands_for_server_snapshot(&server)),
-            resources: Some(server.resources.clone()),
-            server,
-        }
-    }
-}
-
-/// Maps to: CC `useManageMCPConnections.ts#flushPendingUpdates`.
+/// Maps to: CC `useManageMCPConnections.ts:216-291#flushPendingUpdates`, the
+/// body of its loop for one update.
 pub fn apply_mcp_server_update(state: &mut McpState, update: impl Into<McpPendingUpdate>) {
     let McpPendingUpdate {
-        mut server,
+        server,
         mut tools,
         mut commands,
         mut resources,
     } = update.into();
     let name = server.client.name.clone();
+    // `:232-243`: a disabled or failed client clears what it does not supply.
     if matches!(
         server.client.status,
         McpServerConnectionType::Disabled | McpServerConnectionType::Failed
@@ -1715,28 +1678,8 @@ pub fn apply_mcp_server_update(state: &mut McpState, update: impl Into<McpPendin
         commands.get_or_insert_with(Vec::new);
         resources.get_or_insert_with(Vec::new);
     }
-    // Snapshots retain native remote capability caches. Undefined callback
-    // dimensions preserve existing caches; for a new client they contribute
-    // no cache. A forced empty dimension also clears its native cache.
-    let previous = state
-        .clients
-        .iter()
-        .find(|client| client.client.name == name);
-    if tools.is_none() {
-        server.tools = previous.map(|p| p.tools.clone()).unwrap_or_default();
-    } else if tools.as_ref().is_some_and(Vec::is_empty) {
-        server.tools.clear();
-    }
-    if commands.is_none() {
-        server.prompts = previous.map(|p| p.prompts.clone()).unwrap_or_default();
-    } else if commands.as_ref().is_some_and(Vec::is_empty) {
-        server.prompts.clear();
-    }
-    if resources.is_none() {
-        server.resources = previous.map(|p| p.resources.clone()).unwrap_or_default();
-    } else {
-        server.resources = resources.as_ref().unwrap().clone();
-    }
+    // `:255-268`: `undefined` keeps a dimension; otherwise the server's tools
+    // (by prefix) and commands (by `commandBelongsToServer`) are replaced.
     if let Some(tools) = tools {
         let prefix = format!(
             "mcp__{}__",
@@ -1782,48 +1725,6 @@ pub fn apply_mcp_client_update(state: &mut McpState, server: McpServerSnapshot) 
     );
 }
 
-/// Maps to: CC `useManageMCPConnections.ts#tools/list_changed` updateServer.
-pub fn apply_mcp_tools_list_changed(state: &mut McpState, server: McpServerSnapshot) {
-    let tools = Some(super::client::mcp_tools_for_server_snapshot(&server));
-    apply_mcp_server_update(
-        state,
-        McpPendingUpdate {
-            server,
-            tools,
-            commands: None,
-            resources: None,
-        },
-    );
-}
-
-/// Maps to: CC `useManageMCPConnections.ts#prompts/list_changed` updateServer.
-pub fn apply_mcp_prompts_list_changed(state: &mut McpState, server: McpServerSnapshot) {
-    let commands = Some(super::client::mcp_commands_for_server_snapshot(&server));
-    apply_mcp_server_update(
-        state,
-        McpPendingUpdate {
-            server,
-            tools: None,
-            commands,
-            resources: None,
-        },
-    );
-}
-
-/// Maps to: CC `useManageMCPConnections.ts#resources/list_changed` updateServer.
-pub fn apply_mcp_resources_list_changed(state: &mut McpState, server: McpServerSnapshot) {
-    let resources = Some(server.resources.clone());
-    apply_mcp_server_update(
-        state,
-        McpPendingUpdate {
-            server,
-            tools: None,
-            commands: None,
-            resources,
-        },
-    );
-}
-
 /// Maps to: CC `useMcpToggleEnabled()` / `toggleMcpServer`.
 pub async fn toggle_mcp_server_once(
     name: &str,
@@ -1854,7 +1755,9 @@ pub async fn toggle_mcp_server_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::mcp::types::{ConfigScope, ScopedMcpServerConfig, Transport};
+    use crate::services::mcp::types::{
+        ConfigScope, ScopedMcpServerConfig, ServerResource, Transport,
+    };
     use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
@@ -2165,10 +2068,11 @@ mod tests {
                 async move {
                     started_tx.send(name).await.unwrap();
                     gate.await.unwrap();
-                    pending.update_server(
-                        McpConnectionDiscovery::failed(name, &stdio_config(name), "controlled")
-                            .server,
-                    );
+                    pending.update_server(McpConnectionDiscovery::failed(
+                        name,
+                        &stdio_config(name),
+                        "controlled",
+                    ));
                 }
             },
         );
@@ -2234,8 +2138,8 @@ mod tests {
         crate::utils::process_runtime::process_runtime_handle()
             .unwrap()
             .spawn(async move {
-                process_pending.update_server(McpConnectionDiscovery::pending("z").server);
-                process_pending.update_server(McpConnectionDiscovery::pending("a").server);
+                process_pending.update_server(McpConnectionDiscovery::pending("z"));
+                process_pending.update_server(McpConnectionDiscovery::pending("a"));
                 completed.send(()).unwrap();
             });
         observed.await.unwrap();
@@ -2268,7 +2172,7 @@ mod tests {
         );
         let pending = McpPendingUpdates::new(McpWriter::new(store.clone()));
         let turn = crate::state::store::enter_store_turn_segment();
-        pending.update_server(McpConnectionDiscovery::pending("old").server);
+        pending.update_server(McpConnectionDiscovery::pending("old"));
         let generation = pending.state.lock().unwrap().timer.as_ref().unwrap().0;
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -2290,7 +2194,7 @@ mod tests {
         // McpWriter, allowing a newer flush to overtake the detached old batch.
         assert_eq!(pending.state.lock().unwrap().updates.len(), 1);
         assert!(pending.state.lock().unwrap().timer.is_some());
-        pending.update_server(McpConnectionDiscovery::pending("new").server);
+        pending.update_server(McpConnectionDiscovery::pending("new"));
         drop(turn);
         finished_rx
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -2324,13 +2228,13 @@ mod tests {
             if !fired.swap(true, Ordering::SeqCst) {
                 // Real synchronous store listener reentry must not deadlock
                 // on the pending-data mutex or lose the newly armed timer.
-                callback_pending.update_server(McpConnectionDiscovery::pending("reentrant").server);
+                callback_pending.update_server(McpConnectionDiscovery::pending("reentrant"));
             }
         }));
         let (finished, observed) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let _turn = crate::state::store::enter_store_turn_segment();
-            pending.update_server(McpConnectionDiscovery::pending("first").server);
+            pending.update_server(McpConnectionDiscovery::pending("first"));
             let canceled_generation = pending.state.lock().unwrap().timer.as_ref().unwrap().0;
             pending.cleanup();
             assert_eq!(store.revision(), 1);
@@ -2387,7 +2291,7 @@ mod tests {
         }));
         runtime.block_on(async {
             // Register inside the runtime so Instant::now uses its paused clock.
-            pending.update_server(McpConnectionDiscovery::pending("delayed-poll").server);
+            pending.update_server(McpConnectionDiscovery::pending("delayed-poll"));
             tokio::time::advance(std::time::Duration::from_millis(MCP_BATCH_FLUSH_MS + 10)).await;
             tokio::time::timeout(std::time::Duration::from_millis(8), changed_rx.recv())
                 .await
@@ -2842,38 +2746,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reconnect_pending_and_failed_updates_match_official_update_server_semantics() {
-        let config = stdio_config("docs-mcp");
-        let mut server = McpConnectionDiscovery::pending_with_config("docs", &config).server;
+    /// An `mcp.tools` entry for `server`, as `fetchToolsForClient` makes it.
+    fn flat_tool(server: &str, name: &str) -> crate::types::tools::Tool {
+        crate::services::mcp::client::mcp_tool_for_test(
+            server,
+            serde_json::json!({"name": name, "inputSchema": {"type": "object"}}),
+        )
+    }
+
+    /// An `mcp.commands` entry for `server`, as `fetchCommandsForClient`
+    /// makes it.
+    fn flat_command(server: &str, prompt: &str) -> crate::commands::Command {
+        crate::services::mcp::client::mcp_command_for_test(server, prompt, None, &[])
+    }
+
+    fn flat_resource(server: &str, uri: &str) -> ServerResource {
+        ServerResource {
+            server: server.to_string(),
+            uri: uri.to_string(),
+            name: uri.to_string(),
+            description: None,
+            mime_type: None,
+        }
+    }
+
+    fn connected_server(name: &str) -> McpServerSnapshot {
+        let mut server =
+            McpConnectionDiscovery::pending_with_config(name, &stdio_config(name)).server;
         server.client.status = McpServerConnectionType::Connected;
         server
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "search".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({ "type": "object" }),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        server
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-        server
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "docs".to_string(),
-                uri: "docs://one".to_string(),
-                name: "one".to_string(),
-                description: None,
-                mime_type: None,
-            });
+    }
+
+    fn server_update(
+        server: McpServerSnapshot,
+        tools: Option<Vec<crate::types::tools::Tool>>,
+        commands: Option<Vec<crate::commands::Command>>,
+        resources: Option<Vec<ServerResource>>,
+    ) -> McpPendingUpdate {
+        McpPendingUpdate {
+            server,
+            tools,
+            commands,
+            resources,
+        }
+    }
+
+    fn tool_names(state: &McpState) -> Vec<&str> {
+        state.tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    fn command_names(state: &McpState) -> Vec<&str> {
+        state
+            .commands
+            .iter()
+            .map(|command| command.name.as_ref())
+            .collect()
+    }
+
+    /// `docs` connected with one tool, prompt command and resource.
+    fn docs_state() -> McpState {
+        let mut state = McpState::default();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("docs"),
+                Some(vec![flat_tool("docs", "search")]),
+                Some(vec![flat_command("docs", "prompt")]),
+                Some(vec![flat_resource("docs", "docs://one")]),
+            ),
+        );
+        state
+    }
+
+    /// CC's reconnect loop writes `{ ...client, type: 'pending',
+    /// reconnectAttempt, maxReconnectAttempts }` and, on giving up,
+    /// `{ ...client, type: 'failed' }`, both through `updateServer` with no
+    /// capability dimensions. The flush keeps a pending client's capabilities
+    /// and clears a failed one's tools and commands; its resources key stays
+    /// (`useManageMCPConnections.ts:270-277` spreads the old map before
+    /// `omit(old, name)`).
+    #[test]
+    fn reconnect_pending_and_failed_updates_match_official_update_server_semantics() {
+        let mut state = docs_state();
+        let server = state.clients[0].clone();
 
         let pending = pending_reconnect_server_update(&server, 2);
         assert_eq!(pending.client.status, McpServerConnectionType::Pending);
@@ -2882,24 +2837,98 @@ mod tests {
             pending.client.max_reconnect_attempts,
             Some(MAX_RECONNECT_ATTEMPTS)
         );
-        assert_eq!(pending.tools.len(), 1);
-        assert_eq!(pending.prompts.len(), 1);
-        assert_eq!(pending.resources.len(), 1);
+        apply_mcp_client_update(&mut state, pending);
+        assert_eq!(tool_names(&state), vec!["mcp__docs__search"]);
+        assert_eq!(command_names(&state), vec!["mcp__docs__prompt"]);
+        assert_eq!(state.resources["docs"].len(), 1);
 
         let failed = failed_reconnect_server_update(&server);
         assert_eq!(failed.client.status, McpServerConnectionType::Failed);
         assert_eq!(failed.client.reconnect_attempt, None);
-        assert!(failed.tools.is_empty());
-        assert!(failed.prompts.is_empty());
-        assert!(failed.resources.is_empty());
+        apply_mcp_client_update(&mut state, failed);
+        assert_eq!(
+            state.clients[0].client.status,
+            McpServerConnectionType::Failed
+        );
+        assert!(state.tools.is_empty());
+        assert!(state.commands.is_empty());
+        assert_eq!(state.resources["docs"].len(), 1);
+    }
 
-        let cleared = clear_authentication_server_update(&server);
-        assert_eq!(cleared.client.status, McpServerConnectionType::Failed);
-        assert_eq!(cleared.client.reconnect_attempt, None);
-        assert_eq!(cleared.client.max_reconnect_attempts, None);
-        assert!(cleared.tools.is_empty());
-        assert!(cleared.prompts.is_empty());
-        assert!(cleared.resources.is_empty());
+    /// The flush's `rawX ?? []` (`useManageMCPConnections.ts:232-243`) only
+    /// fills an absent dimension: a disabled or failed update that supplies
+    /// one writes what it supplies.
+    #[test]
+    fn disabled_and_failed_updates_write_the_dimensions_they_supply() {
+        let mut state = docs_state();
+        let mut failed = connected_server("docs");
+        failed.client.status = McpServerConnectionType::Failed;
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                failed,
+                Some(vec![flat_tool("docs", "authenticate")]),
+                None,
+                Some(vec![flat_resource("docs", "docs://two")]),
+            ),
+        );
+        assert_eq!(tool_names(&state), vec!["mcp__docs__authenticate"]);
+        assert!(state.commands.is_empty());
+        assert_eq!(state.resources["docs"][0].uri, "docs://two");
+
+        let mut disabled = connected_server("docs");
+        disabled.client.status = McpServerConnectionType::Disabled;
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                disabled,
+                None,
+                Some(vec![flat_command("docs", "kept")]),
+                None,
+            ),
+        );
+        assert!(state.tools.is_empty());
+        assert_eq!(command_names(&state), vec!["mcp__docs__kept"]);
+        assert_eq!(state.resources["docs"][0].uri, "docs://two");
+    }
+
+    /// CC `MCPRemoteServerMenu.tsx:166-190` and `:443-469` write
+    /// `AppState.mcp` directly: the existing client changes type (never
+    /// appended), and `exclude*ByServer` drop its tools, commands and resources
+    /// key — unlike the flush, which keeps the key.
+    #[test]
+    fn clear_auth_states_match_official_menu_set_app_state() {
+        let mut state = docs_state();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("other"),
+                Some(vec![flat_tool("other", "keep")]),
+                Some(vec![flat_command("other", "keep")]),
+                Some(vec![flat_resource("other", "other://keep")]),
+            ),
+        );
+
+        clear_authentication_state(&mut state, "docs");
+        assert_eq!(
+            state.clients[0].client.status,
+            McpServerConnectionType::Failed
+        );
+        assert_eq!(tool_names(&state), vec!["mcp__other__keep"]);
+        assert_eq!(command_names(&state), vec!["mcp__other__keep"]);
+        assert!(!state.resources.contains_key("docs"));
+        assert!(state.resources.contains_key("other"));
+
+        claude_ai_clear_authentication_state(&mut state, "other");
+        assert_eq!(
+            state.clients[1].client.status,
+            McpServerConnectionType::NeedsAuth
+        );
+        assert!(state.tools.is_empty());
+        assert!(state.resources.is_empty());
+
+        claude_ai_clear_authentication_state(&mut state, "absent");
+        assert_eq!(state.clients.len(), 2, "`clients.map` never appends");
     }
 
     #[test]
@@ -2923,97 +2952,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_ai_clear_update_matches_official_menu_state() {
-        let mut server = McpConnectionDiscovery::pending_with_config(
-            "claudeai",
-            &claude_ai_proxy_config(Some("mcpsrv_abc")),
-        )
-        .server;
-        server.client.status = McpServerConnectionType::Connected;
-        server
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "tool".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        let cleared = claude_ai_clear_authentication_server_update(&server);
-        assert_eq!(cleared.client.status, McpServerConnectionType::NeedsAuth);
-        assert!(cleared.tools.is_empty());
-    }
-
-    #[test]
-    fn list_changed_update_helpers_match_official_update_server_semantics() {
-        let config = stdio_config("docs-mcp");
-        let mut server = McpConnectionDiscovery::pending_with_config("docs", &config).server;
-        server.client.status = McpServerConnectionType::Connected;
-        let old_tool = crate::services::mcp::types::McpToolSnapshot {
-            name: "old-tool".to_string(),
-            display_name: None,
-            description: None,
-            input_schema: serde_json::json!({ "type": "object" }),
-            read_only_hint: true,
-            destructive_hint: false,
-            open_world_hint: false,
-        };
-        let old_prompt = crate::services::mcp::types::McpPromptSnapshot {
-            name: "old-prompt".to_string(),
-            description: None,
-            arg_names: Vec::new(),
-        };
-        let old_resource = crate::services::mcp::types::ServerResource {
-            server: "docs".to_string(),
-            uri: "docs://old".to_string(),
-            name: "old-resource".to_string(),
-            description: None,
-            mime_type: None,
-        };
-        server.tools = vec![old_tool.clone()];
-        server.prompts = vec![old_prompt.clone()];
-        server.resources = vec![old_resource.clone()];
-
-        let new_tool = crate::services::mcp::types::McpToolSnapshot {
-            name: "new-tool".to_string(),
-            ..old_tool.clone()
-        };
-        let tool_update = tools_list_changed_server_update(&server, vec![new_tool.clone()]);
-        assert_eq!(tool_update.tools, vec![new_tool]);
-        assert_eq!(tool_update.prompts, vec![old_prompt.clone()]);
-        assert_eq!(tool_update.resources, vec![old_resource.clone()]);
-        assert_eq!(
-            tool_update.client.status,
-            McpServerConnectionType::Connected
-        );
-
-        let new_prompt = crate::services::mcp::types::McpPromptSnapshot {
-            name: "new-prompt".to_string(),
-            description: Some("fresh".to_string()),
-            arg_names: vec!["arg".to_string()],
-        };
-        let prompt_update = prompts_list_changed_server_update(&server, vec![new_prompt.clone()]);
-        assert_eq!(prompt_update.tools, vec![old_tool.clone()]);
-        assert_eq!(prompt_update.prompts, vec![new_prompt]);
-        assert_eq!(prompt_update.resources, vec![old_resource.clone()]);
-
-        let new_resource = crate::services::mcp::types::ServerResource {
-            server: "docs".to_string(),
-            uri: "docs://new".to_string(),
-            name: "new-resource".to_string(),
-            description: Some("fresh".to_string()),
-            mime_type: Some("text/plain".to_string()),
-        };
-        let resource_update =
-            resources_list_changed_server_update(&server, vec![new_resource.clone()]);
-        assert_eq!(resource_update.tools, vec![old_tool]);
-        assert_eq!(resource_update.prompts, vec![old_prompt]);
-        assert_eq!(resource_update.resources, vec![new_resource]);
-    }
-
-    #[test]
     fn apply_mcp_server_update_replaces_in_place_like_official_updated_clients() {
         let mut state = McpState {
             clients: vec![
@@ -3024,7 +2962,7 @@ mod tests {
         };
         apply_mcp_server_update(
             &mut state,
-            McpConnectionDiscovery::failed("alpha", &stdio_config("alpha"), "boom").server,
+            McpConnectionDiscovery::failed("alpha", &stdio_config("alpha"), "boom"),
         );
         assert_eq!(state.clients[0].client.name, "alpha");
         assert_eq!(
@@ -3036,64 +2974,34 @@ mod tests {
 
     #[test]
     fn server_update_replaces_only_its_flat_entries_and_appends_fresh_capabilities() {
-        let mut alpha = McpConnectionDiscovery::pending("alpha").server;
-        alpha.client.status = McpServerConnectionType::Connected;
-        alpha
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "old".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        alpha
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "old-prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-        alpha
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "alpha".to_string(),
-                uri: "alpha://old".to_string(),
-                name: "old".to_string(),
-                description: None,
-                mime_type: None,
-            });
-
-        let mut beta = McpConnectionDiscovery::pending("beta").server;
-        beta.client.status = McpServerConnectionType::Connected;
-        beta.tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "keep".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        beta.prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "keep-prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-
-        let mut state = McpState {
-            clients: vec![alpha.clone(), beta],
-            ..McpState::default()
-        };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
-        alpha.tools[0].name = "new".to_string();
-        alpha.prompts[0].name = "new-prompt".to_string();
-        alpha.resources[0].uri = "alpha://new".to_string();
-        apply_mcp_server_update(&mut state, alpha);
+        let mut state = McpState::default();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("alpha"),
+                Some(vec![flat_tool("alpha", "old")]),
+                Some(vec![flat_command("alpha", "old-prompt")]),
+                Some(vec![flat_resource("alpha", "alpha://old")]),
+            ),
+        );
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("beta"),
+                Some(vec![flat_tool("beta", "keep")]),
+                Some(vec![flat_command("beta", "keep-prompt")]),
+                None,
+            ),
+        );
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("alpha"),
+                Some(vec![flat_tool("alpha", "new")]),
+                Some(vec![flat_command("alpha", "new-prompt")]),
+                Some(vec![flat_resource("alpha", "alpha://new")]),
+            ),
+        );
 
         assert_eq!(
             state
@@ -3120,19 +3028,13 @@ mod tests {
             .iter()
             .map(|command| command.name.to_string())
             .collect::<Vec<_>>();
-        // CC updateServer({ ...client, tools }): the update carries the full
-        // captured client with the refreshed tools list.
-        let mut alpha_tools_update = state.clients[0].clone();
-        alpha_tools_update.tools = vec![crate::services::mcp::types::McpToolSnapshot {
-            name: "newer".to_string(),
-            display_name: None,
-            description: None,
-            input_schema: serde_json::json!({"type":"object"}),
-            read_only_hint: false,
-            destructive_hint: false,
-            open_world_hint: false,
-        }];
-        apply_mcp_tools_list_changed(&mut state, alpha_tools_update);
+        // CC updateServer({ ...client, tools }): the captured client with the
+        // refreshed tools, every other dimension absent.
+        let alpha = state.clients[0].clone();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(alpha, Some(vec![flat_tool("alpha", "newer")]), None, None),
+        );
         assert_eq!(
             state
                 .tools
@@ -3157,13 +3059,16 @@ mod tests {
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
-        let mut alpha_prompts_update = state.clients[0].clone();
-        alpha_prompts_update.prompts = vec![crate::services::mcp::types::McpPromptSnapshot {
-            name: "newer-prompt".to_string(),
-            description: None,
-            arg_names: Vec::new(),
-        }];
-        apply_mcp_prompts_list_changed(&mut state, alpha_prompts_update);
+        let alpha = state.clients[0].clone();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                alpha,
+                None,
+                Some(vec![flat_command("alpha", "newer-prompt")]),
+                None,
+            ),
+        );
         assert_eq!(
             state
                 .tools
@@ -3195,28 +3100,18 @@ mod tests {
         // `mcp.clients` is APPENDED (`[...mcp.clients, client]`) — never
         // skipped. The update's other dimensions stay `undefined` (no
         // commands/resources contribution for the appended client).
-        let mut existing = McpConnectionDiscovery::pending("alpha").server;
-        existing.client.status = McpServerConnectionType::Connected;
-        let mut state = McpState {
-            clients: vec![existing],
-            ..McpState::default()
-        };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
+        let mut state = McpState::default();
+        apply_mcp_client_update(&mut state, connected_server("alpha"));
 
-        let mut gamma = McpConnectionDiscovery::pending("gamma").server;
-        gamma.client.status = McpServerConnectionType::Connected;
-        gamma
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "fresh".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        apply_mcp_tools_list_changed(&mut state, gamma);
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("gamma"),
+                Some(vec![flat_tool("gamma", "fresh")]),
+                None,
+                None,
+            ),
+        );
 
         assert_eq!(
             state
@@ -3233,26 +3128,23 @@ mod tests {
                 .iter()
                 .any(|tool| tool.name == "mcp__gamma__fresh")
         );
-        let appended = &state.clients[1];
-        assert!(appended.prompts.is_empty());
-        assert!(appended.resources.is_empty());
         assert!(
             state.commands.is_empty(),
             "undefined dimensions must not contribute aggregates"
         );
+        assert!(!state.resources.contains_key("gamma"));
 
         // prompts/list_changed for another unknown client appends likewise.
         let tools_before_delta = state.tools.clone();
-        let mut delta = McpConnectionDiscovery::pending("delta").server;
-        delta.client.status = McpServerConnectionType::Connected;
-        delta
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "fresh-prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-        apply_mcp_prompts_list_changed(&mut state, delta);
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("delta"),
+                None,
+                Some(vec![flat_command("delta", "fresh-prompt")]),
+                None,
+            ),
+        );
         assert_eq!(state.clients[2].client.name, "delta");
         assert!(
             state
@@ -3260,33 +3152,26 @@ mod tests {
                 .iter()
                 .any(|command| command.name.as_ref() == "mcp__delta__fresh-prompt")
         );
-        assert!(state.clients[2].tools.is_empty());
-        assert!(state.clients[2].resources.is_empty());
         assert_eq!(
             state.tools, tools_before_delta,
             "prompts append must not move tool aggregates"
         );
         assert!(!state.resources.contains_key("delta"));
 
-        // resources/list_changed appends and projects the resources map.
+        // resources/list_changed appends and writes the resources map.
         let tools_before_epsilon = state.tools.clone();
         let commands_before_epsilon = state.commands.clone();
-        let mut epsilon = McpConnectionDiscovery::pending("epsilon").server;
-        epsilon.client.status = McpServerConnectionType::Connected;
-        epsilon
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "epsilon".to_string(),
-                uri: "epsilon://fresh".to_string(),
-                name: "fresh".to_string(),
-                description: None,
-                mime_type: None,
-            });
-        apply_mcp_resources_list_changed(&mut state, epsilon);
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("epsilon"),
+                None,
+                None,
+                Some(vec![flat_resource("epsilon", "epsilon://fresh")]),
+            ),
+        );
         assert_eq!(state.clients[3].client.name, "epsilon");
         assert_eq!(state.resources["epsilon"][0].uri, "epsilon://fresh");
-        assert!(state.clients[3].tools.is_empty());
-        assert!(state.clients[3].prompts.is_empty());
         assert_eq!(
             state.tools, tools_before_epsilon,
             "resources append must not move tool aggregates"
@@ -3305,44 +3190,26 @@ mod tests {
         assert!(state.tools.is_empty());
         assert!(state.commands.is_empty());
 
+        // CC `onConnectionAttempt({ client, tools, commands, resources })`.
         let mut connected =
             McpConnectionDiscovery::pending_with_config("docs", &configs["docs"]).server;
         connected.client.status = McpServerConnectionType::Connected;
-        connected
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "search".to_string(),
-                display_name: None,
-                description: Some("Search docs".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        connected
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "summarize".to_string(),
-                description: Some("Summarize docs".to_string()),
-                arg_names: Vec::new(),
-            });
-        connected
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "docs".to_string(),
-                uri: "docs://guide".to_string(),
-                name: "guide".to_string(),
-                description: None,
-                mime_type: Some("text/plain".to_string()),
-            });
-        apply_mcp_server_update(&mut state, connected);
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected,
+                Some(vec![flat_tool("docs", "search")]),
+                Some(vec![flat_command("docs", "summarize")]),
+                Some(vec![flat_resource("docs", "docs://guide")]),
+            ),
+        );
         assert_eq!(state.tools[0].name, "mcp__docs__search");
         assert_eq!(state.commands[0].name, "mcp__docs__summarize");
         assert_eq!(state.resources["docs"][0].uri, "docs://guide");
 
         apply_mcp_server_update(
             &mut state,
-            McpConnectionDiscovery::failed("docs", &configs["docs"], "offline").server,
+            McpConnectionDiscovery::failed("docs", &configs["docs"], "offline"),
         );
         assert!(state.tools.is_empty());
         assert!(state.commands.is_empty());

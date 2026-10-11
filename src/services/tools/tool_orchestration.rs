@@ -554,46 +554,35 @@ mod tests {
 
     #[test]
     fn dynamic_mcp_read_only_annotation_controls_concurrency() {
-        let mut server =
-            crate::services::mcp::client::McpConnectionDiscovery::pending("docs").server;
-        server.client.status = crate::services::mcp::types::McpServerConnectionType::Connected;
-        server
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "lookup".to_string(),
-                display_name: None,
-                description: Some("lookup docs".to_string()),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                    "additionalProperties": false
+        let tools = vec![
+            crate::services::mcp::client::mcp_tool_for_test(
+                "docs",
+                serde_json::json!({
+                    "name": "lookup",
+                    "description": "lookup docs",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": false
+                    },
+                    "annotations": {"readOnlyHint": true}
                 }),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        server
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "write".to_string(),
-                display_name: None,
-                description: Some("write docs".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        let mut state = crate::state::app_state_store::McpState {
-            clients: vec![server],
-            ..crate::state::app_state_store::McpState::default()
-        };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
+            ),
+            crate::services::mcp::client::mcp_tool_for_test(
+                "docs",
+                serde_json::json!({
+                    "name": "write",
+                    "description": "write docs",
+                    "inputSchema": {"type": "object"}
+                }),
+            ),
+        ];
         let tool_name = "mcp__docs__lookup";
         // The annotation travels on the tool (CC `isConcurrencySafe()` closes
         // over it); the context carries no MCP state to look it up in.
         let context = ToolUseContext::with_permission_context(ToolPermissionContext::default())
-            .with_tools(state.tools.clone());
+            .with_tools(tools);
         let block = |id: &str, name: &str, input| ToolUseBlock {
             id: crate::types::ids::ToolUseId(id.to_string()),
             name: name.to_string(),
