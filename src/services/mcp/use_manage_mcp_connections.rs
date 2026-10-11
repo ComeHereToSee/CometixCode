@@ -502,8 +502,8 @@ struct ConnectionAttemptRegistry {
     /// Maps to: CC `useIdeSelection(mcp.clients, setIDESelection)` — the
     /// REPL-owned selection sender. Stored here only as the threading path;
     /// the live per-connection sink is the clone captured by each "ide"
-    /// entry in `CONNECTED_CLIENTS` (dropped with the entry — CC
-    /// useIdeSelection.ts:148 "No cleanup needed").
+    /// connection in `CONNECTED_CLIENTS` (released when it leaves the
+    /// registry — CC useIdeSelection.ts:148 "No cleanup needed").
     ide_selection_sink:
         Option<async_channel::Sender<crate::hooks::use_ide_selection::IdeSelection>>,
 }

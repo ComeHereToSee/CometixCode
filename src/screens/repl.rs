@@ -4538,7 +4538,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // live-managed MCP connections ever carry a selection handler. Cometix
     // registers the sink with the live connection registry
     // (`CONNECTED_CLIENTS`), which holds exactly those live-managed
-    // connections; entry removal drops the per-connection sink clone
+    // connections; leaving the registry releases the per-connection sink clone
     // (useIdeSelection.ts:148 "No cleanup needed") and identity changes send
     // the CC-shaped reset object through this channel
     // (useIdeSelection.ts:73-83).
