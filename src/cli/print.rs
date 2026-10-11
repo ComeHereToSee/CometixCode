@@ -329,10 +329,7 @@ async fn resolve_headless_mcp(
         clients: crate::utils::process_env::ecmascript_object_entries(&configs)
             .into_iter()
             .map(|(name, config)| {
-                crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
-                    name, config,
-                )
-                .server
+                crate::services::mcp::client::McpConnectionDiscovery::pending(name, config).server
             })
             .collect(),
         ..Default::default()
@@ -842,14 +839,9 @@ async fn handle_control_request(
             }));
         }
         "mcp_status" => {
-            // CC reads `connection.capabilities` straight off the client
-            // records it is already filtering; Rust keeps them on the live
-            // peers, so they are fetched here and handed to the projection.
-            let experimental =
-                crate::services::mcp::client::experimental_capabilities_by_server().await;
             let servers = engine
                 .mcp_state()
-                .map(|state| build_mcp_server_statuses(state, &experimental))
+                .map(build_mcp_server_statuses)
                 .unwrap_or_default();
             control_success(
                 &control.request_id,
@@ -873,7 +865,7 @@ async fn handle_control_request(
                         .iter()
                         .find(|server| server.name() == server_name)
                 })
-                .and_then(|server| server.config.clone());
+                .map(|server| server.config().clone());
             let Some(config) = config else {
                 control_error(
                     &control.request_id,
@@ -887,20 +879,14 @@ async fn handle_control_request(
                     &config,
                 )
                 .await;
-            let connected = server.server.connection_type()
-                == crate::services::mcp::types::McpServerConnectionType::Connected;
-            let error = server.server.client.error.clone();
+            let error = mcp_reconnect_error(&server.server);
             crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
                 engine.mcp_state_mut(),
                 server,
             );
-            if connected {
-                control_success(&control.request_id, None);
-            } else {
-                control_error(
-                    &control.request_id,
-                    error.as_deref().unwrap_or("Connection failed"),
-                );
+            match error {
+                None => control_success(&control.request_id, None),
+                Some(error) => control_error(&control.request_id, &error),
             }
         }
         "mcp_toggle" => {
@@ -925,7 +911,7 @@ async fn handle_control_request(
                 .clients
                 .iter()
                 .find(|server| server.name() == server_name)
-                .and_then(|server| server.config.clone());
+                .map(|server| server.config().clone());
             let Some(config) = config else {
                 control_error(
                     &control.request_id,
@@ -953,10 +939,18 @@ async fn handle_control_request(
             .await
             {
                 Ok(server) => {
+                    // CC `:3285-3295`: enabling reports a reconnect that did
+                    // not end connected.
+                    let error = enabled
+                        .then(|| mcp_reconnect_error(&server.server))
+                        .flatten();
                     crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
                         state, server,
                     );
-                    control_success(&control.request_id, None);
+                    match error {
+                        None => control_success(&control.request_id, None),
+                        Some(error) => control_error(&control.request_id, &error),
+                    }
                 }
                 Err(error) => control_error(&control.request_id, &error.to_string()),
             }
@@ -1379,6 +1373,28 @@ fn context_usage_response(context: &crate::tool::ToolUseContext) -> serde_json::
     response.into()
 }
 
+/// Maps to: CC `cli/print.ts:3194-3204` (`mcp_reconnect`) and `:3285-3295`
+/// (`mcp_toggle` enabling): the error a reconnect that did not end connected
+/// reports.
+fn mcp_reconnect_error(
+    server: &crate::services::mcp::types::McpServerConnection,
+) -> Option<String> {
+    use crate::services::mcp::types::McpServerConnection;
+    match server {
+        McpServerConnection::Connected(_) => None,
+        McpServerConnection::Failed(failed) => Some(
+            failed
+                .error
+                .clone()
+                .unwrap_or_else(|| "Connection failed".to_string()),
+        ),
+        other => Some(format!(
+            "Server status: {}",
+            other.connection_type().as_str()
+        )),
+    }
+}
+
 /// Maps to: CC `cli/print.ts:1612 buildMcpServerStatuses` — the
 /// `McpServerStatus[]` payload for control responses, shared there by the
 /// `mcp_status` and `reload_plugins` handlers.
@@ -1398,16 +1414,6 @@ fn context_usage_response(context: &crate::tool::ToolUseContext) -> serde_json::
 /// - `reload_plugins` is the second caller upstream; not ported, so this has
 ///   one caller.
 ///
-/// `experimental_by_server` supplies what CC reads straight off the connection
-/// record (`connection.capabilities.experimental`, `:1673`). Rust keeps
-/// capabilities on the live peer rather than on `McpServerSnapshot`, so the
-/// caller fetches them from the registry and passes them in; this stays a pure
-/// projection, as the source's `.map()` is.
-///
-/// SEAM (`serverInfo.name`): CC returns `{name, version}`;
-/// `McpClientSnapshot` only carries `server_version`, so only the version is
-/// emitted.
-///
 /// SEAM (`KAIROS_CHANNELS`): CC's gate is
 /// `feature('KAIROS') || feature('KAIROS_CHANNELS')`. Rust carries only the
 /// `Kairos` flag — `KAIROS_CHANNELS` has no counterpart, the same gap already
@@ -1416,12 +1422,8 @@ fn context_usage_response(context: &crate::tool::ToolUseContext) -> serde_json::
 /// capabilities upstream and does not here.
 fn build_mcp_server_statuses(
     state: &crate::state::app_state_store::McpState,
-    experimental_by_server: &std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<String, serde_json::Value>,
-    >,
 ) -> Vec<serde_json::Value> {
-    use crate::services::mcp::types::{McpServerConnectionType, Transport};
+    use crate::services::mcp::types::{McpServerConnection, Transport};
 
     // Only the feature flag is hoisted: CC's `feature('KAIROS')` is a build
     // constant. `isChannelsEnabled()` and the global config are NOT hoisted —
@@ -1438,38 +1440,36 @@ fn build_mcp_server_statuses(
         .clients
         .iter()
         .map(|server| {
-            let connected = server.connection_type() == McpServerConnectionType::Connected;
+            let connected = server.as_connected();
 
             // CC `:1628-1651` — three shapes, and anything else (ws/sdk) leaves
             // `config` undefined.
-            let config = server
-                .config
-                .as_ref()
-                .and_then(|config| match config.transport {
-                    Transport::Sse | Transport::Http => Some(serde_json::json!({
-                        "type": config.transport.as_str(),
-                        "url": config.url,
-                        "headers": config.headers,
-                        "oauth": config.oauth,
-                    })),
-                    Transport::ClaudeAiProxy => Some(serde_json::json!({
-                        "type": Transport::ClaudeAiProxy.as_str(),
-                        "url": config.url,
-                        "id": config.id,
-                    })),
-                    Transport::Stdio => Some(serde_json::json!({
-                        "type": Transport::Stdio.as_str(),
-                        "command": config.command,
-                        "args": config.args,
-                    })),
-                    Transport::SseIde | Transport::Ws | Transport::WsIde | Transport::Sdk => None,
-                });
+            let config = server.config();
+            let config_status = match config.transport {
+                Transport::Sse | Transport::Http => Some(serde_json::json!({
+                    "type": config.transport.as_str(),
+                    "url": config.url,
+                    "headers": config.headers,
+                    "oauth": config.oauth,
+                })),
+                Transport::ClaudeAiProxy => Some(serde_json::json!({
+                    "type": Transport::ClaudeAiProxy.as_str(),
+                    "url": config.url,
+                    "id": config.id,
+                })),
+                Transport::Stdio => Some(serde_json::json!({
+                    "type": Transport::Stdio.as_str(),
+                    "command": config.command,
+                    "args": config.args,
+                })),
+                Transport::SseIde | Transport::Ws | Transport::WsIde | Transport::Sdk => None,
+            };
 
             // CC `:1655-1665` — tools only for connected servers, the
             // server's share of `mcp.tools` (`filterToolsByServer`), each with
             // the three annotations. The `|| undefined` there means a false
             // hint is ABSENT, not `false`.
-            let tools = connected.then(|| {
+            let tools = connected.is_some().then(|| {
                 crate::services::mcp::utils::filter_tools_by_server(&state.tools, server.name())
                     .iter()
                     .map(|tool| {
@@ -1500,25 +1500,24 @@ fn build_mcp_server_statuses(
                 "status".to_string(),
                 server.connection_type().as_str().to_string().into(),
             );
-            // CC `:1691-1692` — connected only.
-            if let (true, Some(version)) = (connected, server.client.server_version.as_ref()) {
+            // CC `:1691-1692` — connected only, the server's whole
+            // `serverInfo`.
+            if let Some(server_info) = connected.and_then(|server| server.server_info.as_ref()) {
                 status.insert(
                     "serverInfo".to_string(),
-                    serde_json::json!({ "version": version }),
+                    serde_json::to_value(server_info).unwrap_or_default(),
                 );
             }
             // CC `:1693` — failed only.
-            if server.connection_type() == McpServerConnectionType::Failed {
-                if let Some(error) = server.client.error.as_ref() {
-                    status.insert("error".to_string(), error.clone().into());
-                }
+            if let McpServerConnection::Failed(failed) = server
+                && let Some(error) = failed.error.as_ref()
+            {
+                status.insert("error".to_string(), error.clone().into());
             }
-            if let Some(config) = config {
-                status.insert("config".to_string(), config);
+            if let Some(config_status) = config_status {
+                status.insert("config".to_string(), config_status);
             }
-            if let Some(scope) = server.config.as_ref().map(|config| config.scope.as_str()) {
-                status.insert("scope".to_string(), scope.to_string().into());
-            }
+            status.insert("scope".to_string(), config.scope.as_str().into());
             if let Some(tools) = tools {
                 status.insert("tools".to_string(), tools.into());
             }
@@ -1529,38 +1528,34 @@ fn build_mcp_server_statuses(
             // Enable-channel prompt, so it is only echoed when `channel_enable`
             // would actually pass the allowlist. Not a security boundary — the
             // handler re-runs the full gate — just avoids dead buttons.
-            if kairos && connected {
-                if let Some(experimental) = experimental_by_server.get(server.name()) {
-                    let mut experimental = experimental.clone();
-                    let channel_key =
-                        crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY;
-                    if experimental.contains_key(channel_key) {
-                        // CC `:1678-1680` — both reads happen here, guarded by
-                        // the key's presence.
-                        let would_pass =
-                            crate::services::mcp::channel_allowlist::is_channels_enabled()
-                                && crate::services::mcp::channel_allowlist::is_channel_allowlisted(
-                                    server
-                                        .config
-                                        .as_ref()
-                                        .and_then(|config| config.plugin_source.as_deref()),
-                                );
-                        if !would_pass {
-                            experimental.remove(channel_key);
-                        }
-                    }
-                    // CC `:1685-1687` — an empty map leaves `capabilities`
-                    // undefined rather than emitting `{experimental: {}}`.
-                    if !experimental.is_empty() {
-                        status.insert(
-                            "capabilities".to_string(),
-                            serde_json::json!({
-                                "experimental": experimental
-                                    .into_iter()
-                                    .collect::<serde_json::Map<String, serde_json::Value>>(),
-                            }),
+            if kairos
+                && let Some(experimental) =
+                    connected.and_then(|server| server.capabilities.experimental.as_ref())
+            {
+                let mut experimental = experimental
+                    .iter()
+                    .map(|(key, value)| (key.clone(), serde_json::Value::Object(value.clone())))
+                    .collect::<serde_json::Map<String, serde_json::Value>>();
+                let channel_key =
+                    crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY;
+                if experimental.contains_key(channel_key) {
+                    // CC `:1678-1680` — both reads happen here, guarded by
+                    // the key's presence.
+                    let would_pass = crate::services::mcp::channel_allowlist::is_channels_enabled()
+                        && crate::services::mcp::channel_allowlist::is_channel_allowlisted(
+                            config.plugin_source.as_deref(),
                         );
+                    if !would_pass {
+                        experimental.remove(channel_key);
                     }
+                }
+                // CC `:1685-1687` — an empty map leaves `capabilities`
+                // undefined rather than emitting `{experimental: {}}`.
+                if !experimental.is_empty() {
+                    status.insert(
+                        "capabilities".to_string(),
+                        serde_json::json!({ "experimental": experimental }),
+                    );
                 }
             }
 
@@ -2399,8 +2394,7 @@ fn fail(message: &str) -> i32 {
 mod mcp_server_status_tests {
     use super::*;
     use crate::services::mcp::types::{
-        ConfigScope, McpClientSnapshot, McpServerConnectionType, McpServerSnapshot,
-        ScopedMcpServerConfig, Transport,
+        ConfigScope, McpServerConnection, McpServerConnectionType, ScopedMcpServerConfig, Transport,
     };
 
     fn config(transport: Transport) -> ScopedMcpServerConfig {
@@ -2423,30 +2417,34 @@ mod mcp_server_status_tests {
         }
     }
 
+    /// A `status` record: a connected one reports server version `1.2.3`, a
+    /// failed one the error `boom`.
     fn server(
         name: &str,
         status: McpServerConnectionType,
         transport: Transport,
-    ) -> McpServerSnapshot {
-        McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: name.to_string(),
-                status,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: Some("1.2.3".to_string()),
-                error: Some("boom".to_string()),
-            },
-            config: Some(config(transport)),
-            supports_resources: false,
+    ) -> McpServerConnection {
+        let config = config(transport);
+        match status {
+            McpServerConnectionType::Connected => {
+                let mut server = McpServerConnection::connected_for_test(name, config);
+                if let McpServerConnection::Connected(connected) = &mut server {
+                    connected.server_info = Some(rmcp::model::Implementation::new(name, "1.2.3"));
+                }
+                server
+            }
+            McpServerConnectionType::Failed => {
+                McpServerConnection::failed(name, config, Some("boom".to_string()))
+            }
+            McpServerConnectionType::NeedsAuth => McpServerConnection::needs_auth(name, config),
+            McpServerConnectionType::Pending => McpServerConnection::pending(name, config),
+            McpServerConnectionType::Disabled => McpServerConnection::disabled(name, config),
         }
     }
 
     /// The server's connection attempt with its one read-only `search` tool.
     fn attempt(
-        server: McpServerSnapshot,
+        server: McpServerConnection,
         description: Option<&str>,
     ) -> crate::services::mcp::client::McpConnectionDiscovery {
         let tool = crate::services::mcp::client::mcp_tool_for_test(
@@ -2549,7 +2547,7 @@ mod mcp_server_status_tests {
         );
     }
 
-    fn statuses(servers: Vec<McpServerSnapshot>) -> Vec<serde_json::Value> {
+    fn statuses(servers: Vec<McpServerConnection>) -> Vec<serde_json::Value> {
         // Each server's attempt goes through the connection flush, which
         // writes `mcp.tools`. Every status gets the tool, including ones CC
         // never fetches tools for, so the connected-only gate in
@@ -2561,7 +2559,7 @@ mod mcp_server_status_tests {
                 attempt(server, None),
             );
         }
-        build_mcp_server_statuses(&state, &Default::default())
+        build_mcp_server_statuses(&state)
     }
 
     /// Maps to: CC `print.ts:1689-1698` — connected servers carry `serverInfo`
@@ -2577,7 +2575,11 @@ mod mcp_server_status_tests {
 
         assert_eq!(out[0]["name"], "docs");
         assert_eq!(out[0]["status"], "connected");
-        assert_eq!(out[0]["serverInfo"]["version"], "1.2.3");
+        // `connection.serverInfo`, the server's whole implementation object.
+        assert_eq!(
+            out[0]["serverInfo"],
+            serde_json::json!({"name": "docs", "version": "1.2.3"})
+        );
         // `tool.mcpInfo?.toolName ?? tool.name`: the server's own name, not
         // the prefixed `mcp__docs__search`.
         assert_eq!(out[0]["tools"][0]["name"], "search");
@@ -2606,6 +2608,45 @@ mod mcp_server_status_tests {
         assert_eq!(out[0]["error"], "boom");
         assert!(out[0].get("serverInfo").is_none());
         assert!(out[0].get("tools").is_none());
+        // CC `:1694` — every record has a config, so `scope` is always there.
+        assert_eq!(out[0]["scope"], "project");
+    }
+
+    /// Maps to: CC `:3194-3204` and `:3285-3295` — what a reconnect that did
+    /// not end connected reports.
+    #[test]
+    fn reconnect_errors_match_official_control_responses() {
+        let config = config(Transport::Stdio);
+        assert_eq!(
+            mcp_reconnect_error(&McpServerConnection::connected_for_test(
+                "docs",
+                config.clone()
+            )),
+            None
+        );
+        assert_eq!(
+            mcp_reconnect_error(&McpServerConnection::failed(
+                "docs",
+                config.clone(),
+                Some("boom".to_string())
+            ))
+            .as_deref(),
+            Some("boom")
+        );
+        assert_eq!(
+            mcp_reconnect_error(&McpServerConnection::failed("docs", config.clone(), None))
+                .as_deref(),
+            Some("Connection failed")
+        );
+        assert_eq!(
+            mcp_reconnect_error(&McpServerConnection::needs_auth("docs", config.clone()))
+                .as_deref(),
+            Some("Server status: needs-auth")
+        );
+        assert_eq!(
+            mcp_reconnect_error(&McpServerConnection::pending("docs", config)).as_deref(),
+            Some("Server status: pending")
+        );
     }
 
     /// Maps to: CC `:1628-1651` — three config shapes, and anything else

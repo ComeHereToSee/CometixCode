@@ -1408,7 +1408,7 @@ fn resolve_system_prompt(
     model: &str,
     tools: &[crate::types::tools::Tool],
     additional_working_directories: &[String],
-    mcp_clients: &[crate::services::mcp::types::McpServerSnapshot],
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
     overrides: &QueryEngineOverrides,
 ) -> Result<
     (

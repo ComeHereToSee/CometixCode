@@ -101,8 +101,10 @@ pub(crate) async fn list_mcp_resources_output(
             })
             .map(|server| async move {
                 match crate::services::mcp::client::ensure_connected_client(server).await {
-                    Ok(fresh) => crate::services::mcp::client::fetch_resources_for_client(&fresh)
-                        .await
+                    Ok(fresh) => crate::services::mcp::client::fetch_resources_for_client(
+                        &crate::services::mcp::types::McpServerConnection::Connected(fresh),
+                    )
+                    .await
                         .into_iter()
                         .map(|resource| McpResource {
                             uri: resource.uri,
@@ -381,20 +383,11 @@ mod tests {
     #[tokio::test]
     async fn list_mcp_resources_validates_target_and_skips_non_connected_clients_like_official() {
         let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "offline".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Failed,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: Some("boom".to_string()),
-                },
-                config: None,
-                supports_resources: false,
-            }],
+            clients: vec![crate::services::mcp::types::McpServerConnection::failed(
+                "offline",
+                crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("offline"),
+                Some("boom".to_string()),
+            )],
             ..crate::state::app_state_store::McpState::default()
         };
 
@@ -499,13 +492,16 @@ rl.on('line', line => {
                     crate::services::mcp::types::McpServerConnectionType::Connected
                 );
 
+                assert!(
+                    discovery
+                        .server
+                        .as_connected()
+                        .is_some_and(|server| server.capabilities.resources.is_some()),
+                    "the fixture declares resources"
+                );
+
                 let state = crate::state::app_state_store::McpState {
-                    clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                        connection_id: None,
-                        client: discovery.server.client.clone(),
-                        config: Some(config.clone()),
-                        supports_resources: true,
-                    }],
+                    clients: vec![discovery.server.clone()],
                     resources: std::collections::BTreeMap::from([(
                         SERVER.to_string(),
                         vec![crate::services::mcp::types::ServerResource {
@@ -542,7 +538,7 @@ rl.on('line', line => {
 
                 // `resources/list_changed` is one of the two official
                 // invalidation points; after it the next fetch is fresh.
-                let refreshed =
+                let (_, refreshed) =
                     crate::services::mcp::client::refresh_mcp_resources_for_client(SERVER)
                         .await
                         .expect("refresh should bypass and repopulate the cache");

@@ -1927,7 +1927,7 @@ async fn dynamic_mcp_tool_result(
             Ok(connected) => {
                 crate::services::mcp::client::call_mcp_tool_with_elicitation(
                     &server_name,
-                    connected.connection_id,
+                    Some(connected.client.connection_id()),
                     &tool_name,
                     args.clone(),
                     meta.clone(),
@@ -10589,9 +10589,12 @@ rl.on('line', line => {
                     discovery.server.connection_type(),
                     crate::services::mcp::types::McpServerConnectionType::Connected,
                     "{:?}",
-                    discovery.server.client.error
+                    discovery.server
                 );
-                let first_connection = discovery.server.connection_id;
+                let first_connection = discovery
+                    .server
+                    .as_connected()
+                    .map(|server| server.client.connection_id());
                 let (request, context) = dynamic_mcp_tool_call(discovery, "lookup");
                 let message = LocalToolExecutor
                     .result_after_permission(
@@ -10624,7 +10627,8 @@ rl.on('line', line => {
                 assert_ne!(
                     crate::services::mcp::client::connect_to_server(SERVER, &config)
                         .await
-                        .connection_id,
+                        .as_connected()
+                        .map(|server| server.client.connection_id()),
                     first_connection
                 );
 

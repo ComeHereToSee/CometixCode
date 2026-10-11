@@ -668,34 +668,14 @@ mod tests {
     fn tool_search_uses_runtime_mcp_tools_and_reports_pending_servers_like_official() {
         let mcp_state = crate::state::app_state_store::McpState {
             clients: vec![
-                crate::services::mcp::types::McpServerSnapshot {
-                    connection_id: None,
-                    client: crate::services::mcp::types::McpClientSnapshot {
-                        name: "GitHub Server".to_string(),
-                        status: crate::services::mcp::types::McpServerConnectionType::Connected,
-                        reconnect_attempt: None,
-                        max_reconnect_attempts: None,
-                        ide_name: None,
-                        server_version: None,
-                        error: None,
-                    },
-                    config: None,
-                    supports_resources: false,
-                },
-                crate::services::mcp::types::McpServerSnapshot {
-                    connection_id: None,
-                    client: crate::services::mcp::types::McpClientSnapshot {
-                        name: "slack".to_string(),
-                        status: crate::services::mcp::types::McpServerConnectionType::Pending,
-                        reconnect_attempt: None,
-                        max_reconnect_attempts: None,
-                        ide_name: None,
-                        server_version: None,
-                        error: None,
-                    },
-                    config: None,
-                    supports_resources: false,
-                },
+                crate::services::mcp::types::McpServerConnection::connected_for_test(
+                    "GitHub Server",
+                    crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("github"),
+                ),
+                crate::services::mcp::types::McpServerConnection::pending(
+                    "slack",
+                    crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("slack"),
+                ),
             ],
             tools: vec![crate::services::mcp::client::mcp_tool_for_test(
                 "GitHub Server",

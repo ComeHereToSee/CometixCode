@@ -5,7 +5,7 @@
 //! request it and how the returned rows are selected.
 
 use crate::components::prompt_input::prompt_input_footer_suggestions::SuggestionItem;
-use crate::services::mcp::types::{McpServerConnectionType, McpServerSnapshot};
+use crate::services::mcp::types::{McpServerConnection, McpServerConnectionType};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -21,7 +21,7 @@ static KNOWN_CHANNELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static KNOWN_CHANNELS_VERSION: AtomicU64 = AtomicU64::new(0);
 
-fn find_slack_server(clients: &[McpServerSnapshot]) -> Option<String> {
+fn find_slack_server(clients: &[McpServerConnection]) -> Option<String> {
     clients
         .iter()
         .find(|server| {
@@ -34,7 +34,7 @@ fn find_slack_server(clients: &[McpServerSnapshot]) -> Option<String> {
 }
 
 /// Maps to: CC `hasSlackMcpServer`.
-pub fn has_slack_mcp_server(clients: &[McpServerSnapshot]) -> bool {
+pub fn has_slack_mcp_server(clients: &[McpServerConnection]) -> bool {
     find_slack_server(clients).is_some()
 }
 
@@ -200,7 +200,7 @@ async fn fetch_channels(server_name: &str, query: &str) -> Vec<String> {
 
 /// Maps to: CC `getSlackChannelSuggestions`.
 pub async fn get_slack_channel_suggestions(
-    clients: &[McpServerSnapshot],
+    clients: &[McpServerConnection],
     search_token: &str,
 ) -> Vec<SuggestionItem> {
     let token = search_token.to_ascii_lowercase();

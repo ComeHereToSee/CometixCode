@@ -47,15 +47,9 @@ fn connected_ide_labels(mcp_state: &McpState) -> Vec<String> {
         .filter(|server| crate::hooks::use_ide_selection::is_ide_mcp_server_name(server.name()))
         .map(|server| {
             let name = server
-                .client
+                .config()
                 .ide_name
                 .clone()
-                .or_else(|| {
-                    server
-                        .config
-                        .as_ref()
-                        .and_then(|config| config.ide_name.clone())
-                })
                 .unwrap_or_else(|| "IDE".to_string());
             format!("{name} ({})", server.connection_type().as_str())
         })
@@ -146,5 +140,26 @@ mod tests {
             status_message("open", &state),
             "No IDEs with Claude Code extension detected."
         );
+    }
+
+    #[test]
+    fn ide_labels_take_the_configured_ide_name_or_fall_back_to_ide() {
+        use crate::services::mcp::types::{McpServerConnection, ScopedMcpServerConfig};
+        let unnamed = McpState {
+            clients: vec![McpServerConnection::pending(
+                "ide",
+                ScopedMcpServerConfig::stdio_for_test("ide"),
+            )],
+            ..McpState::default()
+        };
+        assert_eq!(connected_ide_labels(&unnamed), ["IDE (pending)"]);
+
+        let mut config = ScopedMcpServerConfig::stdio_for_test("ide");
+        config.ide_name = Some("Cursor".to_string());
+        let named = McpState {
+            clients: vec![McpServerConnection::connected_for_test("ide", config)],
+            ..McpState::default()
+        };
+        assert_eq!(connected_ide_labels(&named), ["Cursor (connected)"]);
     }
 }

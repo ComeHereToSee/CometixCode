@@ -303,7 +303,7 @@ struct AgentMcpInitialization {
 /// server still being connected then is closed once it is made.
 #[derive(Debug, Default)]
 struct AgentMcpCleanup {
-    newly_created_clients: Vec<crate::services::mcp::types::McpServerSnapshot>,
+    newly_created_clients: Vec<crate::services::mcp::types::McpServerConnection>,
     connecting: Option<(String, crate::services::mcp::types::ScopedMcpServerConfig)>,
 }
 
@@ -313,10 +313,8 @@ impl AgentMcpCleanup {
             crate::services::mcp::client::cleanup_memoized_connection(&name, &config);
         }
         for client in self.newly_created_clients.drain(..) {
-            if client.connection_type()
-                == crate::services::mcp::types::McpServerConnectionType::Connected
-            {
-                crate::services::mcp::client::cleanup_connection(&client);
+            if let Some(connected) = client.as_connected() {
+                crate::services::mcp::client::cleanup_connection(&connected.client);
             }
         }
     }
@@ -2932,20 +2930,10 @@ mod tests {
             ),
         }]);
         let parent_state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "parent".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Pending,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-            }],
+            clients: vec![crate::services::mcp::types::McpServerConnection::pending(
+                "parent",
+                crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("parent"),
+            )],
             ..crate::state::app_state_store::McpState::default()
         };
 
@@ -2956,6 +2944,13 @@ mod tests {
         assert_eq!(initialized.mcp_state, parent_state);
         assert!(initialized.tools.is_empty());
         assert!(initialized.cleanup.newly_created_clients.is_empty());
+    }
+
+    /// The connection a record holds, if it is connected.
+    fn connection_id(server: &crate::services::mcp::types::McpServerConnection) -> Option<u64> {
+        server
+            .as_connected()
+            .map(|connected| connected.client.connection_id())
     }
 
     /// CC `runAgent.ts:140-151` with the memoized `connectToServer` and
@@ -3007,9 +3002,9 @@ mod tests {
                     parent.server.connection_type(),
                     McpServerConnectionType::Connected,
                     "{:?}",
-                    parent.server.client.error
+                    parent.server
                 );
-                let parent_connection_id = parent.server.connection_id;
+                let parent_connection_id = connection_id(&parent.server);
                 let mut parent_state = crate::state::app_state_store::McpState::default();
                 crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
                     &mut parent_state,
@@ -3045,13 +3040,13 @@ mod tests {
                     .iter()
                     .find(|server| server.name() == "shared")
                     .expect("the agent's state holds the server");
-                assert_eq!(shared.connection_id, parent_connection_id);
+                assert_eq!(connection_id(shared), parent_connection_id);
                 drop(initialized);
 
                 assert_eq!(
-                    crate::services::mcp::client::connect_to_server("shared", &config)
-                        .await
-                        .connection_id,
+                    connection_id(
+                        &crate::services::mcp::client::connect_to_server("shared", &config).await
+                    ),
                     parent_connection_id
                 );
                 crate::services::mcp::client::clear_server_cache("shared", None).await;

@@ -1057,9 +1057,10 @@ mod tests {
         });
         let config = menu_server.config.clone();
         let runtime_state = hooks.use_state(move || {
-            let mut runtime_server =
-                McpConnectionDiscovery::pending_with_config("remote", &config).server;
-            runtime_server.client.status = McpServerConnectionType::Connected;
+            let runtime_server =
+                crate::services::mcp::types::McpServerConnection::connected_for_test(
+                    "remote", config,
+                );
             let mut initial = crate::state::app_state_store::AppState::default();
             initial.mcp = Arc::new(McpState {
                 clients: vec![runtime_server],

@@ -2,7 +2,7 @@
 //! `buildSideQuestionFallbackParams` remains unported.
 
 use crate::services::api::claude::SystemPrompt;
-use crate::services::mcp::types::McpServerSnapshot;
+use crate::services::mcp::types::McpServerConnection;
 use crate::types::tools::Tool;
 use std::collections::BTreeMap;
 
@@ -16,7 +16,7 @@ pub fn fetch_system_prompt_parts(
     tools: &[Tool],
     main_loop_model: &str,
     additional_working_directories: &[String],
-    mcp_clients: &[McpServerSnapshot],
+    mcp_clients: &[McpServerConnection],
     custom_system_prompt: Option<&str>,
 ) -> (
     SystemPrompt,

@@ -138,8 +138,8 @@ pub struct ServerResource {
 }
 
 /// Maps to: CC `MCPServerConnection['type']` — the discriminant of the
-/// `services/mcp/types.ts:221` union, hoisted into a standalone enum because
-/// Rust models the union as one struct plus this tag.
+/// `services/mcp/types.ts:221` union, as a value of its own for the places
+/// that compare or print it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpServerConnectionType {
     Connected,
@@ -161,12 +161,12 @@ impl McpServerConnectionType {
     }
 }
 
-/// Maps to: CC `MCPServerConnection` (`services/mcp/types.ts:221-226`) flattened
-/// from a 5-way union into one struct plus the `status` tag. Each field is
+/// A server's status line, flattened from [`McpServerConnection`] for the
+/// views that list servers before or apart from `AppState.mcp`. Each field is
 /// carried by only some of the official variants — `reconnectAttempt` /
 /// `maxReconnectAttempts` by `PendingMCPServer`, `error` by `FailedMCPServer`,
-/// `serverInfo.version` by `ConnectedMCPServer` — so they are all `Option` here
-/// where TypeScript got them for free from the union.
+/// `serverInfo.version` by `ConnectedMCPServer` — so they are all `Option`
+/// here.
 ///
 /// The name follows CC's wire key, not a CC type: `systemInit.ts:63-66` emits
 /// `{ name: client.name, status: client.type }`.
@@ -185,53 +185,189 @@ pub struct McpClientSnapshot {
     pub error: Option<String>,
 }
 
-/// Maps to: CC `MCPServerConnection` as stored in `AppState.mcp.clients`
-/// (`state/AppStateStore.ts:174`), consumed by `components/mcp/MCPSettings.tsx`.
+/// Maps to: CC `MCPServerConnection` (`services/mcp/types.ts:221-226`), as
+/// stored in `AppState.mcp.clients` (`state/AppStateStore.ts:174`).
 ///
-/// Like CC's, the record carries no tools, prompts or resources: those live in
+/// Like CC's, a record carries no tools, prompts or resources: those live in
 /// `AppState.mcp.tools` / `.commands` / `.resources`, and views pick a
 /// server's share out of them (`filterToolsByServer`,
 /// `commandBelongsToServer`, `resources[name]`).
 ///
-/// **Stores less**: `ConnectedMCPServer.capabilities` — the whole
-/// `ServerCapabilities` object — is reduced here to the single
-/// `supports_resources` bool. CC reads that object for at least five distinct
-/// questions: `capabilities.resources` (client.ts:2169, the one kept here), the
-/// three `X.listChanged` gates (useManageMCPConnections.ts:618/:667/:705), and
-/// `capabilities.experimental['claude/channel'…]` (channelPermissions.ts:191-192).
-///
-/// The reduction is not a loss of information: `peer.peer_info()` carries the
-/// full `ServerCapabilities` for any live connection, and the registry keeps the
-/// peer. Consumers needing more than `supports_resources` read it live — the
-/// listChanged gates via `context.peer` in the rmcp handlers, the channel gates
-/// via `server_info_has_experimental_capability` (client.rs:1344).
-///
-/// The cost is that "does this server support X" now has two answer paths, and
-/// code holding only a snapshot cannot ask the second kind. That is exactly what
-/// made the listChanged gates look unimplementable until #36 checked where the
-/// data actually was.
+/// Each variant holds only its own fields. CC's transitions spread the
+/// previous record (`{ ...client, type: 'failed' }`), so its non-connected
+/// objects can still carry a `client`; no consumer reads one without first
+/// checking `type === 'connected'`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct McpServerSnapshot {
-    /// Native identity of CC MCPServerConnection.client, independent of config equality.
-    pub connection_id: Option<u64>,
-    pub client: McpClientSnapshot,
-    /// Maps to: CC `MCPServerConnection.config` carried in AppState clients.
-    pub config: Option<ScopedMcpServerConfig>,
-    /// Maps to: CC `!!client.capabilities?.resources`. This is capability
-    /// state, not a projection of the current resource list: a capable server
-    /// with zero resources must still expose List/ReadMcpResourceTool.
-    pub supports_resources: bool,
+pub enum McpServerConnection {
+    Connected(ConnectedMcpServer),
+    Failed(FailedMcpServer),
+    NeedsAuth(NeedsAuthMcpServer),
+    Pending(PendingMcpServer),
+    Disabled(DisabledMcpServer),
 }
 
-impl McpServerSnapshot {
+/// Maps to: CC `ConnectedMCPServer` (`services/mcp/types.ts:180-192`). Its
+/// `cleanup()` is `cleanup_connection(&server.client)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConnectedMcpServer {
+    pub client: super::client::McpClient,
+    pub name: String,
+    pub capabilities: rmcp::model::ServerCapabilities,
+    /// CC `serverInfo`: `client.getServerVersion()`, the server's whole
+    /// `Implementation`.
+    pub server_info: Option<rmcp::model::Implementation>,
+    pub instructions: Option<String>,
+    pub config: ScopedMcpServerConfig,
+}
+
+/// Maps to: CC `FailedMCPServer` (`services/mcp/types.ts:194-199`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailedMcpServer {
+    pub name: String,
+    pub config: ScopedMcpServerConfig,
+    pub error: Option<String>,
+}
+
+/// Maps to: CC `NeedsAuthMCPServer` (`services/mcp/types.ts:201-205`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeedsAuthMcpServer {
+    pub name: String,
+    pub config: ScopedMcpServerConfig,
+}
+
+/// Maps to: CC `PendingMCPServer` (`services/mcp/types.ts:207-213`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingMcpServer {
+    pub name: String,
+    pub config: ScopedMcpServerConfig,
+    pub reconnect_attempt: Option<u32>,
+    pub max_reconnect_attempts: Option<u32>,
+}
+
+/// Maps to: CC `DisabledMCPServer` (`services/mcp/types.ts:215-219`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisabledMcpServer {
+    pub name: String,
+    pub config: ScopedMcpServerConfig,
+}
+
+impl McpServerConnection {
     /// CC `client.name`.
     pub fn name(&self) -> &str {
-        &self.client.name
+        match self {
+            Self::Connected(server) => &server.name,
+            Self::Failed(server) => &server.name,
+            Self::NeedsAuth(server) => &server.name,
+            Self::Pending(server) => &server.name,
+            Self::Disabled(server) => &server.name,
+        }
     }
 
     /// CC `client.type`.
     pub fn connection_type(&self) -> McpServerConnectionType {
-        self.client.status
+        match self {
+            Self::Connected(_) => McpServerConnectionType::Connected,
+            Self::Failed(_) => McpServerConnectionType::Failed,
+            Self::NeedsAuth(_) => McpServerConnectionType::NeedsAuth,
+            Self::Pending(_) => McpServerConnectionType::Pending,
+            Self::Disabled(_) => McpServerConnectionType::Disabled,
+        }
+    }
+
+    /// CC `client.config`.
+    pub fn config(&self) -> &ScopedMcpServerConfig {
+        match self {
+            Self::Connected(server) => &server.config,
+            Self::Failed(server) => &server.config,
+            Self::NeedsAuth(server) => &server.config,
+            Self::Pending(server) => &server.config,
+            Self::Disabled(server) => &server.config,
+        }
+    }
+
+    /// The record when it is `type === 'connected'`.
+    pub fn as_connected(&self) -> Option<&ConnectedMcpServer> {
+        match self {
+            Self::Connected(server) => Some(server),
+            _ => None,
+        }
+    }
+
+    /// `{ name, type: 'failed', config, error }`.
+    pub fn failed(
+        name: impl Into<String>,
+        config: ScopedMcpServerConfig,
+        error: Option<String>,
+    ) -> Self {
+        Self::Failed(FailedMcpServer {
+            name: name.into(),
+            config,
+            error,
+        })
+    }
+
+    /// `{ name, type: 'needs-auth', config }`.
+    pub fn needs_auth(name: impl Into<String>, config: ScopedMcpServerConfig) -> Self {
+        Self::NeedsAuth(NeedsAuthMcpServer {
+            name: name.into(),
+            config,
+        })
+    }
+
+    /// `{ name, type: 'pending', config }`.
+    pub fn pending(name: impl Into<String>, config: ScopedMcpServerConfig) -> Self {
+        Self::Pending(PendingMcpServer {
+            name: name.into(),
+            config,
+            reconnect_attempt: None,
+            max_reconnect_attempts: None,
+        })
+    }
+
+    /// `{ name, type: 'disabled', config }`.
+    pub fn disabled(name: impl Into<String>, config: ScopedMcpServerConfig) -> Self {
+        Self::Disabled(DisabledMcpServer {
+            name: name.into(),
+            config,
+        })
+    }
+
+    /// A connected record with no connection behind it, declaring no
+    /// capabilities.
+    #[cfg(test)]
+    pub(crate) fn connected_for_test(name: &str, config: ScopedMcpServerConfig) -> Self {
+        Self::Connected(ConnectedMcpServer {
+            client: super::client::McpClient::detached_for_test(name, &config),
+            name: name.to_owned(),
+            capabilities: Default::default(),
+            server_info: None,
+            instructions: None,
+            config,
+        })
+    }
+}
+
+#[cfg(test)]
+impl ScopedMcpServerConfig {
+    /// A user-scoped stdio server running `command`.
+    pub(crate) fn stdio_for_test(command: &str) -> Self {
+        Self {
+            name: None,
+            scope: ConfigScope::User,
+            transport: Transport::Stdio,
+            command: Some(command.to_string()),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            headers_helper: None,
+            oauth: None,
+            ide_running_in_windows: None,
+            ide_name: None,
+            auth_token: None,
+            id: None,
+            plugin_source: None,
+        }
     }
 }
 

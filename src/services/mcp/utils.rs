@@ -5,7 +5,7 @@
 
 use super::mcp_string_utils::mcp_info_from_string;
 use super::normalization::normalize_name_for_mcp;
-use super::types::McpServerSnapshot;
+use super::types::McpServerConnection;
 use super::types::{ConfigScope, ScopedMcpServerConfig, ServerResource, Transport};
 use crate::commands::Command;
 use crate::components::mcp::types::AgentMcpServerInfo;
@@ -385,18 +385,16 @@ pub struct ExcludeStalePluginClientsResult {
     pub state: McpState,
     /// Stale clients are returned so the caller can perform service-boundary
     /// cleanup (`clearServerCache`) outside AppState reconciliation, matching CC.
-    pub stale: Vec<McpServerSnapshot>,
+    pub stale: Vec<McpServerConnection>,
 }
 
-fn mcp_server_snapshot_is_stale(
-    server: &McpServerSnapshot,
+fn is_stale_plugin_client(
+    server: &McpServerConnection,
     configs: &indexmap::IndexMap<String, ScopedMcpServerConfig>,
 ) -> bool {
-    match (server.config.as_ref(), configs.get(server.name())) {
-        (Some(current), Some(fresh)) => hash_mcp_config(current) != hash_mcp_config(fresh),
-        (Some(current), None) => current.scope == ConfigScope::Dynamic,
-        (None, Some(_)) => true,
-        (None, None) => false,
+    match configs.get(server.name()) {
+        Some(fresh) => hash_mcp_config(server.config()) != hash_mcp_config(fresh),
+        None => server.config().scope == ConfigScope::Dynamic,
     }
 }
 
@@ -408,7 +406,7 @@ pub fn exclude_stale_plugin_clients(
     let stale = state
         .clients
         .iter()
-        .filter(|server| mcp_server_snapshot_is_stale(server, configs))
+        .filter(|server| is_stale_plugin_client(server, configs))
         .cloned()
         .collect::<Vec<_>>();
     if stale.is_empty() {
@@ -825,17 +823,17 @@ mod tests {
 
         let state = McpState {
             clients: vec![
-                crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
+                crate::services::mcp::client::McpConnectionDiscovery::pending(
                     "removed-plugin",
                     &dynamic_config,
                 )
                 .server,
-                crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
+                crate::services::mcp::client::McpConnectionDiscovery::pending(
                     "changed-user",
                     &changed_config,
                 )
                 .server,
-                crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
+                crate::services::mcp::client::McpConnectionDiscovery::pending(
                     "kept-user",
                     &kept_config,
                 )

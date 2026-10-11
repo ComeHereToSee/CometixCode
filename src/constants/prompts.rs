@@ -47,7 +47,7 @@ pub fn get_system_prompt(
     tools: &[crate::types::tools::Tool],
     model: &str,
     additional_working_directories: &[String],
-    mcp_clients: &[crate::services::mcp::types::McpServerSnapshot],
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
 ) -> SystemPrompt {
     let settings = prompt_settings_snapshot();
     get_system_prompt_with_settings(
@@ -65,7 +65,7 @@ pub fn get_system_prompt_with_settings(
     tools: &[crate::types::tools::Tool],
     model: &str,
     additional_working_directories: &[String],
-    mcp_clients: &[crate::services::mcp::types::McpServerSnapshot],
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
     settings: &crate::utils::settings::types::SettingsJson,
 ) -> SystemPrompt {
     // The Rust test binary hosts thousands of otherwise independent CC
@@ -494,7 +494,7 @@ fn get_output_style_section(
 /// Maps to CC `constants/prompts.ts:160-166` `getMcpInstructionsSection(
 /// mcpClients)`.
 fn get_mcp_instructions_section(
-    mcp_clients: &[crate::services::mcp::types::McpServerSnapshot],
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
 ) -> Option<String> {
     // CC :164 `if (!mcpClients || mcpClients.length === 0) return null`.
     if mcp_clients.is_empty() {

@@ -981,27 +981,16 @@ mod tests {
     #[test]
     fn notifications_render_ide_selection_row_from_repl_prop() {
         use crate::hooks::use_ide_selection::{IdeSelection, ide_selection_reset};
-        use crate::services::mcp::types::McpServerConnectionType;
-        use crate::services::mcp::types::{McpClientSnapshot, McpServerSnapshot};
+        use crate::services::mcp::types::{McpServerConnection, ScopedMcpServerConfig};
         use crate::state::app_state_store::McpState;
 
         let connected_ide_state = || {
             let mut initial = crate::state::app_state_store::AppState::default();
             initial.mcp = std::sync::Arc::new(McpState {
-                clients: vec![McpServerSnapshot {
-                    connection_id: None,
-                    client: McpClientSnapshot {
-                        name: "ide".into(),
-                        status: McpServerConnectionType::Connected,
-                        reconnect_attempt: None,
-                        max_reconnect_attempts: None,
-                        ide_name: None,
-                        server_version: None,
-                        error: None,
-                    },
-                    config: None,
-                    supports_resources: false,
-                }],
+                clients: vec![McpServerConnection::connected_for_test(
+                    "ide",
+                    ScopedMcpServerConfig::stdio_for_test("ide"),
+                )],
                 ..McpState::default()
             });
             crate::state::store::AppStore::new(initial, None)

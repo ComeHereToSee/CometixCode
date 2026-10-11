@@ -1591,7 +1591,7 @@ struct McpPromptSlashCommandSubmit {
     command: McpPromptCommandSnapshot,
     /// The client the prompt command was fetched from, and the server's own
     /// prompt name (CC's command record closes over both).
-    server: crate::services::mcp::types::McpServerSnapshot,
+    server: crate::services::mcp::types::McpServerConnection,
     prompt_name: String,
     args: String,
     tool_permission_context: ToolPermissionContext,
@@ -10413,8 +10413,8 @@ mod tests {
                             == crate::services::mcp::types::McpServerConnectionType::Failed
                 }) {
                     assert_eq!(
-                        client.config.as_ref(),
-                        Some(&server),
+                        client.config(),
+                        &server,
                         "actual manager must receive the launcher config"
                     );
                     // Native SDK transport is owned externally and rejects a

@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use crate::services::mcp::types::{
-    McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, ServerResource,
+    McpClientSnapshot, McpServerConnection, McpServerConnectionType, ServerResource,
 };
 use crate::tool::ToolPermissionContext;
 
@@ -301,7 +301,7 @@ impl TaskState {
 pub struct McpState {
     /// Maps to: CC `AppStateStore.ts:183` / `getDefaultAppState:517`.
     pub plugin_reconnect_key: u64,
-    pub clients: Vec<McpServerSnapshot>,
+    pub clients: Vec<McpServerConnection>,
     pub tools: Vec<crate::types::tools::Tool>,
     pub commands: Vec<crate::commands::Command>,
     pub resources: std::collections::BTreeMap<String, Vec<ServerResource>>,
@@ -311,7 +311,29 @@ impl McpState {
     pub fn client_snapshots(&self) -> Vec<McpClientSnapshot> {
         self.clients
             .iter()
-            .map(|server| server.client.clone())
+            .map(|server| {
+                let (reconnect_attempt, max_reconnect_attempts) = match server {
+                    McpServerConnection::Pending(pending) => {
+                        (pending.reconnect_attempt, pending.max_reconnect_attempts)
+                    }
+                    _ => (None, None),
+                };
+                McpClientSnapshot {
+                    name: server.name().to_owned(),
+                    status: server.connection_type(),
+                    reconnect_attempt,
+                    max_reconnect_attempts,
+                    ide_name: server.config().ide_name.clone(),
+                    server_version: server
+                        .as_connected()
+                        .and_then(|connected| connected.server_info.as_ref())
+                        .map(|info| info.version.clone()),
+                    error: match server {
+                        McpServerConnection::Failed(failed) => failed.error.clone(),
+                        _ => None,
+                    },
+                }
+            })
             .collect()
     }
 }
@@ -396,7 +418,7 @@ impl McpWriter {
     pub fn initialize_servers_as_pending(
         &self,
         configs: &indexmap::IndexMap<String, crate::services::mcp::types::ScopedMcpServerConfig>,
-    ) -> Vec<McpServerSnapshot> {
+    ) -> Vec<McpServerConnection> {
         self.store.set_state(|prev| {
             let result =
                 crate::services::mcp::use_manage_mcp_connections::initialize_servers_as_pending(
@@ -405,11 +427,8 @@ impl McpWriter {
             // Detach before publishing replacement pending state; an old
             // transport closing during async cache cleanup must not reconnect.
             for stale in &result.stale {
-                if stale.connection_type() == McpServerConnectionType::Connected {
-                    crate::services::mcp::client::detach_mcp_close_handler(
-                        stale.name(),
-                        stale.connection_id,
-                    );
+                if let Some(connected) = stale.as_connected() {
+                    connected.client.clear_onclose();
                 }
             }
             if result
@@ -506,7 +525,7 @@ impl McpWriter {
 
     /// Maps to an official client-only `updateServer` patch (for example a
     /// reconnecting `pending` status) that preserves existing capabilities.
-    pub fn apply_client_update(&self, server: McpServerSnapshot) {
+    pub fn apply_client_update(&self, server: McpServerConnection) {
         self.store.replace_with(|app| {
             let mut state = (*app.mcp).clone();
             crate::services::mcp::use_manage_mcp_connections::apply_mcp_client_update(
@@ -933,7 +952,7 @@ impl AppState {
 mod tests {
     use super::{AppState, McpState, McpWriter};
     use crate::services::mcp::types::{
-        McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, ServerResource,
+        McpServerConnection, McpServerConnectionType, ServerResource,
     };
     use std::sync::Arc;
 
@@ -957,6 +976,48 @@ mod tests {
         }
     }
 
+    /// Each variant's own fields reach its status line, and only its own.
+    #[test]
+    fn client_snapshots_project_each_variants_fields() {
+        let mut ide_config = stdio_scoped_config("ide");
+        ide_config.ide_name = Some("Cursor".to_string());
+        let mut connected = McpServerConnection::connected_for_test("ide", ide_config);
+        if let McpServerConnection::Connected(server) = &mut connected {
+            server.server_info = Some(rmcp::model::Implementation::new("ide", "2.0.1"));
+        }
+        let state = McpState {
+            clients: vec![
+                connected,
+                McpServerConnection::failed(
+                    "broken",
+                    stdio_scoped_config("broken"),
+                    Some("boom".to_string()),
+                ),
+                McpServerConnection::Pending(crate::services::mcp::types::PendingMcpServer {
+                    name: "retrying".to_string(),
+                    config: stdio_scoped_config("retrying"),
+                    reconnect_attempt: Some(2),
+                    max_reconnect_attempts: Some(5),
+                }),
+            ],
+            ..McpState::default()
+        };
+
+        let [ide, broken, retrying] = state.client_snapshots().try_into().unwrap();
+        assert_eq!(ide.status, McpServerConnectionType::Connected);
+        assert_eq!(ide.ide_name.as_deref(), Some("Cursor"));
+        assert_eq!(ide.server_version.as_deref(), Some("2.0.1"));
+        assert_eq!(ide.error, None);
+        assert_eq!(broken.status, McpServerConnectionType::Failed);
+        assert_eq!(broken.error.as_deref(), Some("boom"));
+        assert_eq!(broken.server_version, None);
+        assert_eq!(retrying.status, McpServerConnectionType::Pending);
+        assert_eq!(
+            (retrying.reconnect_attempt, retrying.max_reconnect_attempts),
+            (Some(2), Some(5))
+        );
+    }
+
     /// Maps to: CC `useManageMCPConnections.ts#flushPendingUpdates`
     /// (`:216-291`) — N resolved servers cost ONE store transition, because
     /// `updateServer` (`:297-308`) only queues and the 16ms flush applies the
@@ -970,20 +1031,9 @@ mod tests {
         let writer = McpWriter::new(store.clone());
         // A resolved server's connection attempt.
         let server = |name: &str| {
-            crate::services::mcp::client::McpConnectionDiscovery::from(McpServerSnapshot {
-                connection_id: None,
-                client: McpClientSnapshot {
-                    name: name.to_string(),
-                    status: McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-            })
+            crate::services::mcp::client::McpConnectionDiscovery::from(
+                McpServerConnection::connected_for_test(name, stdio_scoped_config(name)),
+            )
         };
 
         let baseline = store.revision();
@@ -1066,24 +1116,14 @@ mod tests {
         // "docs" resolves with a tool.
         writer.apply_server_update(
             crate::services::mcp::use_manage_mcp_connections::McpPendingUpdate {
-                server: McpServerSnapshot {
-                    connection_id: None,
-                    client: McpClientSnapshot {
-                        name: "docs".to_string(),
-                        status: McpServerConnectionType::Connected,
-                        reconnect_attempt: None,
-                        max_reconnect_attempts: None,
-                        ide_name: None,
-                        server_version: None,
-                        error: None,
-                    },
-                    // Carry the config forward: `exclude_stale_plugin_clients`
-                    // hashes it, and a mismatch legitimately marks the server
-                    // stale, which CC re-adds as `pending` (:786-789). This
-                    // test is about the merge, not the stale path.
-                    config: Some(stdio_scoped_config("docs-mcp")),
-                    supports_resources: false,
-                },
+                // Carry the config forward: `exclude_stale_plugin_clients`
+                // hashes it, and a mismatch legitimately marks the server
+                // stale, which CC re-adds as `pending` (:786-789). This test
+                // is about the merge, not the stale path.
+                server: McpServerConnection::connected_for_test(
+                    "docs",
+                    stdio_scoped_config("docs-mcp"),
+                ),
                 tools: Some(vec![crate::services::mcp::client::mcp_tool_for_test(
                     "docs",
                     serde_json::json!({

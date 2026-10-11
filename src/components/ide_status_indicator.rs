@@ -18,9 +18,8 @@ pub use crate::hooks::use_ide_selection::IdeSelection;
 pub fn ide_client_connected(mcp: &crate::state::app_state_store::McpState) -> bool {
     use crate::services::mcp::types::McpServerConnectionType;
     mcp.clients.iter().any(|server| {
-        let client = &server.client;
-        client.status == McpServerConnectionType::Connected
-            && crate::hooks::use_ide_selection::is_ide_mcp_server_name(&client.name)
+        server.connection_type() == McpServerConnectionType::Connected
+            && crate::hooks::use_ide_selection::is_ide_mcp_server_name(server.name())
     })
 }
 
@@ -209,30 +208,25 @@ mod tests {
     #[test]
     fn ide_client_connected_requires_official_exact_ide_name() {
         use crate::services::mcp::types::McpServerConnectionType;
-        use crate::services::mcp::types::{McpClientSnapshot, McpServerSnapshot};
+        use crate::services::mcp::types::{McpServerConnection, ScopedMcpServerConfig};
         use crate::state::app_state_store::McpState;
 
         fn server(
             name: &str,
             status: McpServerConnectionType,
             ide_name: Option<&str>,
-        ) -> McpServerSnapshot {
-            McpServerSnapshot {
-                connection_id: None,
-                client: McpClientSnapshot {
-                    name: name.into(),
-                    status,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: ide_name.map(str::to_string),
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
+        ) -> McpServerConnection {
+            let mut config = ScopedMcpServerConfig::stdio_for_test(name);
+            config.ide_name = ide_name.map(str::to_string);
+            match status {
+                McpServerConnectionType::Connected => {
+                    McpServerConnection::connected_for_test(name, config)
+                }
+                McpServerConnectionType::Pending => McpServerConnection::pending(name, config),
+                other => unreachable!("fixture builds connected or pending, not {other:?}"),
             }
         }
-        let state_for = |clients: Vec<McpServerSnapshot>| McpState {
+        let state_for = |clients: Vec<McpServerConnection>| McpState {
             clients,
             ..McpState::default()
         };

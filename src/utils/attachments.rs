@@ -1206,8 +1206,11 @@ async fn process_mcp_resource_attachments(
         };
         let description = resource.description.clone();
         // CC reads over the AppState client itself (`client.client.readResource`).
+        let connection_id = server
+            .as_connected()
+            .map(|connected| connected.client.connection_id());
         let content =
-            crate::services::mcp::client::read_mcp_resource(server_name, server.connection_id, uri)
+            crate::services::mcp::client::read_mcp_resource(server_name, connection_id, uri)
                 .await
                 .ok()?;
         let attachment = AttachmentMessage::new(serde_json::json!({
@@ -4160,20 +4163,12 @@ mod tests {
         let _instructions =
             McpInstructionGuard::set("docs", "Use resource templates before tools.");
         let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "docs".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-            }],
+            clients: vec![
+                crate::services::mcp::types::McpServerConnection::connected_for_test(
+                    "docs",
+                    crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("docs"),
+                ),
+            ],
             ..Default::default()
         };
         let mut context = ToolUseContext::default().with_mcp_state(state);
@@ -4197,20 +4192,12 @@ mod tests {
         let _tool_search = EnvVarGuard::set("ENABLE_TOOL_SEARCH", "true");
         let _instructions = McpInstructionGuard::set("claude-in-chrome", "Server guidance.");
         let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "claude-in-chrome".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-            }],
+            clients: vec![
+                crate::services::mcp::types::McpServerConnection::connected_for_test(
+                    "claude-in-chrome",
+                    crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("chrome"),
+                ),
+            ],
             ..Default::default()
         };
         let mut context = ToolUseContext::default()

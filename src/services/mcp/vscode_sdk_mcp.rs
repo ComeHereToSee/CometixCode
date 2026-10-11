@@ -113,7 +113,7 @@ pub fn handle_vscode_log_event_notification(
 }
 
 pub async fn setup_vscode_sdk_mcp(
-    sdk_clients: &[crate::services::mcp::types::McpServerSnapshot],
+    sdk_clients: &[crate::services::mcp::types::McpServerConnection],
 ) -> bool {
     // Maps to: CC `services/mcp/vscodeSdkMcp.ts#setupVscodeSdkMcp`:
     // store/recognize the connected `claude-vscode` SDK MCP client and send

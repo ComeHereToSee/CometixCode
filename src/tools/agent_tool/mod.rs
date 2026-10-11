@@ -2923,22 +2923,20 @@ mod tests {
         status: crate::services::mcp::types::McpServerConnectionType,
         tool_names: &[&str],
     ) -> crate::services::mcp::client::McpConnectionDiscovery {
-        let mut discovery = crate::services::mcp::client::McpConnectionDiscovery::from(
-            crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: name.to_string(),
-                    status,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-            },
-        );
+        use crate::services::mcp::types::{
+            McpServerConnection, McpServerConnectionType, ScopedMcpServerConfig,
+        };
+        let config = ScopedMcpServerConfig::stdio_for_test(name);
+        let server = match status {
+            McpServerConnectionType::Connected => {
+                McpServerConnection::connected_for_test(name, config)
+            }
+            McpServerConnectionType::Failed => McpServerConnection::failed(name, config, None),
+            McpServerConnectionType::NeedsAuth => McpServerConnection::needs_auth(name, config),
+            McpServerConnectionType::Pending => McpServerConnection::pending(name, config),
+            McpServerConnectionType::Disabled => McpServerConnection::disabled(name, config),
+        };
+        let mut discovery = crate::services::mcp::client::McpConnectionDiscovery::from(server);
         discovery.tools = tool_names
             .iter()
             .map(|tool_name| {

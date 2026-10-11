@@ -200,10 +200,10 @@ pub(crate) async fn read_mcp_resource_output(
             available_servers.join(", ")
         ));
     };
-    if client.connection_type() != crate::services::mcp::types::McpServerConnectionType::Connected {
+    let Some(connected) = client.as_connected() else {
         return Err(format!("Server \"{server}\" is not connected"));
-    }
-    if !client.supports_resources {
+    };
+    if connected.capabilities.resources.is_none() {
         return Err(format!("Server \"{server}\" does not support resources"));
     }
 
@@ -211,7 +211,11 @@ pub(crate) async fn read_mcp_resource_output(
     let connected = crate::services::mcp::client::ensure_connected_client(client)
         .await
         .map_err(|error| error.to_string())?;
-    crate::services::mcp::client::read_mcp_resource(server, connected.connection_id, uri)
+    crate::services::mcp::client::read_mcp_resource(
+        server,
+        Some(connected.client.connection_id()),
+        uri,
+    )
         .await
         .map(|value| read_mcp_resource_result_from_value(server, value))
         .map_err(|error| error.to_string())
@@ -434,20 +438,11 @@ mod tests {
     #[tokio::test]
     async fn read_mcp_resource_reports_not_connected_like_official() {
         let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "offline".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Failed,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: Some("boom".to_string()),
-                },
-                config: None,
-                supports_resources: false,
-            }],
+            clients: vec![crate::services::mcp::types::McpServerConnection::failed(
+                "offline",
+                crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("offline"),
+                Some("boom".to_string()),
+            )],
             ..crate::state::app_state_store::McpState::default()
         };
 

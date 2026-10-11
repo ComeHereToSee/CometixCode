@@ -9,7 +9,7 @@
 
 use crate::commands::Command;
 use crate::components::prompt_input::prompt_input_footer_suggestions::SuggestionItem;
-use crate::services::mcp::types::{McpServerSnapshot, ServerResource};
+use crate::services::mcp::types::{McpServerConnection, ServerResource};
 use crate::tools::agent_tool::load_agents_dir::AgentDefinition;
 use crate::utils::bash::shell_completion::ShellCompletionType;
 use crate::utils::suggestions::command_suggestions::{
@@ -1123,7 +1123,7 @@ struct FileSuggestionRequest {
     kind: SuggestionRequestKind,
     request_id: u64,
     mcp_resources: Arc<std::collections::BTreeMap<String, Vec<ServerResource>>>,
-    mcp_clients: Arc<Vec<McpServerSnapshot>>,
+    mcp_clients: Arc<Vec<McpServerConnection>>,
     agents: Arc<Vec<AgentDefinition>>,
     /// Source `fetchFileSuggestions`'s `isAtSymbol` flag. It controls whether
     /// an empty query is allowed to return top-level files/resources.
@@ -1239,7 +1239,7 @@ fn slack_channel_token(input: &str, cursor_offset: usize) -> Option<String> {
 
 /// @cometix: no CC symbol. Rust memo identity for Slack/MCP client
 /// snapshots; official `useTypeahead` re-runs from React deps instead.
-fn mcp_client_source_key(clients: &[McpServerSnapshot]) -> String {
+fn mcp_client_source_key(clients: &[McpServerConnection]) -> String {
     clients
         .iter()
         .map(|server| format!("{}:{:?}", server.name(), server.connection_type()))
