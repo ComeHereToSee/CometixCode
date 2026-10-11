@@ -818,7 +818,7 @@ async fn run_query(input: QueryRunInput<'_>) -> Result<QueryEngineOutcome, Strin
         .mcp_state
         .clients
         .iter()
-        .map(|server| server.client.name.as_str())
+        .map(|server| server.name())
         .collect();
     let scratchpad_dir = crate::utils::permissions::filesystem::is_scratchpad_enabled()
         .then(crate::utils::permissions::filesystem::get_scratchpad_dir);

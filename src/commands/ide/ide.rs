@@ -44,9 +44,7 @@ fn connected_ide_labels(mcp_state: &McpState) -> Vec<String> {
     mcp_state
         .clients
         .iter()
-        .filter(|server| {
-            crate::hooks::use_ide_selection::is_ide_mcp_server_name(&server.client.name)
-        })
+        .filter(|server| crate::hooks::use_ide_selection::is_ide_mcp_server_name(server.name()))
         .map(|server| {
             let name = server
                 .client
@@ -59,7 +57,7 @@ fn connected_ide_labels(mcp_state: &McpState) -> Vec<String> {
                         .and_then(|config| config.ide_name.clone())
                 })
                 .unwrap_or_else(|| "IDE".to_string());
-            format!("{name} ({})", server.client.status.as_str())
+            format!("{name} ({})", server.connection_type().as_str())
         })
         .collect()
 }

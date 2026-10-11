@@ -1189,8 +1189,8 @@ async fn process_mcp_resource_attachments(
             return None;
         }
         let server = context.mcp_state.clients.iter().find(|server| {
-            server.client.name == server_name
-                && server.client.status
+            server.name() == server_name
+                && server.connection_type()
                     == crate::services::mcp::types::McpServerConnectionType::Connected
         })?;
         // CC `toolUseContext.options.mcpResources?.[serverName]` only.
@@ -1486,9 +1486,10 @@ pub(crate) fn get_mcp_instructions_delta_attachment(
         .clients
         .iter()
         .filter(|server| {
-            server.client.status == crate::services::mcp::types::McpServerConnectionType::Connected
+            server.connection_type()
+                == crate::services::mcp::types::McpServerConnectionType::Connected
         })
-        .map(|server| server.client.name.clone())
+        .map(|server| server.name().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
     let mut instructions =
         crate::services::mcp::client::connected_mcp_server_instructions(&context.mcp_state);

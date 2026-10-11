@@ -120,8 +120,8 @@ pub async fn setup_vscode_sdk_mcp(
     // the initial `experiment_gates` notification. The log_event handler is
     // installed by `client.rs#on_custom_notification` for this internal server.
     let has_connected_vscode = sdk_clients.iter().any(|server| {
-        server.client.name == VSCODE_MCP_SERVER_NAME
-            && server.client.status
+        server.name() == VSCODE_MCP_SERVER_NAME
+            && server.connection_type()
                 == crate::services::mcp::types::McpServerConnectionType::Connected
     });
     if !has_connected_vscode {

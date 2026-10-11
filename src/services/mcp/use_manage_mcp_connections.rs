@@ -164,7 +164,7 @@ fn exclude_server_after_clearing_auth(
     status: McpServerConnectionType,
 ) {
     for server in &mut state.clients {
-        if server.client.name == server_name {
+        if server.name() == server_name {
             server.client.status = status;
         }
     }
@@ -229,7 +229,7 @@ pub async fn authenticate_remote_mcp_server_once(
 
     let updated = reconnect_mcp_server_once(server_name, config).await;
     let message = remote_authentication_result_message(
-        updated.server.client.status,
+        updated.server.connection_type(),
         server_name,
         was_effectively_authenticated,
     );
@@ -276,7 +276,7 @@ fn reconnect_base_server(
         .current()
         .clients
         .into_iter()
-        .find(|server| server.client.name == name)
+        .find(|server| server.name() == name)
         .unwrap_or_else(|| McpConnectionDiscovery::pending_with_config(name, config).server)
 }
 
@@ -337,7 +337,7 @@ fn resolve_list_changed_client_base(name: &str, runtime_mcp: &McpWriter) -> McpS
         .current()
         .clients
         .into_iter()
-        .find(|server| server.client.name == name)
+        .find(|server| server.name() == name)
         .unwrap_or_else(|| McpConnectionDiscovery::pending(name).server);
     server.client.status = McpServerConnectionType::Connected;
     server
@@ -959,7 +959,7 @@ pub async fn start_automatic_mcp_reconnect(
                 let result = reconnect_mcp_server_impl(&name, &config).await;
                 let resume = {
                     let _turn = crate::state::store::enter_store_turn_segment();
-                    if result.server.client.status == McpServerConnectionType::Connected
+                    if result.server.connection_type() == McpServerConnectionType::Connected
                         || attempt == MAX_RECONNECT_ATTEMPTS
                     {
                         RECONNECT_TASKS
@@ -984,7 +984,7 @@ pub async fn start_automatic_mcp_reconnect(
 /// stale-client cleanup guard: only connected clients have an active runtime
 /// connection/cache to cancel after removing stale AppState entries.
 pub fn stale_mcp_server_needs_cache_cleanup(server: &McpServerSnapshot) -> bool {
-    server.client.status == McpServerConnectionType::Connected
+    server.connection_type() == McpServerConnectionType::Connected
 }
 
 /// Maps to: CC `useManageMCPConnections.ts#initializeServersAsPending` stale
@@ -997,7 +997,7 @@ pub fn cleanup_stale_mcp_clients(
     let cleanups = stale
         .iter()
         .filter(|server| stale_mcp_server_needs_cache_cleanup(server))
-        .map(|server| clear_server_cache(&server.client.name, server.config.as_ref()))
+        .map(|server| clear_server_cache(server.name(), server.config.as_ref()))
         .collect::<Vec<_>>();
     async move {
         futures::future::join_all(cleanups).await;
@@ -1026,13 +1026,13 @@ pub fn initialize_servers_as_pending(
     let stale_result = super::utils::exclude_stale_plugin_clients(current_state, configs);
     // Source timer guards run synchronously inside the initialization updater.
     for server in &stale_result.stale {
-        cancel_pending_mcp_reconnect(&server.client.name);
+        cancel_pending_mcp_reconnect(server.name());
     }
     let mut state = stale_result.state;
     let existing_names = state
         .clients
         .iter()
-        .map(|server| server.client.name.clone())
+        .map(|server| server.name().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
     let mut new_clients = Vec::new();
     for (name, config) in crate::utils::process_env::ecmascript_object_entries(configs)
@@ -1419,7 +1419,7 @@ async fn load_and_connect_mcp_configs(
                         .mcp
                         .clients
                         .iter()
-                        .any(|client| client.client.name == *name)
+                        .any(|client| client.name() == *name)
                 })
                 .map(|(name, config)| {
                     if is_mcp_server_disabled(name) {
@@ -1668,10 +1668,10 @@ pub fn apply_mcp_server_update(state: &mut McpState, update: impl Into<McpPendin
         mut commands,
         mut resources,
     } = update.into();
-    let name = server.client.name.clone();
+    let name = server.name().to_owned();
     // `:232-243`: a disabled or failed client clears what it does not supply.
     if matches!(
-        server.client.status,
+        server.connection_type(),
         McpServerConnectionType::Disabled | McpServerConnectionType::Failed
     ) {
         tools.get_or_insert_with(Vec::new);
@@ -1704,7 +1704,7 @@ pub fn apply_mcp_server_update(state: &mut McpState, update: impl Into<McpPendin
     if let Some(previous) = state
         .clients
         .iter_mut()
-        .find(|client| client.client.name == name)
+        .find(|client| client.name() == name)
     {
         *previous = server;
     } else {
@@ -1735,7 +1735,7 @@ pub async fn toggle_mcp_server_once(
     let server = current_state
         .clients
         .iter()
-        .find(|server| server.client.name == name)
+        .find(|server| server.name() == name)
         .ok_or_else(|| anyhow::anyhow!("MCP server {name} not found"))?;
     let client = &server.client;
     let is_currently_disabled = client.status == McpServerConnectionType::Disabled;
@@ -2088,11 +2088,11 @@ mod tests {
             let first = changed_rx.recv().await.unwrap();
             assert!(released_at.elapsed() >= std::time::Duration::from_millis(MCP_BATCH_FLUSH_MS));
             assert_eq!(
-                first.clients[0].client.status,
+                first.clients[0].connection_type(),
                 McpServerConnectionType::Pending
             );
             assert_eq!(
-                first.clients[1].client.status,
+                first.clients[1].connection_type(),
                 McpServerConnectionType::Failed
             );
             assert_eq!(
@@ -2110,7 +2110,7 @@ mod tests {
         // Source cleanup cancels the pending timer and synchronously flushes.
         drop(owner);
         assert_eq!(
-            writer.current().clients[0].client.status,
+            writer.current().clients[0].connection_type(),
             McpServerConnectionType::Failed
         );
         assert_eq!(store.revision(), 2);
@@ -2156,7 +2156,7 @@ mod tests {
                 .current()
                 .clients
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             ["z", "a"]
         );
@@ -2207,7 +2207,7 @@ mod tests {
                 .current()
                 .clients
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             ["old", "new"]
         );
@@ -2258,7 +2258,7 @@ mod tests {
                     .current()
                     .clients
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 ["first", "reentrant"]
             );
@@ -2520,9 +2520,9 @@ mod tests {
             ]);
             let state = pending_mcp_state_from_configs(&configs);
             assert_eq!(state.clients.len(), 2);
-            assert_eq!(state.clients[0].client.name, "docs");
+            assert_eq!(state.clients[0].name(), "docs");
             assert_eq!(
-                state.clients[0].client.status,
+                state.clients[0].connection_type(),
                 McpServerConnectionType::Pending
             );
             assert_eq!(
@@ -2557,7 +2557,7 @@ mod tests {
                     .state
                     .clients
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 ["2", "9", "z", "a"]
             );
@@ -2600,7 +2600,7 @@ mod tests {
                 indexmap::IndexMap::from([("docs".to_string(), stdio_config("docs-mcp"))]);
             let state = pending_mcp_state_from_configs(&configs);
             assert_eq!(
-                state.clients[0].client.status,
+                state.clients[0].connection_type(),
                 McpServerConnectionType::Disabled
             );
         });
@@ -2635,7 +2635,7 @@ mod tests {
                 result
                     .stale
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 vec!["removed-plugin", "docs"]
             );
@@ -2644,7 +2644,7 @@ mod tests {
                     .state
                     .clients
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 vec!["kept", "docs", "new"]
             );
@@ -2652,7 +2652,7 @@ mod tests {
                 .state
                 .clients
                 .iter()
-                .find(|server| server.client.name == "docs")
+                .find(|server| server.name() == "docs")
                 .unwrap();
             assert_eq!(
                 docs.config
@@ -2660,7 +2660,7 @@ mod tests {
                     .and_then(|config| config.command.as_deref()),
                 Some("docs-new")
             );
-            assert_eq!(docs.client.status, McpServerConnectionType::Pending);
+            assert_eq!(docs.connection_type(), McpServerConnectionType::Pending);
         });
     }
 
@@ -2831,7 +2831,7 @@ mod tests {
         let server = state.clients[0].clone();
 
         let pending = pending_reconnect_server_update(&server, 2);
-        assert_eq!(pending.client.status, McpServerConnectionType::Pending);
+        assert_eq!(pending.connection_type(), McpServerConnectionType::Pending);
         assert_eq!(pending.client.reconnect_attempt, Some(2));
         assert_eq!(
             pending.client.max_reconnect_attempts,
@@ -2843,11 +2843,11 @@ mod tests {
         assert_eq!(state.resources["docs"].len(), 1);
 
         let failed = failed_reconnect_server_update(&server);
-        assert_eq!(failed.client.status, McpServerConnectionType::Failed);
+        assert_eq!(failed.connection_type(), McpServerConnectionType::Failed);
         assert_eq!(failed.client.reconnect_attempt, None);
         apply_mcp_client_update(&mut state, failed);
         assert_eq!(
-            state.clients[0].client.status,
+            state.clients[0].connection_type(),
             McpServerConnectionType::Failed
         );
         assert!(state.tools.is_empty());
@@ -2911,7 +2911,7 @@ mod tests {
 
         clear_authentication_state(&mut state, "docs");
         assert_eq!(
-            state.clients[0].client.status,
+            state.clients[0].connection_type(),
             McpServerConnectionType::Failed
         );
         assert_eq!(tool_names(&state), vec!["mcp__other__keep"]);
@@ -2921,7 +2921,7 @@ mod tests {
 
         claude_ai_clear_authentication_state(&mut state, "other");
         assert_eq!(
-            state.clients[1].client.status,
+            state.clients[1].connection_type(),
             McpServerConnectionType::NeedsAuth
         );
         assert!(state.tools.is_empty());
@@ -2964,12 +2964,12 @@ mod tests {
             &mut state,
             McpConnectionDiscovery::failed("alpha", &stdio_config("alpha"), "boom"),
         );
-        assert_eq!(state.clients[0].client.name, "alpha");
+        assert_eq!(state.clients[0].name(), "alpha");
         assert_eq!(
-            state.clients[0].client.status,
+            state.clients[0].connection_type(),
             McpServerConnectionType::Failed
         );
-        assert_eq!(state.clients[1].client.name, "zeta");
+        assert_eq!(state.clients[1].name(), "zeta");
     }
 
     #[test]
@@ -3020,8 +3020,8 @@ mod tests {
             vec!["mcp__beta__keep-prompt", "mcp__alpha__new-prompt"]
         );
         assert_eq!(state.resources["alpha"][0].uri, "alpha://new");
-        assert_eq!(state.clients[0].client.name, "alpha");
-        assert_eq!(state.clients[1].client.name, "beta");
+        assert_eq!(state.clients[0].name(), "alpha");
+        assert_eq!(state.clients[1].name(), "beta");
 
         let commands_before_tools_patch = state
             .commands
@@ -3086,7 +3086,7 @@ mod tests {
         let pending = pending_reconnect_server_update(&state.clients[0], 1);
         apply_mcp_client_update(&mut state, pending);
         assert_eq!(
-            state.clients[0].client.status,
+            state.clients[0].connection_type(),
             McpServerConnectionType::Pending
         );
         assert_eq!(state.tools, tools_before_pending);
@@ -3117,7 +3117,7 @@ mod tests {
             state
                 .clients
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             vec!["alpha", "gamma"],
             "missing client must be appended, preserving existing order"
@@ -3145,7 +3145,7 @@ mod tests {
                 None,
             ),
         );
-        assert_eq!(state.clients[2].client.name, "delta");
+        assert_eq!(state.clients[2].name(), "delta");
         assert!(
             state
                 .commands
@@ -3170,7 +3170,7 @@ mod tests {
                 Some(vec![flat_resource("epsilon", "epsilon://fresh")]),
             ),
         );
-        assert_eq!(state.clients[3].client.name, "epsilon");
+        assert_eq!(state.clients[3].name(), "epsilon");
         assert_eq!(state.resources["epsilon"][0].uri, "epsilon://fresh");
         assert_eq!(
             state.tools, tools_before_epsilon,
@@ -3296,7 +3296,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                updated.server.client.status,
+                updated.server.connection_type(),
                 McpServerConnectionType::Disabled
             );
             assert!(crate::services::mcp::config::is_mcp_server_disabled("docs"));

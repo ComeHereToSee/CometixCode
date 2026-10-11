@@ -223,6 +223,18 @@ pub struct McpServerSnapshot {
     pub supports_resources: bool,
 }
 
+impl McpServerSnapshot {
+    /// CC `client.name`.
+    pub fn name(&self) -> &str {
+        &self.client.name
+    }
+
+    /// CC `client.type`.
+    pub fn connection_type(&self) -> McpServerConnectionType {
+        self.client.status
+    }
+}
+
 /// Maps to: CC `services/mcp/types.ts:28-35#McpStdioServerConfigSchema`.
 pub fn mcp_stdio_server_config_schema() -> &'static Schema {
     static S: OnceLock<Schema> = OnceLock::new();

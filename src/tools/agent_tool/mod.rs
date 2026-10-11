@@ -1239,8 +1239,8 @@ fn has_required_mcp_server_with_status(
     status: crate::services::mcp::types::McpServerConnectionType,
 ) -> bool {
     mcp_state.clients.iter().any(|server| {
-        server.client.status == status && {
-            let name = server.client.name.to_lowercase();
+        server.connection_type() == status && {
+            let name = server.name().to_lowercase();
             required
                 .iter()
                 .any(|pattern| name.contains(&pattern.to_lowercase()))
@@ -3213,7 +3213,7 @@ mod tests {
         // (tool.rs:1334) and nothing below ever refreshes it, so a check that
         // reads the snapshot instead of the re-read state cannot pass.
         assert_eq!(
-            context.mcp_state.clients[0].client.status,
+            context.mcp_state.clients[0].connection_type(),
             McpServerConnectionType::Pending
         );
 

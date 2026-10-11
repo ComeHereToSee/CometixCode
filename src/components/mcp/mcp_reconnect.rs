@@ -78,7 +78,7 @@ pub fn MCPReconnect(props: &MCPReconnectProps, mut hooks: Hooks) -> impl Into<An
                 pending_result.set(Some(result));
                 return;
             };
-            let status = server.client.status;
+            let status = server.connection_type();
             let result = reconnect_result_from_status(&server_name, Some(status));
             let error_message = reconnect_error_from_status(&server_name, Some(status));
             error.set(error_message);

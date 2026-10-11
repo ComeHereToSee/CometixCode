@@ -25,12 +25,12 @@ fn find_slack_server(clients: &[McpServerSnapshot]) -> Option<String> {
     clients
         .iter()
         .find(|server| {
-            server.client.status == McpServerConnectionType::Connected
+            server.connection_type() == McpServerConnectionType::Connected
                 // Source uses `client.name.includes('slack')` without a
                 // case-fold. Preserve that protocol-facing gate exactly.
-                && server.client.name.contains("slack")
+                && server.name().contains("slack")
         })
-        .map(|server| server.client.name.clone())
+        .map(|server| server.name().to_owned())
 }
 
 /// Maps to: CC `hasSlackMcpServer`.

@@ -82,9 +82,10 @@ pub(crate) fn pending_mcp_server_names(
         .clients
         .iter()
         .filter(|server| {
-            server.client.status == crate::services::mcp::types::McpServerConnectionType::Pending
+            server.connection_type()
+                == crate::services::mcp::types::McpServerConnectionType::Pending
         })
-        .map(|server| server.client.name.clone())
+        .map(|server| server.name().to_owned())
         .collect()
 }
 

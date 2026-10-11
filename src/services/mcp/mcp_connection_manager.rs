@@ -232,7 +232,7 @@ pub async fn reconnect_mcp_server_from_manager(
     let runtime_server = current
         .clients
         .iter()
-        .find(|server| server.client.name == server_name)?;
+        .find(|server| server.name() == server_name)?;
     let config = resolve_server_config(server_name, runtime_server)?;
 
     runtime_mcp.apply_client_update(
@@ -274,7 +274,7 @@ pub async fn toggle_mcp_server_from_manager(
     let Some(runtime_server) = current
         .clients
         .iter()
-        .find(|server| server.client.name == server_name)
+        .find(|server| server.name() == server_name)
     else {
         return Ok(None);
     };
@@ -282,7 +282,7 @@ pub async fn toggle_mcp_server_from_manager(
         return Ok(None);
     };
 
-    if runtime_server.client.status == McpServerConnectionType::Disabled {
+    if runtime_server.connection_type() == McpServerConnectionType::Disabled {
         runtime_mcp.apply_client_update(
             crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
                 server_name,

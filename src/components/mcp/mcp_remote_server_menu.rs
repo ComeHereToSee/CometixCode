@@ -321,7 +321,7 @@ pub fn MCPRemoteServerMenu<'a>(
                         let client_type = reconnect_mcp_server
                             .call(&server.name)
                             .await
-                            .map(|updated| updated.client.status)
+                            .map(|updated| updated.connection_type())
                             .unwrap_or_else(|| server.official_client_type());
                         pending_runtime_result.set(Some(
                             handle_reconnect_result(client_type, &server.name).message,
@@ -439,7 +439,7 @@ pub fn MCPRemoteServerMenu<'a>(
                         is_reconnecting.set(true);
                         let updated = reconnect_mcp_server.call(&server.name).await;
                         let success = updated.as_ref().is_some_and(|updated| {
-                            updated.client.status == McpServerConnectionType::Connected
+                            updated.connection_type() == McpServerConnectionType::Connected
                         });
                         if success {
                             pending_runtime_result.set(Some(format!(
@@ -447,7 +447,7 @@ pub fn MCPRemoteServerMenu<'a>(
                                 server.name
                             )));
                         } else if updated.as_ref().is_some_and(|updated| {
-                            updated.client.status == McpServerConnectionType::NeedsAuth
+                            updated.connection_type() == McpServerConnectionType::NeedsAuth
                         }) {
                             pending_runtime_result.set(Some(
                                 "Authentication successful, but server still requires authentication. You may need to manually restart Claude Code."

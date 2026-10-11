@@ -67,8 +67,8 @@ pub(crate) fn connected_mcp_server_instructions(
     let connected = state
         .clients
         .iter()
-        .filter(|server| server.client.status == McpServerConnectionType::Connected)
-        .map(|server| server.client.name.as_str())
+        .filter(|server| server.connection_type() == McpServerConnectionType::Connected)
+        .map(|server| server.name())
         .collect::<std::collections::HashSet<_>>();
     MCP_SERVER_INSTRUCTIONS
         .read()
@@ -644,7 +644,7 @@ pub fn has_pending_mcp_servers(state: &McpState) -> bool {
     state
         .clients
         .iter()
-        .any(|server| server.client.status == McpServerConnectionType::Pending)
+        .any(|server| server.connection_type() == McpServerConnectionType::Pending)
 }
 
 /// Maps to: CC `fetchCommandsForClient(...)` MCP prompt command name:
@@ -799,7 +799,7 @@ pub fn resolve_mcp_prompt_command_invocation(
     let server = state
         .clients
         .iter()
-        .find(|server| server.client.name == binding.server_name)?;
+        .find(|server| server.name() == binding.server_name)?;
     Some((
         server.clone(),
         mcp_prompt_command_snapshot(command),
@@ -901,7 +901,7 @@ impl McpConnectionDiscovery {
 
     // Native extraction of client.ts's per-invocation resourceToolsAdded branch.
     fn add_discovery_resource_tools(&mut self, added: &std::sync::atomic::AtomicBool) {
-        if self.server.client.status == McpServerConnectionType::Connected
+        if self.server.connection_type() == McpServerConnectionType::Connected
             && self.server.supports_resources
             && !added.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
@@ -910,7 +910,7 @@ impl McpConnectionDiscovery {
     }
 
     fn add_reconnect_resource_tools(&mut self) {
-        if self.server.client.status != McpServerConnectionType::Connected {
+        if self.server.connection_type() != McpServerConnectionType::Connected {
             self.tools.clear();
             self.commands.clear();
             self.resources = None;
@@ -3249,10 +3249,10 @@ mod runtime {
     /// registered under its name — CC would request on the closed client
     /// and cache the failure as `[]`.
     fn connected_client_for_fetch(client: &McpServerSnapshot) -> Option<McpClient> {
-        if client.client.status != McpServerConnectionType::Connected {
+        if client.connection_type() != McpServerConnectionType::Connected {
             return None;
         }
-        registered_connection(&client.client.name, Some(client.connection_id?)).ok()
+        registered_connection(client.name(), Some(client.connection_id?)).ok()
     }
 
     /// The connection registered under `name` — only if it is `connection_id`
@@ -3818,7 +3818,7 @@ mod runtime {
     /// close has run it by the time `cleanup()` resolves.
     pub fn cleanup_connection(client: &McpServerSnapshot) {
         if let Some(connection_id) = client.connection_id {
-            close_connection(&client.client.name, connection_id);
+            close_connection(client.name(), connection_id);
         }
     }
 
@@ -3853,7 +3853,7 @@ mod runtime {
         };
         handle.spawn(async move {
             let client = connection.await;
-            if client.client.status == McpServerConnectionType::Connected {
+            if client.connection_type() == McpServerConnectionType::Connected {
                 cleanup_connection(&client);
             }
         });
@@ -4162,7 +4162,7 @@ mod runtime {
     pub async fn ensure_connected_client(
         client: &McpServerSnapshot,
     ) -> anyhow::Result<McpServerSnapshot> {
-        let name = &client.client.name;
+        let name = client.name();
         let Some(config) = client.config.as_ref() else {
             anyhow::bail!("MCP server \"{name}\" is not connected");
         };
@@ -4170,7 +4170,7 @@ mod runtime {
             return Ok(client.clone());
         }
         let connected = connect_to_server(name, config).await;
-        if connected.client.status != McpServerConnectionType::Connected {
+        if connected.connection_type() != McpServerConnectionType::Connected {
             anyhow::bail!("MCP server \"{name}\" is not connected");
         }
         Ok(connected)
@@ -4271,7 +4271,7 @@ mod runtime {
         crate::utils::secure_storage::mac_os_keychain_helpers::clear_keychain_cache();
         clear_server_cache(name, Some(config)).await;
         let client = connect_to_server(name, config).await;
-        let mut result = if client.client.status == McpServerConnectionType::Connected {
+        let mut result = if client.connection_type() == McpServerConnectionType::Connected {
             if config.transport == Transport::ClaudeAiProxy {
                 mark_claude_ai_mcp_connected(name);
             }
@@ -4329,7 +4329,7 @@ mod runtime {
             return McpConnectionDiscovery::needs_auth(name, &config);
         }
         let client = connect_to_server(&name, &config).await;
-        match client.client.status {
+        match client.connection_type() {
             McpServerConnectionType::Connected => {
                 if config.transport == Transport::ClaudeAiProxy {
                     mark_claude_ai_mcp_connected(&name);
@@ -4449,9 +4449,11 @@ mod runtime {
         if refresh_after_remote_auth_failure(server_name, config, error).await? {
             clear_server_cache(server_name, Some(config)).await;
             let client = connect_to_server(server_name, config).await;
-            return Ok((client.client.status == McpServerConnectionType::Connected)
-                .then_some(client.connection_id)
-                .flatten());
+            return Ok(
+                (client.connection_type() == McpServerConnectionType::Connected)
+                    .then_some(client.connection_id)
+                    .flatten(),
+            );
         }
         set_mcp_auth_cache_entry(server_name);
         Ok(None)
@@ -4641,7 +4643,7 @@ mod runtime {
         args: &str,
     ) -> anyhow::Result<Vec<Value>> {
         let connected = ensure_connected_client(client).await?;
-        let server_name = connected.client.name.as_str();
+        let server_name = connected.name();
         let Some(connection_id) = connected.connection_id else {
             anyhow::bail!("MCP server \"{server_name}\" is not connected");
         };
@@ -5874,7 +5876,7 @@ mod tests {
         let (server, command, prompt_name) =
             resolve_mcp_prompt_command_invocation("mcp__docs__summarize", &state)
                 .expect("the prompt resolves");
-        assert_eq!(server.client.name, "docs");
+        assert_eq!(server.name(), "docs");
         assert_eq!(prompt_name, "summarize");
         assert_eq!(command.arg_names, vec!["path".to_string()]);
         assert_eq!(command.user_facing_name, "docs:summarize (MCP)");
@@ -5891,8 +5893,8 @@ mod tests {
         let (server, _, prompt_name) =
             resolve_mcp_prompt_command_invocation("mcp__docs__summarize", &state)
                 .expect("the prompt still resolves while the server reconnects");
-        assert_eq!(server.client.name, "docs");
-        assert_eq!(server.client.status, McpServerConnectionType::Pending);
+        assert_eq!(server.name(), "docs");
+        assert_eq!(server.connection_type(), McpServerConnectionType::Pending);
         assert_eq!(prompt_name, "summarize");
     }
 
@@ -5918,12 +5920,12 @@ mod tests {
         let (server, _, prompt_name) =
             resolve_mcp_prompt_command_invocation("mcp__a__b__x__y", &state)
                 .expect("server a__b's prompt resolves");
-        assert_eq!(server.client.name, "a__b");
+        assert_eq!(server.name(), "a__b");
         assert_eq!(prompt_name, "x__y");
         let (server, _, prompt_name) =
             resolve_mcp_prompt_command_invocation("mcp__My_Server__report", &state)
                 .expect("the normalized server's prompt resolves");
-        assert_eq!(server.client.name, "My Server");
+        assert_eq!(server.name(), "My Server");
         assert_eq!(prompt_name, "report");
     }
 
@@ -6036,9 +6038,9 @@ mod tests {
         let setup = setup_sdk_mcp_clients(&configs, callback).await;
 
         assert_eq!(setup.clients.len(), 1);
-        assert_eq!(setup.clients[0].client.name, "sdk-server");
+        assert_eq!(setup.clients[0].name(), "sdk-server");
         assert_eq!(
-            setup.clients[0].client.status,
+            setup.clients[0].connection_type(),
             McpServerConnectionType::Failed
         );
         assert!(
@@ -6136,8 +6138,8 @@ mod tests {
 
         assert_eq!(setup.clients.len(), 1);
         let client = &setup.clients[0];
-        assert_eq!(client.client.name, "sdk-connected");
-        assert_eq!(client.client.status, McpServerConnectionType::Connected);
+        assert_eq!(client.name(), "sdk-connected");
+        assert_eq!(client.connection_type(), McpServerConnectionType::Connected);
         assert_eq!(client.client.server_version.as_deref(), Some("1.2.3"));
         assert_eq!(
             client.config.as_ref().map(|config| config.scope),
@@ -6795,7 +6797,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(tool_names(&discovery.tools), vec!["login"]);
@@ -6881,7 +6883,7 @@ rl.on('line', line => {
                 runtime::connect_to_server(SERVER, &config)
             );
             assert_eq!(
-                first.client.status,
+                first.connection_type(),
                 McpServerConnectionType::Connected,
                 "{:?}",
                 first.client.error
@@ -6919,7 +6921,7 @@ rl.on('line', line => {
             let config = fixture.config(&[]);
             let connected = runtime::connect_to_server(SERVER, &config).await;
             assert_eq!(
-                connected.client.status,
+                connected.connection_type(),
                 McpServerConnectionType::Connected,
                 "{:?}",
                 connected.client.error
@@ -6954,7 +6956,7 @@ rl.on('line', line => {
             let config = fixture.config(&[]);
             let connected = runtime::connect_to_server(SERVER, &config).await;
             assert_eq!(
-                connected.client.status,
+                connected.connection_type(),
                 McpServerConnectionType::Connected,
                 "{:?}",
                 connected.client.error
@@ -6978,7 +6980,7 @@ rl.on('line', line => {
             let config = fixture.config(&["resources"]);
             let connected = runtime::connect_to_server(SERVER, &config).await;
             assert_eq!(
-                connected.client.status,
+                connected.connection_type(),
                 McpServerConnectionType::Connected,
                 "{:?}",
                 connected.client.error
@@ -7015,7 +7017,7 @@ rl.on('line', line => {
             let config = fixture.config(&[]);
             let connected = runtime::connect_to_server(SERVER, &config).await;
             assert_eq!(
-                connected.client.status,
+                connected.connection_type(),
                 McpServerConnectionType::Connected,
                 "{:?}",
                 connected.client.error
@@ -7069,7 +7071,7 @@ rl.on('line', line => {
                 let config = fixture.config(&[]);
                 let first = runtime::connect_to_server(SERVER, &config).await;
                 let second = runtime::connect_to_server(SERVER, &config).await;
-                assert_eq!(second.client.status, McpServerConnectionType::Connected);
+                assert_eq!(second.connection_type(), McpServerConnectionType::Connected);
                 assert_ne!(first.connection_id, second.connection_id);
                 assert_eq!(fixture.count("initialize"), 2);
                 assert_eq!(registered_connection_id(SERVER), second.connection_id);
@@ -7103,7 +7105,7 @@ rl.on('line', line => {
                 .await;
 
             let second = runtime::connect_to_server(SERVER, &config).await;
-            assert_eq!(second.client.status, McpServerConnectionType::Connected);
+            assert_eq!(second.connection_type(), McpServerConnectionType::Connected);
             assert_ne!(second.connection_id, first.connection_id);
             assert_eq!(fixture.count("initialize"), 2);
             assert_eq!(
@@ -7142,11 +7144,11 @@ rl.on('line', line => {
 
             let clear = runtime::clear_server_cache(SERVER, Some(&config));
             let second = runtime::connect_to_server(SERVER, &config).await;
-            assert_eq!(second.client.status, McpServerConnectionType::Connected);
+            assert_eq!(second.connection_type(), McpServerConnectionType::Connected);
             clear.await;
             let first = first.await.unwrap();
 
-            assert_eq!(first.client.status, McpServerConnectionType::Connected);
+            assert_eq!(first.connection_type(), McpServerConnectionType::Connected);
             assert_ne!(first.connection_id, second.connection_id);
             assert!(runtime::fetch_tools_for_client(&first).await.is_empty());
             assert_eq!(fixture.count("initialize"), 2);
@@ -7174,14 +7176,14 @@ rl.on('line', line => {
             const SERVER: &str = "failing-stdio-fixture";
             let config = fixture.config(&["exit-on-initialize"]);
             let first = runtime::connect_to_server(SERVER, &config).await;
-            assert_eq!(first.client.status, McpServerConnectionType::Failed);
+            assert_eq!(first.connection_type(), McpServerConnectionType::Failed);
             let again = runtime::connect_to_server(SERVER, &config).await;
-            assert_eq!(again.client.status, McpServerConnectionType::Failed);
+            assert_eq!(again.connection_type(), McpServerConnectionType::Failed);
             assert_eq!(fixture.count("initialize"), 1);
 
             let reconnected = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
             assert_eq!(
-                reconnected.server.client.status,
+                reconnected.server.connection_type(),
                 McpServerConnectionType::Failed
             );
             assert_eq!(fixture.count("initialize"), 2);
@@ -7249,7 +7251,7 @@ rl.on('line', line => {
             let config = fixture.config();
             let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
             assert_eq!(
-                discovery.server.client.status,
+                discovery.server.connection_type(),
                 McpServerConnectionType::Connected
             );
 
@@ -7294,7 +7296,7 @@ rl.on('line', line => {
             );
 
             let second = runtime::connect_to_server(SERVER, &second_config).await;
-            assert_eq!(second.client.status, McpServerConnectionType::Connected);
+            assert_eq!(second.connection_type(), McpServerConnectionType::Connected);
             assert_ne!(second.connection_id, first.connection_id);
             assert_eq!(registered_connection_id(SERVER), second.connection_id);
             assert_eq!(
@@ -7333,12 +7335,12 @@ rl.on('line', line => {
             let reset = crate::hooks::use_ide_selection::ide_selection_reset();
 
             let first = runtime::connect_to_server(SERVER, &fixture.config(&[])).await;
-            assert_eq!(first.client.status, McpServerConnectionType::Connected);
+            assert_eq!(first.connection_type(), McpServerConnectionType::Connected);
             assert_eq!(rx.try_recv().unwrap(), reset, "null → first");
 
             let second =
                 runtime::connect_to_server(SERVER, &fixture.config(&["another-config"])).await;
-            assert_eq!(second.client.status, McpServerConnectionType::Connected);
+            assert_eq!(second.connection_type(), McpServerConnectionType::Connected);
             assert_eq!(registered_connection_id(SERVER), second.connection_id);
             assert_eq!(
                 rx.sender_count(),
@@ -7485,7 +7487,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(tool_names(&discovery.tools), vec!["first"]);
@@ -7620,7 +7622,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(
@@ -7777,7 +7779,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 let resources = discovery.resources.as_ref().expect("resources");
@@ -7869,7 +7871,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 // `resources.length > 0 ? resources : undefined`.
@@ -7972,7 +7974,7 @@ rl.on('line', line => {
             };
             let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
             assert_eq!(
-                discovery.server.client.status,
+                discovery.server.connection_type(),
                 McpServerConnectionType::Connected
             );
             assert_eq!(discovery.commands.len(), 1);
@@ -8141,7 +8143,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.server.client.server_version.as_deref(), Some("1.0.0"));
@@ -8326,7 +8328,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.server.client.server_version.as_deref(), Some("1.0.0"));
@@ -8486,7 +8488,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.server.client.server_version.as_deref(), Some("1.0.0"));
@@ -8581,7 +8583,7 @@ rl.on('line', line => {
                     plugin_source: None,
                 };
                 let client = runtime::connect_to_server(SERVER, &config).await;
-                assert_eq!(client.client.status, McpServerConnectionType::Failed);
+                assert_eq!(client.connection_type(), McpServerConnectionType::Failed);
                 assert_eq!(
                     client.client.error.as_deref(),
                     Some(
@@ -8755,7 +8757,7 @@ rl.on('line', line => {
                 };
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.tools.len(), 1);
@@ -8875,7 +8877,7 @@ rl.on('line', line => {
 
         assert_eq!(discoveries.len(), 1);
         assert_eq!(
-            discoveries[0].server.client.status,
+            discoveries[0].server.connection_type(),
             McpServerConnectionType::NeedsAuth
         );
         assert_eq!(tool_names(&discoveries[0].tools), vec!["authenticate"]);

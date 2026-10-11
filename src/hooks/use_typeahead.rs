@@ -1242,7 +1242,7 @@ fn slack_channel_token(input: &str, cursor_offset: usize) -> Option<String> {
 fn mcp_client_source_key(clients: &[McpServerSnapshot]) -> String {
     clients
         .iter()
-        .map(|server| format!("{}:{:?}", server.client.name, server.client.status))
+        .map(|server| format!("{}:{:?}", server.name(), server.connection_type()))
         .collect::<Vec<_>>()
         .join("|")
 }

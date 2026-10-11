@@ -197,7 +197,7 @@ impl McpAuthTool {
                                 if let Some(existing) = mcp
                                     .clients
                                     .iter_mut()
-                                    .find(|client| client.client.name == background_server_name)
+                                    .find(|client| client.name() == background_server_name)
                                 {
                                     *existing = result.server;
                                 }

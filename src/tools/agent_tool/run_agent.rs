@@ -313,7 +313,7 @@ impl AgentMcpCleanup {
             crate::services::mcp::client::cleanup_memoized_connection(&name, &config);
         }
         for client in self.newly_created_clients.drain(..) {
-            if client.client.status
+            if client.connection_type()
                 == crate::services::mcp::types::McpServerConnectionType::Connected
             {
                 crate::services::mcp::client::cleanup_connection(&client);
@@ -396,21 +396,19 @@ async fn initialize_agent_mcp_servers(
             cleanup.newly_created_clients.push(client.clone());
         }
 
-        if client.client.status != crate::services::mcp::types::McpServerConnectionType::Connected {
+        if client.connection_type()
+            != crate::services::mcp::types::McpServerConnectionType::Connected
+        {
             tracing::warn!(
                 agent_type = %agent_definition.agent_type,
                 server = %name,
-                status = ?client.client.status,
+                status = ?client.connection_type(),
                 "failed to connect to agent MCP server"
             );
             // CC appends the agent's clients to the parent's
             // (`runAgent.ts:213-214`): an entry the parent already holds stays
             // as it is, with any tools it carries.
-            if !state
-                .clients
-                .iter()
-                .any(|server| server.client.name == name)
-            {
+            if !state.clients.iter().any(|server| server.name() == name) {
                 state.clients.push(client);
             }
             continue;
@@ -3006,7 +3004,7 @@ mod tests {
                     crate::services::mcp::client::reconnect_mcp_server_impl("shared", &config)
                         .await;
                 assert_eq!(
-                    parent.server.client.status,
+                    parent.server.connection_type(),
                     McpServerConnectionType::Connected,
                     "{:?}",
                     parent.server.client.error
@@ -3045,7 +3043,7 @@ mod tests {
                     .mcp_state
                     .clients
                     .iter()
-                    .find(|server| server.client.name == "shared")
+                    .find(|server| server.name() == "shared")
                     .expect("the agent's state holds the server");
                 assert_eq!(shared.connection_id, parent_connection_id);
                 drop(initialized);
@@ -3126,16 +3124,16 @@ mod tests {
                     .mcp_state
                     .clients
                     .iter()
-                    .find(|server| server.client.name == "broken")
+                    .find(|server| server.name() == "broken")
                     .expect("the agent's state holds the failed server");
-                assert_eq!(broken.client.status, McpServerConnectionType::Failed);
+                assert_eq!(broken.connection_type(), McpServerConnectionType::Failed);
                 assert!(crate::services::mcp::client::is_connected_mcp_client("inline").await);
 
                 drop(initialized);
                 assert!(!crate::services::mcp::client::is_connected_mcp_client("inline").await);
                 let again =
                     crate::services::mcp::client::connect_to_server("inline", &config).await;
-                assert_eq!(again.client.status, McpServerConnectionType::Connected);
+                assert_eq!(again.connection_type(), McpServerConnectionType::Connected);
                 assert_eq!(fixture.count("initialize"), 2);
                 crate::services::mcp::client::clear_server_cache("inline", None).await;
                 crate::services::mcp::client::clear_server_cache("broken", None).await;

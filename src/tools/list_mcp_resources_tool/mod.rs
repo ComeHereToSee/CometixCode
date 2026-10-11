@@ -73,7 +73,7 @@ pub(crate) async fn list_mcp_resources_output(
     let available_servers = state
         .clients
         .iter()
-        .map(|server| server.client.name.as_str())
+        .map(|server| server.name())
         .collect::<Vec<_>>();
 
     if let Some(server) = target_server {
@@ -94,9 +94,9 @@ pub(crate) async fn list_mcp_resources_output(
         state
             .clients
             .iter()
-            .filter(|server| target_server.is_none_or(|target| target == server.client.name))
+            .filter(|server| target_server.is_none_or(|target| target == server.name()))
             .filter(|server| {
-                server.client.status
+                server.connection_type()
                     == crate::services::mcp::types::McpServerConnectionType::Connected
             })
             .map(|server| async move {
@@ -109,13 +109,13 @@ pub(crate) async fn list_mcp_resources_output(
                             name: resource.name,
                             mime_type: resource.mime_type,
                             description: resource.description,
-                            server: server.client.name.clone(),
+                            server: server.name().to_owned(),
                         })
                         .collect(),
                     // One server's reconnect failure doesn't sink the whole
                     // result.
                     Err(error) => {
-                        tracing::warn!(server = %server.client.name, error = %error, "failed to reconnect MCP server for ListMcpResourcesTool");
+                        tracing::warn!(server = %server.name(), error = %error, "failed to reconnect MCP server for ListMcpResourcesTool");
                         Vec::new()
                     }
                 }
@@ -495,7 +495,7 @@ rl.on('line', line => {
                 let discovery =
                     crate::services::mcp::client::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     crate::services::mcp::types::McpServerConnectionType::Connected
                 );
 

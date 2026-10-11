@@ -405,9 +405,9 @@ impl McpWriter {
             // Detach before publishing replacement pending state; an old
             // transport closing during async cache cleanup must not reconnect.
             for stale in &result.stale {
-                if stale.client.status == McpServerConnectionType::Connected {
+                if stale.connection_type() == McpServerConnectionType::Connected {
                     crate::services::mcp::client::detach_mcp_close_handler(
-                        &stale.client.name,
+                        stale.name(),
                         stale.connection_id,
                     );
                 }
@@ -415,7 +415,7 @@ impl McpWriter {
             if result
                 .stale
                 .iter()
-                .any(|server| server.client.status == McpServerConnectionType::Connected)
+                .any(|server| server.connection_type() == McpServerConnectionType::Connected)
             {
                 let cleanup =
                     crate::services::mcp::use_manage_mcp_connections::cleanup_stale_mcp_clients(
@@ -1110,9 +1110,9 @@ mod tests {
         let docs = state
             .clients
             .iter()
-            .find(|server| server.client.name == "docs")
+            .find(|server| server.name() == "docs")
             .expect("docs client survives");
-        assert_eq!(docs.client.status, McpServerConnectionType::Connected);
+        assert_eq!(docs.connection_type(), McpServerConnectionType::Connected);
         assert_eq!(
             state.tools.len(),
             1,

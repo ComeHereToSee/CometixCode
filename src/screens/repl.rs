@@ -3627,7 +3627,7 @@ fn build_repl_query_prompt_contexts(
     let mcp_names: Vec<&str> = mcp_state
         .clients
         .iter()
-        .map(|server| server.client.name.as_str())
+        .map(|server| server.name())
         .collect();
     let scratchpad_dir = crate::utils::permissions::filesystem::is_scratchpad_enabled()
         .then(crate::utils::permissions::filesystem::get_scratchpad_dir);
@@ -10408,8 +10408,8 @@ mod tests {
                 }
                 let current = store.get();
                 if let Some(client) = current.mcp.clients.iter().find(|client| {
-                    client.client.name == name
-                        && client.client.status
+                    client.name() == name
+                        && client.connection_type()
                             == crate::services::mcp::types::McpServerConnectionType::Failed
                 }) {
                     assert_eq!(
@@ -10422,7 +10422,7 @@ mod tests {
                     // callback (not transient pending) to prove both effects ran,
                     // without a network service, subprocess, or model request.
                     assert_eq!(
-                        client.client.status,
+                        client.connection_type(),
                         crate::services::mcp::types::McpServerConnectionType::Failed
                     );
                     break;

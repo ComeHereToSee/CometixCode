@@ -188,19 +188,19 @@ pub(crate) async fn read_mcp_resource_output(
     let available_servers = state
         .clients
         .iter()
-        .map(|candidate| candidate.client.name.as_str())
+        .map(|candidate| candidate.name())
         .collect::<Vec<_>>();
     let Some(client) = state
         .clients
         .iter()
-        .find(|candidate| candidate.client.name == server)
+        .find(|candidate| candidate.name() == server)
     else {
         return Err(format!(
             "Server \"{server}\" not found. Available servers: {}",
             available_servers.join(", ")
         ));
     };
-    if client.client.status != crate::services::mcp::types::McpServerConnectionType::Connected {
+    if client.connection_type() != crate::services::mcp::types::McpServerConnectionType::Connected {
         return Err(format!("Server \"{server}\" is not connected"));
     }
     if !client.supports_resources {

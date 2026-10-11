@@ -392,7 +392,7 @@ fn mcp_server_snapshot_is_stale(
     server: &McpServerSnapshot,
     configs: &indexmap::IndexMap<String, ScopedMcpServerConfig>,
 ) -> bool {
-    match (server.config.as_ref(), configs.get(&server.client.name)) {
+    match (server.config.as_ref(), configs.get(server.name())) {
         (Some(current), Some(fresh)) => hash_mcp_config(current) != hash_mcp_config(fresh),
         (Some(current), None) => current.scope == ConfigScope::Dynamic,
         (None, Some(_)) => true,
@@ -420,13 +420,13 @@ pub fn exclude_stale_plugin_clients(
 
     let stale_names = stale
         .iter()
-        .map(|server| server.client.name.as_str())
+        .map(|server| server.name())
         .collect::<std::collections::BTreeSet<_>>();
     let mut next = state.clone();
     // CC `excludeToolsByServer`: by the server's `mcp__<name>__` prefix.
     let stale_prefixes = stale
         .iter()
-        .map(|server| format!("mcp__{}__", normalize_name_for_mcp(&server.client.name)))
+        .map(|server| format!("mcp__{}__", normalize_name_for_mcp(server.name())))
         .collect::<Vec<_>>();
     next.tools.retain(|tool| {
         !stale_prefixes
@@ -436,13 +436,13 @@ pub fn exclude_stale_plugin_clients(
     next.commands.retain(|command| {
         !stale
             .iter()
-            .any(|server| command_belongs_to_server(command.name.as_ref(), &server.client.name))
+            .any(|server| command_belongs_to_server(command.name.as_ref(), server.name()))
     });
     for name in &stale_names {
         next.resources.remove(*name);
     }
     next.clients
-        .retain(|server| !stale_names.contains(server.client.name.as_str()));
+        .retain(|server| !stale_names.contains(server.name()));
     ExcludeStalePluginClientsResult { state: next, stale }
 }
 
@@ -856,12 +856,12 @@ mod tests {
             result
                 .stale
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             vec!["removed-plugin", "changed-user"]
         );
         assert_eq!(result.state.clients.len(), 1);
-        assert_eq!(result.state.clients[0].client.name, "kept-user");
+        assert_eq!(result.state.clients[0].name(), "kept-user");
     }
 
     #[test]

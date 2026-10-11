@@ -177,7 +177,7 @@ fn server_infos_from_capability_arrays(
     let mut configs = all_configured_mcp_servers_readonly(global_config, project_config);
     let runtime_by_name = runtime_servers
         .iter()
-        .map(|server| (server.client.name.clone(), server))
+        .map(|server| (server.name().to_owned(), server))
         .collect::<BTreeMap<_, _>>();
     let client_statuses = fallback_clients
         .iter()
@@ -186,7 +186,7 @@ fn server_infos_from_capability_arrays(
 
     for server in runtime_servers {
         configs
-            .entry(server.client.name.clone())
+            .entry(server.name().to_owned())
             .or_insert_with(|| ScopedMcpServerConfig {
                 name: None,
                 scope: ConfigScope::Project,
@@ -236,7 +236,7 @@ fn server_infos_from_capability_arrays(
                 .and_then(|server| server.config.clone())
                 .unwrap_or(config);
             let status = runtime
-                .map(|server| server.client.status)
+                .map(|server| server.connection_type())
                 .or_else(|| client_statuses.get(&name).copied())
                 .unwrap_or(McpServerConnectionType::Pending);
             let tools = crate::services::mcp::utils::filter_tools_by_server(runtime_tools, &name)

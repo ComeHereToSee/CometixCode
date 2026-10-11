@@ -361,7 +361,7 @@ fn apply_headless_mcp_connection_attempt(
     if let Some(existing) = state
         .clients
         .iter_mut()
-        .find(|existing| existing.client.name == server.client.name)
+        .find(|existing| existing.name() == server.name())
     {
         *existing = server;
     } else {
@@ -871,7 +871,7 @@ async fn handle_control_request(
                     state
                         .clients
                         .iter()
-                        .find(|server| server.client.name == server_name)
+                        .find(|server| server.name() == server_name)
                 })
                 .and_then(|server| server.config.clone());
             let Some(config) = config else {
@@ -887,7 +887,7 @@ async fn handle_control_request(
                     &config,
                 )
                 .await;
-            let connected = server.server.client.status
+            let connected = server.server.connection_type()
                 == crate::services::mcp::types::McpServerConnectionType::Connected;
             let error = server.server.client.error.clone();
             crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
@@ -924,7 +924,7 @@ async fn handle_control_request(
             let config = state
                 .clients
                 .iter()
-                .find(|server| server.client.name == server_name)
+                .find(|server| server.name() == server_name)
                 .and_then(|server| server.config.clone());
             let Some(config) = config else {
                 control_error(
@@ -936,9 +936,9 @@ async fn handle_control_request(
             let currently_enabled = state
                 .clients
                 .iter()
-                .find(|server| server.client.name == server_name)
+                .find(|server| server.name() == server_name)
                 .is_some_and(|server| {
-                    server.client.status
+                    server.connection_type()
                         != crate::services::mcp::types::McpServerConnectionType::Disabled
                 });
             if currently_enabled == enabled {
@@ -1438,7 +1438,7 @@ fn build_mcp_server_statuses(
         .clients
         .iter()
         .map(|server| {
-            let connected = server.client.status == McpServerConnectionType::Connected;
+            let connected = server.connection_type() == McpServerConnectionType::Connected;
 
             // CC `:1628-1651` — three shapes, and anything else (ws/sdk) leaves
             // `config` undefined.
@@ -1470,38 +1470,35 @@ fn build_mcp_server_statuses(
             // the three annotations. The `|| undefined` there means a false
             // hint is ABSENT, not `false`.
             let tools = connected.then(|| {
-                crate::services::mcp::utils::filter_tools_by_server(
-                    &state.tools,
-                    &server.client.name,
-                )
-                .iter()
-                .map(|tool| {
-                    let mut annotations = serde_json::Map::new();
-                    if tool.mcp_annotations.read_only_hint {
-                        annotations.insert("readOnly".to_string(), true.into());
-                    }
-                    if tool.mcp_annotations.destructive_hint {
-                        annotations.insert("destructive".to_string(), true.into());
-                    }
-                    if tool.mcp_annotations.open_world_hint {
-                        annotations.insert("openWorld".to_string(), true.into());
-                    }
-                    serde_json::json!({
-                        "name": tool
-                            .mcp_info
-                            .as_ref()
-                            .map_or(&tool.name, |info| &info.tool_name),
-                        "annotations": serde_json::Value::Object(annotations),
+                crate::services::mcp::utils::filter_tools_by_server(&state.tools, server.name())
+                    .iter()
+                    .map(|tool| {
+                        let mut annotations = serde_json::Map::new();
+                        if tool.mcp_annotations.read_only_hint {
+                            annotations.insert("readOnly".to_string(), true.into());
+                        }
+                        if tool.mcp_annotations.destructive_hint {
+                            annotations.insert("destructive".to_string(), true.into());
+                        }
+                        if tool.mcp_annotations.open_world_hint {
+                            annotations.insert("openWorld".to_string(), true.into());
+                        }
+                        serde_json::json!({
+                            "name": tool
+                                .mcp_info
+                                .as_ref()
+                                .map_or(&tool.name, |info| &info.tool_name),
+                            "annotations": serde_json::Value::Object(annotations),
+                        })
                     })
-                })
-                .collect::<Vec<_>>()
+                    .collect::<Vec<_>>()
             });
 
             let mut status = serde_json::Map::new();
-            status.insert("name".to_string(), server.client.name.clone().into());
+            status.insert("name".to_string(), server.name().to_owned().into());
             status.insert(
                 "status".to_string(),
-                server.client.status.as_str().to_string().into(),
+                server.connection_type().as_str().to_string().into(),
             );
             // CC `:1691-1692` — connected only.
             if let (true, Some(version)) = (connected, server.client.server_version.as_ref()) {
@@ -1511,7 +1508,7 @@ fn build_mcp_server_statuses(
                 );
             }
             // CC `:1693` — failed only.
-            if server.client.status == McpServerConnectionType::Failed {
+            if server.connection_type() == McpServerConnectionType::Failed {
                 if let Some(error) = server.client.error.as_ref() {
                     status.insert("error".to_string(), error.clone().into());
                 }
@@ -1533,7 +1530,7 @@ fn build_mcp_server_statuses(
             // would actually pass the allowlist. Not a security boundary — the
             // handler re-runs the full gate — just avoids dead buttons.
             if kairos && connected {
-                if let Some(experimental) = experimental_by_server.get(&server.client.name) {
+                if let Some(experimental) = experimental_by_server.get(server.name()) {
                     let mut experimental = experimental.clone();
                     let channel_key =
                         crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY;
@@ -2453,7 +2450,7 @@ mod mcp_server_status_tests {
         description: Option<&str>,
     ) -> crate::services::mcp::client::McpConnectionDiscovery {
         let tool = crate::services::mcp::client::mcp_tool_for_test(
-            &server.client.name,
+            server.name(),
             serde_json::json!({
                 "name": "search",
                 "description": description,
@@ -2482,11 +2479,11 @@ mod mcp_server_status_tests {
         );
         apply_headless_mcp_connection_attempt(&mut state, attempt(fast.clone(), Some("first")));
         assert_eq!(
-            state.clients[0].client.status,
+            state.clients[0].connection_type(),
             McpServerConnectionType::Pending
         );
         assert_eq!(
-            state.clients[1].client.status,
+            state.clients[1].connection_type(),
             McpServerConnectionType::Connected
         );
         let fast_name = state.tools[0].name.clone();
@@ -2505,7 +2502,7 @@ mod mcp_server_status_tests {
             state
                 .clients
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             ["z-slow", "a-fast"]
         );

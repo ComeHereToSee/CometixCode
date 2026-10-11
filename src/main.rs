@@ -2121,9 +2121,9 @@ mod tests {
 
         let state = store.get();
         assert_eq!(state.mcp.clients.len(), 1);
-        assert_eq!(state.mcp.clients[0].client.name, "docs");
+        assert_eq!(state.mcp.clients[0].name(), "docs");
         assert_eq!(
-            state.mcp.clients[0].client.status,
+            state.mcp.clients[0].connection_type(),
             crate::services::mcp::types::McpServerConnectionType::Pending
         );
         assert!(state.mcp.tools.is_empty());

@@ -1901,7 +1901,7 @@ async fn dynamic_mcp_tool_result(
         .mcp_state
         .clients
         .iter()
-        .find(|server| server.client.name == server_name);
+        .find(|server| server.name() == server_name);
     let args = match parse_request_input(request) {
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),
@@ -10415,7 +10415,7 @@ rl.on('line', line => {
                 let discovery =
                     crate::services::mcp::client::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     crate::services::mcp::types::McpServerConnectionType::Connected
                 );
                 assert_eq!(discovery.tools.len(), 1);
@@ -10478,7 +10478,7 @@ rl.on('line', line => {
         tool: &str,
     ) -> (PermissionRequest, crate::tool::ToolUseContext) {
         let tool_name = crate::services::mcp::mcp_string_utils::build_mcp_tool_name(
-            &discovery.server.client.name,
+            discovery.server.name(),
             tool,
         );
         let request = mock_permission_request_with_input(
@@ -10586,7 +10586,7 @@ rl.on('line', line => {
                 let discovery =
                     crate::services::mcp::client::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     crate::services::mcp::types::McpServerConnectionType::Connected,
                     "{:?}",
                     discovery.server.client.error

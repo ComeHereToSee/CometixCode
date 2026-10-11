@@ -7,8 +7,8 @@ fn mcp_server_statuses(state: &crate::state::app_state_store::McpState) -> Vec<s
         .clients
         .iter()
         .map(|server| {
-            let status = server.client.status.as_str();
-            serde_json::json!({"name": server.client.name, "status": status})
+            let status = server.connection_type().as_str();
+            serde_json::json!({"name": server.name(), "status": status})
         })
         .collect()
 }

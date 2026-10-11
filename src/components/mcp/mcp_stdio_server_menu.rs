@@ -138,7 +138,7 @@ pub fn MCPStdioServerMenu<'a>(
                         let client_type = reconnect_mcp_server
                             .call(&server.name)
                             .await
-                            .map(|updated| updated.client.status)
+                            .map(|updated| updated.connection_type())
                             .unwrap_or_else(|| server.official_client_type());
                         pending_runtime_result.set(Some(
                             handle_reconnect_result(client_type, &server.name).message,
