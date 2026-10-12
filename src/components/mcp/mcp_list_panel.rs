@@ -5,7 +5,7 @@
 //! Selection/menu actions remain callback seams; no MCP client operations run here.
 
 use super::mcp_parsing_warnings::McpParsingWarnings;
-use super::types::{AgentMcpServerInfo, ServerInfo, mcp_client_state_from_parts};
+use super::types::{AgentMcpServerInfo, ServerInfo};
 use crate::components::configurable_shortcut_hint::ConfigurableShortcutHint;
 use crate::components::design_system::byline::Byline;
 use crate::components::design_system::dialog::Dialog;
@@ -485,6 +485,7 @@ pub fn MCPListPanel<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::mcp::types::mcp_client_state_from_parts;
     use crate::services::mcp::types::{ScopedMcpServerConfig, Transport};
     use crate::utils::theme;
 

@@ -4,7 +4,7 @@
 //! transport lifecycle and settings writes remain in `services/mcp/*`.
 
 use super::capabilities_section::CapabilitiesSection;
-use super::types::{ServerInfo, mcp_client_state_from_parts};
+use super::types::ServerInfo;
 use super::utils::reconnect_helpers::handle_reconnect_result;
 use crate::components::configurable_shortcut_hint::ConfigurableShortcutHint;
 use crate::components::custom_select::select::{Select, SelectLayout, SelectOptionData};
@@ -355,6 +355,7 @@ pub fn MCPStdioServerMenu<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::mcp::types::mcp_client_state_from_parts;
     use crate::services::mcp::client::McpConnectionDiscovery;
     use crate::services::mcp::types::{ConfigScope, ScopedMcpServerConfig, Transport};
     use crate::state::app_state_store::McpState;
