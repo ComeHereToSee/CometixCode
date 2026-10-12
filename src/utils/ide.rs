@@ -157,6 +157,29 @@ pub fn get_ide_client_name(
     }
 }
 
+/// Maps to: CC `utils/ide.ts:1251-1264` `getConnectedIdeClient`: the
+/// connected record named exactly `ide`.
+pub fn get_connected_ide_client(
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
+) -> Option<&crate::services::mcp::types::ConnectedMcpServer> {
+    mcp_clients
+        .iter()
+        .filter_map(crate::services::mcp::types::McpServerConnection::as_connected)
+        .find(|client| client.name == "ide")
+}
+
+/// Maps to: CC `utils/ide.ts:1266-1278` `closeOpenDiffs`: tells the IDE a
+/// new prompt was submitted so it closes its diff tabs; a failure is
+/// ignored.
+pub async fn close_open_diffs(ide_client: &crate::services::mcp::types::ConnectedMcpServer) {
+    let _ = crate::services::mcp::client::call_ide_rpc(
+        "closeAllDiffTabs",
+        serde_json::Map::new(),
+        ide_client,
+    )
+    .await;
+}
+
 /// Maps to: CC `components/IdeAutoConnectDialog.tsx`
 /// `shouldShowAutoConnectDialog`, with `isSupportedTerminal()` supplied as an
 /// already-known input.

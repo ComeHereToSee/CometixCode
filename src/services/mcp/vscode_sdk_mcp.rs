@@ -112,53 +112,72 @@ pub fn handle_vscode_log_event_notification(
     true
 }
 
+/// Maps to: CC `vscodeSdkMcp.ts:32-33` `vscodeMcpClient`: the connected
+/// `claude-vscode` record `setupVscodeSdkMcp` keeps for later notifications.
+static VSCODE_MCP_CLIENT: std::sync::Mutex<
+    Option<crate::services::mcp::types::ConnectedMcpServer>,
+> = std::sync::Mutex::new(None);
+
+/// Maps to: CC `services/mcp/vscodeSdkMcp.ts:64-112` `setupVscodeSdkMcp`:
+/// keeps the connected `claude-vscode` SDK client and sends it the initial
+/// `experiment_gates` notification. The `log_event` handler CC registers on
+/// it is dispatched by `client.rs#on_custom_notification` for this server.
 pub async fn setup_vscode_sdk_mcp(
     sdk_clients: &[crate::services::mcp::types::McpServerConnection],
 ) -> bool {
-    // Maps to: CC `services/mcp/vscodeSdkMcp.ts#setupVscodeSdkMcp`:
-    // store/recognize the connected `claude-vscode` SDK MCP client and send
-    // the initial `experiment_gates` notification. The log_event handler is
-    // installed by `client.rs#on_custom_notification` for this internal server.
-    let has_connected_vscode = sdk_clients.iter().any(|server| {
-        server.name() == VSCODE_MCP_SERVER_NAME
-            && server.connection_type()
-                == crate::services::mcp::types::McpServerConnectionType::Connected
-    });
-    if !has_connected_vscode {
+    let Some(client) = sdk_clients
+        .iter()
+        .find(|client| client.name() == VSCODE_MCP_SERVER_NAME)
+        .and_then(crate::services::mcp::types::McpServerConnection::as_connected)
+    else {
         return false;
-    }
+    };
+    *VSCODE_MCP_CLIENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client.clone());
     let gates = vscode_experiment_gates(None);
-    crate::services::mcp::client::send_custom_notification_to_connected_client(
-        VSCODE_MCP_SERVER_NAME,
-        EXPERIMENT_GATES_METHOD,
-        serde_json::json!({ "gates": gates }),
-    )
-    .await
-    .is_ok()
+    client
+        .client
+        .notification(
+            EXPERIMENT_GATES_METHOD,
+            serde_json::json!({ "gates": gates }),
+        )
+        .await
+        .is_ok()
 }
 
+/// Maps to: CC `vscodeSdkMcp.ts:39-59` `notifyVscodeFileUpdated`: a
+/// `file_updated` notification to the kept `claude-vscode` client, for
+/// internal builds only.
 pub async fn notify_vscode_file_updated(
     file_path: &str,
     old_content: Option<&str>,
     new_content: Option<&str>,
 ) -> bool {
+    let client = VSCODE_MCP_CLIENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     if !should_notify_vscode_file_updated_for_audience(
         crate::utils::build_profile::build_audience(),
-        crate::services::mcp::client::is_connected_mcp_client(VSCODE_MCP_SERVER_NAME).await,
+        client.is_some(),
     ) {
         return false;
     }
+    let Some(client) = client else {
+        return false;
+    };
     let params = file_updated_params(file_path, old_content, new_content);
-    match crate::services::mcp::client::send_custom_notification_to_connected_client(
-        VSCODE_MCP_SERVER_NAME,
-        FILE_UPDATED_METHOD,
-        params,
-    )
-    .await
+    match client
+        .client
+        .notification(FILE_UPDATED_METHOD, params)
+        .await
     {
         Ok(()) => true,
         Err(error) => {
-            tracing::debug!(error = %error, "[VSCode] Failed to send file_updated notification");
+            crate::utils::debug::log_for_debugging(&format!(
+                "[VSCode] Failed to send file_updated notification: {error}"
+            ));
             false
         }
     }

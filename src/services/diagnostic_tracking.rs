@@ -13,8 +13,22 @@ const MAX_DIAGNOSTICS_SUMMARY_CHARS: usize = 4000;
 #[derive(Default)]
 struct DiagnosticTrackerState {
     baseline: HashMap<String, Vec<Diagnostic>>,
+    initialized: bool,
+    /// CC `mcpClient`: the IDE client the first `handleQueryStart` found,
+    /// kept for the session (CC's own TODO notes it can change).
+    mcp_client: Option<crate::services::mcp::types::ConnectedMcpServer>,
     right_file_diagnostics_state: HashMap<String, Vec<Diagnostic>>,
     last_processed_timestamps: HashMap<String, i64>,
+}
+
+impl DiagnosticTrackerState {
+    /// Maps to CC `DiagnosticTrackingService.reset()` (`:72-76`): the tracked
+    /// files go; the service stays initialized with its client.
+    fn reset(&mut self) {
+        self.baseline.clear();
+        self.right_file_diagnostics_state.clear();
+        self.last_processed_timestamps.clear();
+    }
 }
 
 static TRACKER: LazyLock<Mutex<DiagnosticTrackerState>> =
@@ -46,31 +60,79 @@ fn normalize_file_uri(file_uri: &str) -> String {
     normalized
 }
 
-fn parse_diagnostic_result(result: &serde_json::Value) -> Vec<DiagnosticFile> {
-    let blocks = result
-        .as_array()
-        .or_else(|| result.get("content").and_then(serde_json::Value::as_array));
-    let Some(text) = blocks.and_then(|blocks| {
-        blocks.iter().find_map(|block| {
-            (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                .then(|| block.get("text").and_then(serde_json::Value::as_str))
-                .flatten()
-        })
-    }) else {
-        return Vec::new();
-    };
-    serde_json::from_str(text).unwrap_or_default()
+/// Maps to CC `DiagnosticTrackingService.parseDiagnosticResult(result)`
+/// (`:285-294`): the first text block's JSON. Text that is not a diagnostic
+/// file list fails, as CC's `jsonParse` throws into the caller's `catch`.
+fn parse_diagnostic_result(result: &serde_json::Value) -> serde_json::Result<Vec<DiagnosticFile>> {
+    let text = result.as_array().and_then(|blocks| {
+        blocks
+            .iter()
+            .find(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .and_then(|block| block.get("text").and_then(serde_json::Value::as_str))
+    });
+    match text {
+        Some(text) => serde_json::from_str(text),
+        None => Ok(Vec::new()),
+    }
 }
 
-/// Maps to CC `DiagnosticTrackingService.beforeFileEdited(filePath)`.
-///
-/// Rust adaptation: MCP connections live in the process-global runtime rather
-/// than an object cached by `handleQueryStart`, so connected-IDE lookup happens
-/// at call time (also avoiding CC's stale-client TODO).
-pub async fn before_file_edited(file_path: &str) {
-    if !crate::services::mcp::client::is_connected_mcp_client("ide").await {
+fn lock_tracker() -> std::sync::MutexGuard<'static, DiagnosticTrackerState> {
+    TRACKER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// CC's guard at the top of each RPC method: the kept client, while the
+/// service is initialized and the client connected.
+fn initialized_client() -> Option<crate::services::mcp::types::ConnectedMcpServer> {
+    let tracker = lock_tracker();
+    tracker
+        .initialized
+        .then(|| tracker.mcp_client.clone())
+        .flatten()
+}
+
+/// Maps to CC `DiagnosticTrackingService.initialize(mcpClient)` (`:51-59`):
+/// the first client is kept; later calls change nothing.
+fn initialize(
+    tracker: &mut DiagnosticTrackerState,
+    mcp_client: crate::services::mcp::types::ConnectedMcpServer,
+) {
+    if tracker.initialized {
         return;
     }
+    tracker.mcp_client = Some(mcp_client);
+    tracker.initialized = true;
+}
+
+/// Maps to CC `DiagnosticTrackingService.handleQueryStart(clients)`
+/// (`:330-343`): the first query that finds a connected IDE client keeps it;
+/// every later one resets the tracked files.
+pub fn handle_query_start(clients: &[crate::services::mcp::types::McpServerConnection]) {
+    let mut tracker = lock_tracker();
+    if !tracker.initialized {
+        if let Some(client) = crate::utils::ide::get_connected_ide_client(clients) {
+            initialize(&mut tracker, client.clone());
+        }
+    } else {
+        tracker.reset();
+    }
+}
+
+/// Maps to CC `DiagnosticTrackingService.shutdown()` (`:61-66`).
+pub fn shutdown() {
+    let mut tracker = lock_tracker();
+    tracker.initialized = false;
+    tracker.reset();
+}
+
+/// Maps to CC `DiagnosticTrackingService.beforeFileEdited(filePath)`
+/// (`:135-182`): the file's diagnostics from the kept IDE client become its
+/// baseline; any failure leaves the baseline as it was.
+pub async fn before_file_edited(file_path: &str) {
+    let Some(client) = initialized_client() else {
+        return;
+    };
     let timestamp = chrono::Utc::now().timestamp_millis();
     let mut arguments = serde_json::Map::new();
     arguments.insert(
@@ -78,11 +140,13 @@ pub async fn before_file_edited(file_path: &str) {
         serde_json::Value::String(format!("file://{file_path}")),
     );
     let Ok(result) =
-        crate::services::mcp::client::call_mcp_tool("ide", "getDiagnostics", arguments).await
+        crate::services::mcp::client::call_ide_rpc("getDiagnostics", arguments, &client).await
     else {
         return;
     };
-    let files = parse_diagnostic_result(&result);
+    let Ok(files) = parse_diagnostic_result(&result) else {
+        return;
+    };
     let expected = normalize_file_uri(file_path);
     let diagnostics = match files.first() {
         Some(file) if normalize_file_uri(&file.uri) == expected => file.diagnostics.clone(),
@@ -95,9 +159,7 @@ pub async fn before_file_edited(file_path: &str) {
         }
         None => Vec::new(),
     };
-    let mut tracker = TRACKER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut tracker = lock_tracker();
     tracker.baseline.insert(expected.clone(), diagnostics);
     tracker
         .last_processed_timestamps
@@ -172,32 +234,23 @@ fn collect_new_diagnostics(
     new_files
 }
 
-/// Maps to CC `DiagnosticTrackingService.getNewDiagnostics()`.
+/// Maps to CC `DiagnosticTrackingService.getNewDiagnostics()` (`:188-283`):
+/// every diagnostic from the kept IDE client, diffed against the baselines;
+/// any failure is no new diagnostics.
 pub async fn get_new_diagnostics() -> Vec<DiagnosticFile> {
-    if !crate::services::mcp::client::is_connected_mcp_client("ide").await {
-        return Vec::new();
-    }
-    let Ok(result) = crate::services::mcp::client::call_mcp_tool(
-        "ide",
-        "getDiagnostics",
-        serde_json::Map::new(),
-    )
-    .await
-    else {
+    let Some(client) = initialized_client() else {
         return Vec::new();
     };
-    let files = parse_diagnostic_result(&result);
-    let mut tracker = TRACKER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    collect_new_diagnostics(&mut tracker, &files)
-}
-
-/// Maps to CC `DiagnosticTrackingService.reset()`.
-pub fn reset() {
-    *TRACKER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = DiagnosticTrackerState::default();
+    let Ok(Ok(files)) = crate::services::mcp::client::call_ide_rpc(
+        "getDiagnostics",
+        serde_json::Map::new(),
+        &client,
+    )
+    .await
+    .map(|result| parse_diagnostic_result(&result)) else {
+        return Vec::new();
+    };
+    collect_new_diagnostics(&mut lock_tracker(), &files)
 }
 
 /// Maps to: CC `DiagnosticTrackingService.getSeveritySymbol(...)`.
@@ -294,20 +347,35 @@ mod tests {
         }
     }
 
+    /// CC `parseDiagnosticResult` (`:285-294`): the first text block of the
+    /// `callIdeRpc` content is parsed; with no text block there is nothing,
+    /// and text that is not JSON throws.
     #[test]
     fn diagnostic_result_parser_reads_first_text_block() {
-        let value = serde_json::json!({
-            "content": [{
+        let value = serde_json::json!([
+            { "type": "image", "data": "", "mimeType": "image/png" },
+            {
                 "type": "text",
                 "text": serde_json::to_string(&vec![DiagnosticFile {
                     uri: "file:///tmp/a.rs".to_string(),
                     diagnostics: vec![diag("broken", "Error", 0)],
                 }]).unwrap()
-            }]
-        });
-        let parsed = parse_diagnostic_result(&value);
+            },
+            { "type": "text", "text": "ignored" },
+        ]);
+        let parsed = parse_diagnostic_result(&value).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].diagnostics[0].message, "broken");
+
+        assert!(
+            parse_diagnostic_result(&serde_json::json!([]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_diagnostic_result(&serde_json::json!([{ "type": "text", "text": "ok:s1" }]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -428,6 +496,101 @@ mod tests {
         assert!(summary.ends_with(TRUNCATION_MARKER));
         assert_eq!(summary.chars().count(), MAX_DIAGNOSTICS_SUMMARY_CHARS);
     }
+    /// CC `handleQueryStart` (`:330-343`) keeps the IDE client the first
+    /// query finds, and `beforeFileEdited` / `getNewDiagnostics` call
+    /// `getDiagnostics` on it through `callIdeRpc`. Before that, and after
+    /// `shutdown`, nothing is asked; a later query start resets the
+    /// baselines.
+    #[test]
+    fn diagnostics_go_through_the_ide_client_kept_at_query_start() {
+        use crate::services::mcp::types::McpServerConnection;
+        let _guard = crate::utils::test_env::TEST_ENV_LOCK.lock().unwrap();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::services::mcp::client::session_http_fixture::{
+                    SESSION_NOT_FOUND, SessionHttpFixture,
+                };
+                let fixture = SessionHttpFixture::spawn(|_, _| false, SESSION_NOT_FOUND).await;
+                let config = fixture.config();
+                let ide = crate::services::mcp::client::connect_to_server("ide", &config).await;
+                let reply = |diagnostics: Vec<Diagnostic>| {
+                    let files = vec![DiagnosticFile {
+                        uri: "file:///tmp/edited.rs".into(),
+                        diagnostics,
+                    }];
+                    fixture.reply(
+                        "getDiagnostics",
+                        serde_json::json!({ "content": [{
+                            "type": "text",
+                            "text": serde_json::to_string(&files).unwrap(),
+                        }] }),
+                    );
+                };
+                let calls = || {
+                    fixture
+                        .tool_calls()
+                        .into_iter()
+                        .map(|call| (call["name"].clone(), call["arguments"].clone()))
+                        .collect::<Vec<_>>()
+                };
+                let old = diag("old", "Warning", 0);
+                let new = diag("new", "Error", 1);
+                reply(vec![old.clone()]);
+                shutdown();
+
+                // Not initialized, then a query start with no connected IDE:
+                // nothing is asked.
+                before_file_edited("/tmp/edited.rs").await;
+                assert!(get_new_diagnostics().await.is_empty());
+                handle_query_start(&[McpServerConnection::failed("ide", config.clone(), None)]);
+                before_file_edited("/tmp/edited.rs").await;
+                assert!(calls().is_empty());
+
+                handle_query_start(std::slice::from_ref(&ide));
+                before_file_edited("/tmp/edited.rs").await;
+                reply(vec![old.clone(), new.clone()]);
+                assert_eq!(
+                    get_new_diagnostics().await,
+                    [DiagnosticFile {
+                        uri: "file:///tmp/edited.rs".into(),
+                        diagnostics: vec![new.clone()],
+                    }]
+                );
+                assert_eq!(
+                    calls(),
+                    [
+                        (
+                            serde_json::json!("getDiagnostics"),
+                            serde_json::json!({ "uri": "file:///tmp/edited.rs" })
+                        ),
+                        (serde_json::json!("getDiagnostics"), serde_json::json!({})),
+                    ]
+                );
+
+                // A later query start resets the baselines, and keeps the
+                // first IDE client although another one is connected now
+                // (CC `:56` TODO): the call still reaches the fixture.
+                let other_ide = McpServerConnection::connected_for_test(
+                    "ide",
+                    crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("other"),
+                );
+                handle_query_start(&[other_ide]);
+                assert!(get_new_diagnostics().await.is_empty());
+                assert_eq!(calls().len(), 3);
+
+                shutdown();
+                assert!(get_new_diagnostics().await.is_empty());
+                assert_eq!(calls().len(), 3);
+
+                crate::services::mcp::client::clear_server_cache("ide", None).await;
+            });
+    }
+
     #[tokio::test]
     async fn hook_query_preserves_parent_diagnostics_matches_official_generator_entry() {
         // execAgentHook.ts:177-189 calls query directly; only REPL.tsx:3565-3570

@@ -5,7 +5,7 @@
 //! request it and how the returned rows are selected.
 
 use crate::components::prompt_input::prompt_input_footer_suggestions::SuggestionItem;
-use crate::services::mcp::types::{McpServerConnection, McpServerConnectionType};
+use crate::services::mcp::types::{ConnectedMcpServer, McpServerConnection};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -21,21 +21,18 @@ static KNOWN_CHANNELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static KNOWN_CHANNELS_VERSION: AtomicU64 = AtomicU64::new(0);
 
-fn find_slack_server(clients: &[McpServerConnection]) -> Option<String> {
+/// Maps to: CC `findSlackClient(clients)` (`slackChannelSuggestions.ts:23-27`):
+/// the first connected record whose name contains `slack`, case-sensitively.
+fn find_slack_client(clients: &[McpServerConnection]) -> Option<&ConnectedMcpServer> {
     clients
         .iter()
-        .find(|server| {
-            server.connection_type() == McpServerConnectionType::Connected
-                // Source uses `client.name.includes('slack')` without a
-                // case-fold. Preserve that protocol-facing gate exactly.
-                && server.name().contains("slack")
-        })
-        .map(|server| server.name().to_owned())
+        .filter_map(McpServerConnection::as_connected)
+        .find(|client| client.name.contains("slack"))
 }
 
 /// Maps to: CC `hasSlackMcpServer`.
 pub fn has_slack_mcp_server(clients: &[McpServerConnection]) -> bool {
-    find_slack_server(clients).is_some()
+    find_slack_client(clients).is_some()
 }
 
 /// Maps to CC `getKnownChannelsVersion`.
@@ -169,7 +166,14 @@ fn find_reusable_cache_entry(mcp_query: &str, search_token: &str) -> Option<Vec<
         .map(|(_, channels)| channels.clone())
 }
 
-async fn fetch_channels(server_name: &str, query: &str) -> Vec<String> {
+/// Maps to: CC `fetchChannels(clients, query)`
+/// (`slackChannelSuggestions.ts:29-65`): `slack_search_channels` straight
+/// on the Slack client, with a five-second timeout; any failure is no
+/// channels.
+async fn fetch_channels(clients: &[McpServerConnection], query: &str) -> Vec<String> {
+    let Some(slack_client) = find_slack_client(clients) else {
+        return Vec::new();
+    };
     let args = Map::from_iter([
         ("query".to_string(), json!(query)),
         ("limit".to_string(), json!(20)),
@@ -178,24 +182,27 @@ async fn fetch_channels(server_name: &str, query: &str) -> Vec<String> {
             json!("public_channel,private_channel"),
         ),
     ]);
-    let Ok(result) =
-        crate::services::mcp::client::call_mcp_tool(server_name, SEARCH_TOOL, args).await
-    else {
-        return Vec::new();
+    let params = rmcp::model::CallToolRequestParams::new(SEARCH_TOOL).with_arguments(args);
+    let result = match slack_client
+        .client
+        .call_tool(params, std::time::Duration::from_millis(5000))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            crate::utils::debug::log_for_debugging(&format!(
+                "Failed to fetch Slack channels: {error}"
+            ));
+            return Vec::new();
+        }
     };
-    let content = result
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            (entry.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| entry.get("text").and_then(Value::as_str))
-                .flatten()
-        })
+    let raw_text = result
+        .content
+        .iter()
+        .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
         .collect::<Vec<_>>()
         .join("\n");
-    parse_channels(&unwrap_results(&content))
+    parse_channels(&unwrap_results(&raw_text))
 }
 
 /// Maps to: CC `getSlackChannelSuggestions`.
@@ -207,9 +214,6 @@ pub async fn get_slack_channel_suggestions(
     if token.is_empty() {
         return Vec::new();
     }
-    let Some(server_name) = find_slack_server(clients) else {
-        return Vec::new();
-    };
     let mcp_query = mcp_query_for(&token);
     let cached = CACHE
         .lock()
@@ -219,7 +223,7 @@ pub async fn get_slack_channel_suggestions(
     let channels = if let Some(cached) = cached {
         cached
     } else {
-        let channels = fetch_channels(&server_name, &mcp_query).await;
+        let channels = fetch_channels(clients, &mcp_query).await;
         if let Ok(mut cache) = CACHE.lock() {
             cache.insert(mcp_query, channels.clone());
             if cache.len() > 50 {
@@ -291,6 +295,71 @@ mod tests {
             vec![0..8, 18..26]
         );
         clear_slack_channel_cache();
+    }
+
+    /// CC `fetchChannels` (`:29-65`): `slack_search_channels` goes straight
+    /// to the first connected record whose name contains `slack`; with none,
+    /// the query is cached as no channels.
+    #[test]
+    fn channel_suggestions_call_the_slack_client_among_the_records() {
+        let _guard = crate::utils::test_env::TEST_ENV_LOCK.lock().unwrap();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::services::mcp::client::session_http_fixture::{
+                    SESSION_NOT_FOUND, SessionHttpFixture,
+                };
+                let fixture = SessionHttpFixture::spawn(|_, _| false, SESSION_NOT_FOUND).await;
+                fixture.reply(
+                    SEARCH_TOOL,
+                    json!({ "content": [{
+                        "type": "text",
+                        "text": "Name: #general\nName: #gen-ai\nName: #random",
+                    }] }),
+                );
+                let slack = crate::services::mcp::client::connect_to_server(
+                    "team-slack",
+                    &fixture.config(),
+                )
+                .await;
+                clear_slack_channel_cache();
+
+                let clients = [
+                    McpServerConnection::failed(
+                        "slack-down",
+                        crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("x"),
+                        None,
+                    ),
+                    slack,
+                ];
+                let ids = get_slack_channel_suggestions(&clients, "gen")
+                    .await
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(ids, ["slack-channel-gen-ai", "slack-channel-general"]);
+                let calls = fixture.tool_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0]["name"], SEARCH_TOOL);
+                assert_eq!(
+                    calls[0]["arguments"],
+                    json!({
+                        "query": "gen",
+                        "limit": 20,
+                        "channel_types": "public_channel,private_channel",
+                    })
+                );
+
+                assert!(get_slack_channel_suggestions(&[], "zz").await.is_empty());
+                assert_eq!(CACHE.lock().unwrap().get("zz"), Some(&Vec::new()));
+
+                clear_slack_channel_cache();
+                crate::services::mcp::client::clear_server_cache("team-slack", None).await;
+            });
     }
 
     #[test]

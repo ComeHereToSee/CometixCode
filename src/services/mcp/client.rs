@@ -36,14 +36,6 @@ use serde_json::{Map, Value};
 /// registered by App (CC `onConnectionAttempt` closures). Observation drain is for tests without App.
 pub use crate::services::mcp::use_manage_mcp_connections::drain_mcp_connection_callback_observations;
 
-/// Maps to: CC `interactiveHandler.ts` outbound channel permission relay
-/// `client.client.notification({ method: CHANNEL_PERMISSION_REQUEST_METHOD, params })`.
-pub async fn send_channel_permission_request_to_relays(
-    params: &crate::services::mcp::channel_permissions::ChannelPermissionRequestParams,
-) -> crate::services::mcp::channel_permissions::ChannelPermissionRelaySendReport {
-    runtime::send_channel_permission_request_to_relays(params).await
-}
-
 /// Maps to: CC `ElicitationRequestEvent.respond(...)` callback stored in
 /// `services/mcp/elicitationHandler.ts`.
 pub async fn respond_to_mcp_elicitation(
@@ -880,11 +872,12 @@ mod runtime {
     use http::{HeaderName, HeaderValue};
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
-        CallToolRequestParams, ClientCapabilities, ClientNotification, CustomNotification,
-        ElicitRequestParams as RmcpElicitRequestParams, ElicitResult as RmcpElicitResult,
-        ElicitationAction as RmcpElicitationAction, ElicitationCapability, ErrorCode,
-        GetPromptRequestParams, Implementation, InitializeRequestParams, ProtocolVersion,
-        ReadResourceRequestParams, RequestMetaObject, RootsCapabilities, ServerPeerInfo,
+        CallToolRequestParams, CallToolResult, ClientCapabilities, ClientNotification,
+        CustomNotification, ElicitRequestParams as RmcpElicitRequestParams,
+        ElicitResult as RmcpElicitResult, ElicitationAction as RmcpElicitationAction,
+        ElicitationCapability, ErrorCode, GetPromptRequestParams, Implementation,
+        InitializeRequestParams, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
+        RootsCapabilities, ServerPeerInfo,
     };
     // SEP-2577 deprecates roots in the 2026-07-28 draft; CC's SDK (1.29)
     // still serves `roots/list`, on the 2025-11-25 protocol Cometix speaks.
@@ -1049,8 +1042,8 @@ mod runtime {
         connection_id: u64,
         name: String,
         config: ScopedMcpServerConfig,
-        /// `None` only for a test handle with no connection behind it. Such a
-        /// handle is never registered, so no request reaches it.
+        /// `None` only for a test handle with no connection behind it; every
+        /// request on such a handle fails as not connected.
         peer: Option<Peer<RoleClient>>,
         /// Taken by whichever closes the connection first.
         cancellation_token: std::sync::Mutex<Option<RunningServiceCancellationToken>>,
@@ -1119,6 +1112,30 @@ mod runtime {
                 .peer
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("MCP server \"{}\" is not connected", self.0.name))
+        }
+
+        /// Maps to: SDK `Client.notification({ method, params })`. A failed
+        /// send reaches the connection's `onerror` first.
+        pub(crate) async fn notification(&self, method: &str, params: Value) -> anyhow::Result<()> {
+            let notification = CustomNotification::new(method.to_string(), Some(params));
+            self.peer()?
+                .send_notification(ClientNotification::CustomNotification(notification))
+                .await
+                .map_err(|error| request_failed(self, anyhow::Error::new(error)))
+        }
+
+        /// Maps to: SDK `Client.callTool(params, undefined, { timeout })`: the
+        /// raw `tools/call` request, without `callMCPTool`'s handling.
+        pub(crate) async fn call_tool(
+            &self,
+            params: CallToolRequestParams,
+            timeout: Duration,
+        ) -> anyhow::Result<CallToolResult> {
+            match tokio::time::timeout(timeout, self.peer()?.call_tool(params)).await {
+                Err(_) => anyhow::bail!("MCP error -32001: Request timed out"),
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err(request_failed(self, anyhow::Error::new(error))),
+            }
         }
 
         /// Ends the connection; its close watcher then sees it quit.
@@ -1622,106 +1639,6 @@ mod runtime {
         true
     }
 
-    pub async fn send_channel_permission_request_to_relays(
-        params: &crate::services::mcp::channel_permissions::ChannelPermissionRequestParams,
-    ) -> crate::services::mcp::channel_permissions::ChannelPermissionRelaySendReport {
-        // Maps to: CC `interactiveHandler.ts` channel permission relay block.
-        let mut report =
-            crate::services::mcp::channel_permissions::ChannelPermissionRelaySendReport {
-                enabled:
-                    crate::services::mcp::channel_permissions::is_channel_permission_relay_enabled(),
-                ..Default::default()
-            };
-        if !report.enabled {
-            return report;
-        }
-
-        let allowed_channels = crate::bootstrap::state::get_allowed_channels();
-        let targets = {
-            let clients = CONNECTED_CLIENTS.lock().unwrap();
-            // CC filters `AppState.mcp.clients` directly. This walks the
-            // registry, which holds the same live connections, so each one is
-            // projected into the candidate shape first and its experimental
-            // map is read from `peer_info`. The selection rule
-            // itself is NOT reimplemented here — it belongs to
-            // `channel_permissions`, which is what CC's
-            // `filterPermissionRelayClients` maps to.
-            let candidates = clients
-                .iter()
-                .map(|(name, client)| {
-                    let experimental_capabilities: std::collections::BTreeMap<
-                        String,
-                        serde_json::Value,
-                    > = client
-                        .peer()
-                        .ok()
-                        .and_then(|peer| peer.peer_info())
-                        .and_then(|info| info.capabilities.experimental.clone())
-                        .map(|map| {
-                            // rmcp types each experimental entry as a JSON
-                            // object; CC only ever tests key presence
-                            // (`experimental['claude/channel'] !== undefined`),
-                            // so the value is carried as-is.
-                            map.into_iter()
-                                .map(|(key, value)| (key, serde_json::Value::Object(value)))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    crate::services::mcp::channel_permissions::ChannelPermissionRelayClientCandidate {
-                        // Every entry in this registry is a live connection;
-                        // CC's `c.type === 'connected'` clause is satisfied by
-                        // construction.
-                        client_type: "connected".to_string(),
-                        name: name.clone(),
-                        experimental_capabilities,
-                    }
-                })
-                .collect::<Vec<_>>();
-            crate::services::mcp::channel_permissions::filter_permission_relay_clients(
-                &candidates,
-                |name| {
-                    crate::services::mcp::channel_notification::find_channel_entry(
-                        name,
-                        &allowed_channels,
-                    )
-                    .is_some()
-                },
-            )
-            .into_iter()
-            .filter_map(|candidate| {
-                let peer = clients.get(&candidate.name)?.peer().ok()?.clone();
-                Some((candidate.name.clone(), peer))
-            })
-            .collect::<Vec<_>>()
-        };
-
-        let params_value = match serde_json::to_value(params) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to serialize MCP channel permission request");
-                return report;
-            }
-        };
-        for (name, peer) in targets {
-            report.attempted += 1;
-            let notification = CustomNotification::new(
-                crate::services::mcp::channel_notification::CHANNEL_PERMISSION_REQUEST_METHOD,
-                Some(params_value.clone()),
-            );
-            match peer
-                .send_notification(ClientNotification::CustomNotification(notification))
-                .await
-            {
-                Ok(()) => report.sent += 1,
-                Err(error) => {
-                    report.failed += 1;
-                    tracing::warn!(server = %name, error = %error, "MCP channel permission_request failed");
-                }
-            }
-        }
-        report
-    }
-
     impl ClientHandler for CometixMcpClientHandler {
         fn get_info(&self) -> InitializeRequestParams {
             // Maps to: CC `new Client({ name:'claude-code', title:'Claude Code', ... },
@@ -2199,7 +2116,7 @@ mod runtime {
             .unwrap_or_default()
     }
 
-    fn is_mcp_auth_cached(server_id: &str) -> bool {
+    pub(super) fn is_mcp_auth_cached(server_id: &str) -> bool {
         // Maps to: CC `isMcpAuthCached(serverId)` 15-minute TTL.
         let cache = read_mcp_auth_cache();
         let Some(entry) = cache.get(server_id) else {
@@ -2913,6 +2830,13 @@ mod runtime {
             ) {
                 return true;
             }
+        }
+        // A JSON-RPC error response carries a JSON-RPC code, never an HTTP
+        // status: CC's `errorCode === 401 || e instanceof UnauthorizedError`
+        // (`client.ts:3197-3199`) cannot match one, whatever its message or
+        // data say — a URL elicitation's URL included.
+        if mcp_error_from_anyhow(error).is_some() {
+            return false;
         }
         let message = error.to_string().to_ascii_lowercase();
         message.contains("401")
@@ -3788,11 +3712,6 @@ mod runtime {
         }
     }
 
-    pub async fn is_connected_mcp_client(name: &str) -> bool {
-        // Maps to: CC `vscodeSdkMcp.ts` checking the stored connected client.
-        CONNECTED_CLIENTS.lock().unwrap().contains_key(name)
-    }
-
     /// The connection ids memoized under `name`.
     #[cfg(test)]
     pub(crate) fn memoized_connection_ids(name: &str) -> Vec<u64> {
@@ -3803,7 +3722,7 @@ mod runtime {
     }
 
     #[cfg(test)]
-    pub(super) fn registered_connection_id(name: &str) -> Option<u64> {
+    pub(crate) fn registered_connection_id(name: &str) -> Option<u64> {
         CONNECTED_CLIENTS
             .lock()
             .unwrap()
@@ -3820,25 +3739,6 @@ mod runtime {
             .unwrap()
             .get(name)
             .map(McpClient::has_onclose)
-    }
-
-    pub async fn send_custom_notification_to_connected_client(
-        name: &str,
-        method: &str,
-        params: Value,
-    ) -> anyhow::Result<()> {
-        // Maps to: CC `ConnectedMCPServer.client.notification({ method, params })`.
-        let client = registered_connection(name, None)?;
-        let notification = CustomNotification::new(method.to_string(), Some(params));
-        client
-            .peer()?
-            .send_notification(ClientNotification::CustomNotification(notification))
-            .await
-            .map_err(|error| {
-                let error = anyhow::Error::new(error);
-                close_on_expired_session(&client, &error);
-                error
-            })
     }
 
     /// Maps to: CC `client.ts:595` `connectToServer`, memoized by
@@ -4257,33 +4157,55 @@ mod runtime {
         Ok(())
     }
 
-    /// Calls `tool_name` on the connection registered under `server_name`.
-    /// CC's callers find the record in `mcp.clients` and call on its client:
-    /// `callIdeRpc(tool, args, ideClient)` (`client.ts:2116-2128`) and
-    /// `findSlackClient(clients)` (`slackChannelSuggestions.ts:23-27`). The
-    /// IDE diagnostics and Slack suggestions here pass the server name, and
-    /// the registry stands in for the record.
+    /// Maps to: CC `callMCPTool` (`client.ts:3029-3245`) on `client`: the
+    /// request, then its error handling — an expired session clears the
+    /// connection and throws `McpSessionExpiredError` (`:3210-3231`). A 401
+    /// refreshes the token and retries once on a fresh connection, where CC
+    /// throws `McpAuthError` (`:3198-3208`). The result is the raw
+    /// `CallToolResult`; `isError` and `processMCPResult` are the caller's.
     pub async fn call_mcp_tool(
-        server_name: &str,
+        client: &McpClient,
         tool_name: &str,
         args: Map<String, Value>,
+        meta: Option<Map<String, Value>>,
     ) -> anyhow::Result<Value> {
-        let client = registered_connection(server_name, None)?;
-        call_mcp_tool_with_elicitation(
-            &client,
-            tool_name,
-            args,
-            None,
-            crate::tool::HandleElicitationCallback::default(),
-        )
-        .await
+        let server_name = client.name();
+        let config = client.config();
+        let error = match call_mcp_tool_once(client, tool_name, args.clone(), meta.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if is_auth_error(&error)
+            && let Some(retry_client) =
+                handle_remote_call_auth_failure_and_retry_connect(server_name, config, &error)
+                    .await?
+        {
+            return match call_mcp_tool_once(&retry_client, tool_name, args, meta).await {
+                Ok(value) => Ok(value),
+                Err(retry_error) => {
+                    record_final_remote_call_error(
+                        server_name,
+                        retry_client.config(),
+                        &retry_error,
+                    )?;
+                    if is_tool_call_session_expired_error(&retry_error, retry_client.config()) {
+                        return Err(session_expired(&retry_client).into());
+                    }
+                    Err(retry_error)
+                }
+            };
+        }
+        if is_tool_call_session_expired_error(&error, config) {
+            return Err(session_expired(client).into());
+        }
+        Err(error)
     }
 
     /// Maps to: CC `callMCPToolWithUrlElicitationRetry` (`client.ts:2813`)
-    /// around `callMCPTool` (`:3029-3245`) on `client`. For an MCP tool's
-    /// `call` that is the connection `ensureConnectedClient` returned
-    /// (`:1862-1881`); `handle_elicitation` is the print/SDK leg it passes
-    /// from `context.handleElicitation`.
+    /// around [`call_mcp_tool`] on `client`. For an MCP tool's `call` that is
+    /// the connection `ensureConnectedClient` returned (`:1862-1881`);
+    /// `handle_elicitation` is the print/SDK leg it passes from
+    /// `context.handleElicitation`.
     pub async fn call_mcp_tool_with_elicitation(
         client: &McpClient,
         tool_name: &str,
@@ -4291,75 +4213,63 @@ mod runtime {
         meta: Option<Map<String, Value>>,
         handle_elicitation: crate::tool::HandleElicitationCallback,
     ) -> anyhow::Result<Value> {
-        let server_name = client.name();
-        let config = client.config();
         let mut url_elicitation_attempt = 0usize;
         loop {
-            match call_mcp_tool_once(client, tool_name, args.clone(), meta.clone()).await {
+            let error = match call_mcp_tool(client, tool_name, args.clone(), meta.clone()).await {
                 Ok(value) => return Ok(value),
-                Err(error) => {
-                    if is_url_elicitation_required_error(&error) {
-                        if url_elicitation_attempt >= MAX_URL_ELICITATION_RETRIES {
-                            return Err(error);
-                        }
-                        let elicitations = url_elicitations_from_error(&error);
-                        if !elicitations.is_empty() {
-                            if let Some(result) = process_url_elicitation_required(
-                                server_name,
-                                tool_name,
-                                elicitations,
-                                handle_elicitation.clone(),
-                            )
-                            .await
-                            {
-                                return Ok(result);
-                            }
-                            url_elicitation_attempt += 1;
-                            continue;
-                        }
-                    }
-
-                    if is_auth_error(&error)
-                        && let Some(retry_client) =
-                            handle_remote_call_auth_failure_and_retry_connect(
-                                server_name,
-                                config,
-                                &error,
-                            )
-                            .await?
-                    {
-                        return match call_mcp_tool_once(
-                            &retry_client,
-                            tool_name,
-                            args.clone(),
-                            meta.clone(),
-                        )
-                        .await
-                        {
-                            Ok(value) => Ok(value),
-                            Err(retry_error) => {
-                                record_final_remote_call_error(
-                                    server_name,
-                                    retry_client.config(),
-                                    &retry_error,
-                                )?;
-                                if is_tool_call_session_expired_error(
-                                    &retry_error,
-                                    retry_client.config(),
-                                ) {
-                                    return Err(session_expired(&retry_client).into());
-                                }
-                                Err(retry_error)
-                            }
-                        };
-                    }
-                    if is_tool_call_session_expired_error(&error, config) {
-                        return Err(session_expired(client).into());
-                    }
-                    return Err(error);
-                }
+                Err(error) => error,
+            };
+            if !is_url_elicitation_required_error(&error)
+                || url_elicitation_attempt >= MAX_URL_ELICITATION_RETRIES
+            {
+                return Err(error);
             }
+            let elicitations = url_elicitations_from_error(&error);
+            if elicitations.is_empty() {
+                return Err(error);
+            }
+            if let Some(result) = process_url_elicitation_required(
+                client.name(),
+                tool_name,
+                elicitations,
+                handle_elicitation.clone(),
+            )
+            .await
+            {
+                return Ok(result);
+            }
+            url_elicitation_attempt += 1;
         }
+    }
+
+    /// Maps to: CC `callIdeRpc(toolName, args, client)` (`client.ts:2116-2128`):
+    /// `callMCPTool` on the IDE record's client, returning the processed
+    /// content. A tool result with `isError` throws (`:3123-3146`).
+    pub async fn call_ide_rpc(
+        tool_name: &str,
+        args: Map<String, Value>,
+        client: &ConnectedMcpServer,
+    ) -> anyhow::Result<Value> {
+        let result = call_mcp_tool(&client.client, tool_name, args, None).await?;
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            // A non-empty `content` decides, even when its first block has
+            // no text; only without one does the legacy `error` field count.
+            let error_details = match result
+                .get("content")
+                .and_then(Value::as_array)
+                .filter(|content| !content.is_empty())
+            {
+                Some(content) => content[0].get("text").map(js_string),
+                None => result.get("error").map(js_string),
+            };
+            anyhow::bail!(
+                "{}",
+                error_details.unwrap_or_else(|| "Unknown error".to_owned())
+            );
+        }
+        Ok(super::process_mcp_result(&result, tool_name, &client.name)
+            .await?
+            .content)
     }
 
     async fn get_mcp_prompt_once(
@@ -4469,13 +4379,12 @@ mod runtime {
 }
 
 pub use runtime::{
-    McpClient, call_mcp_tool, call_mcp_tool_with_elicitation, cleanup_connection,
+    McpClient, call_ide_rpc, call_mcp_tool, call_mcp_tool_with_elicitation, cleanup_connection,
     cleanup_memoized_connection, clear_mcp_auth_cache, clear_server_cache, connect_to_server,
     ensure_connected_client, fetch_resources_for_client, fetch_tools_for_client,
-    get_mcp_prompt_for_command, get_mcp_tools_commands_and_resources, is_connected_mcp_client,
-    read_mcp_resource, reconnect_mcp_server_impl, refresh_mcp_prompts_for_client,
-    refresh_mcp_resources_for_client, refresh_mcp_tools_for_client, register_ide_selection_sink,
-    send_custom_notification_to_connected_client, setup_sdk_mcp_clients,
+    get_mcp_prompt_for_command, get_mcp_tools_commands_and_resources, read_mcp_resource,
+    reconnect_mcp_server_impl, refresh_mcp_prompts_for_client, refresh_mcp_resources_for_client,
+    refresh_mcp_tools_for_client, register_ide_selection_sink, setup_sdk_mcp_clients,
 };
 
 /// A stdio MCP server for the connection and fetch caches. It appends each
@@ -4572,7 +4481,7 @@ rl.on('line', line => {
 "#;
 
 #[cfg(test)]
-pub(crate) use runtime::memoized_connection_ids;
+pub(crate) use runtime::{memoized_connection_ids, registered_connection_id};
 
 /// A streamable HTTP MCP server that gives every `initialize` a new session
 /// (`s1`, `s2`, ...) and answers 404 to the requests `expires` picks.
@@ -4584,6 +4493,11 @@ pub(crate) mod session_http_fixture {
         pub(crate) url: String,
         /// `initialize s1`, `tools/call s1`, `prompts/get s2`, ...
         pub(crate) log: Arc<Mutex<Vec<String>>>,
+        /// The `params` of each `tools/call` answered.
+        pub(crate) tool_calls: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// `tools/call` results by tool name; any other tool answers
+        /// `ok:<session>`.
+        pub(crate) tool_results: Arc<Mutex<std::collections::HashMap<String, serde_json::Value>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -4606,8 +4520,12 @@ pub(crate) mod session_http_fixture {
                 .expect("bind HTTP MCP fixture");
             let url = format!("http://{}/mcp", listener.local_addr().unwrap());
             let log = Arc::new(Mutex::new(Vec::new()));
+            let tool_calls = Arc::new(Mutex::new(Vec::new()));
+            let tool_results = Arc::new(Mutex::new(std::collections::HashMap::new()));
             let task = tokio::spawn({
                 let log = log.clone();
+                let tool_calls = tool_calls.clone();
+                let tool_results = tool_results.clone();
                 async move {
                     let mut sessions = 0;
                     loop {
@@ -4700,9 +4618,18 @@ pub(crate) mod session_http_fixture {
                             ("POST", "prompts/list") => result(serde_json::json!({ "prompts": [{
                                 "name": "daily"
                             }] })),
-                            ("POST", "tools/call") => result(serde_json::json!({
-                                "content": [{ "type": "text", "text": format!("ok:{session}") }]
-                            })),
+                            ("POST", "tools/call") => {
+                                let params = message["params"].clone();
+                                tool_calls.lock().unwrap().push(params.clone());
+                                let preset = params["name"]
+                                    .as_str()
+                                    .and_then(|name| tool_results.lock().unwrap().get(name).cloned());
+                                result(preset.unwrap_or_else(|| {
+                                    serde_json::json!({
+                                        "content": [{ "type": "text", "text": format!("ok:{session}") }]
+                                    })
+                                }))
+                            }
                             ("POST", "prompts/get") => result(serde_json::json!({
                                 "messages": [{
                                     "role": "user",
@@ -4717,7 +4644,13 @@ pub(crate) mod session_http_fixture {
                     }
                 }
             });
-            Self { url, log, task }
+            Self {
+                url,
+                log,
+                tool_calls,
+                tool_results,
+                task,
+            }
         }
 
         pub(crate) fn config(&self) -> super::ScopedMcpServerConfig {
@@ -4742,6 +4675,18 @@ pub(crate) mod session_http_fixture {
 
         pub(crate) fn log(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
+        }
+
+        /// Answers `tools/call` for `tool` with `result` from now on.
+        pub(crate) fn reply(&self, tool: &str, result: serde_json::Value) {
+            self.tool_results
+                .lock()
+                .unwrap()
+                .insert(tool.to_string(), result);
+        }
+
+        pub(crate) fn tool_calls(&self) -> Vec<serde_json::Value> {
+            self.tool_calls.lock().unwrap().clone()
         }
     }
 
@@ -5785,6 +5730,67 @@ mod tests {
         );
     }
 
+    /// CC `callIdeRpc` (`client.ts:2116-2128`) returns the processed content
+    /// of `callMCPTool`, which throws on `isError`: the first content block's
+    /// text, or "Unknown error" when that block has none (`:3123-3146`).
+    /// `closeOpenDiffs` (`utils/ide.ts:1266-1278`) sends `closeAllDiffTabs`
+    /// and ignores a failure.
+    #[test]
+    fn ide_rpc_returns_the_content_and_throws_tool_errors() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        block_on_with_process_runtime(async {
+            use session_http_fixture::{SESSION_NOT_FOUND, SessionHttpFixture};
+            let fixture = SessionHttpFixture::spawn(|_, _| false, SESSION_NOT_FOUND).await;
+            fixture.reply(
+                "fine",
+                serde_json::json!({ "content": [{ "type": "text", "text": "done" }] }),
+            );
+            fixture.reply(
+                "text",
+                serde_json::json!({
+                    "isError": true,
+                    "content": [{ "type": "text", "text": "boom" }],
+                }),
+            );
+            fixture.reply(
+                "no-text",
+                serde_json::json!({
+                    "isError": true,
+                    "content": [{ "type": "image", "data": "", "mimeType": "image/png" }],
+                }),
+            );
+            fixture.reply(
+                "closeAllDiffTabs",
+                serde_json::json!({
+                    "isError": true,
+                    "content": [{ "type": "text", "text": "unsupported" }],
+                }),
+            );
+            let ide = runtime::connect_to_server("ide", &fixture.config()).await;
+            let ide = ide.as_connected().expect("a connected IDE record");
+
+            let content = runtime::call_ide_rpc("fine", Map::new(), ide)
+                .await
+                .expect("content");
+            assert_eq!(content[0]["text"], "done");
+            let error = |tool: &'static str| async move {
+                runtime::call_ide_rpc(tool, Map::new(), ide)
+                    .await
+                    .expect_err("a tool error")
+                    .to_string()
+            };
+            assert_eq!(error("text").await, "boom");
+            assert_eq!(error("no-text").await, "Unknown error");
+
+            crate::utils::ide::close_open_diffs(ide).await;
+            let last = fixture.tool_calls().pop().expect("a tools/call");
+            assert_eq!(last["name"], "closeAllDiffTabs");
+            assert_eq!(last["arguments"], serde_json::json!({}));
+
+            runtime::clear_server_cache("ide", None).await;
+        });
+    }
+
     /// A request on a handle with no connection behind it answers "not
     /// connected", where the old registry check did.
     #[test]
@@ -6067,7 +6073,10 @@ mod tests {
             clear_server_cache("sdk-connected", Some(replacement.clients[0].config()));
         let latest = setup_sdk_mcp_clients(&configs, callback).await;
         delayed_clear.await;
-        assert!(is_connected_mcp_client("sdk-connected").await);
+        assert_eq!(
+            registered_connection_id("sdk-connected"),
+            connection_id(&latest.clients[0])
+        );
         latest.clients[0]
             .as_connected()
             .expect("the latest SDK client is connected")
@@ -6080,7 +6089,10 @@ mod tests {
         let mut mismatched_config = latest.clients[0].config().clone();
         mismatched_config.url = Some("https://different.invalid".into());
         clear_server_cache("sdk-connected", Some(&mismatched_config)).await;
-        assert!(is_connected_mcp_client("sdk-connected").await);
+        assert_eq!(
+            registered_connection_id("sdk-connected"),
+            connection_id(&latest.clients[0])
+        );
         clear_server_cache("sdk-connected", None).await;
     }
 
@@ -6371,28 +6383,6 @@ mod tests {
     }
 
     #[test]
-    fn channel_permission_relay_send_is_disabled_by_default() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let params =
-                    crate::services::mcp::channel_permissions::channel_permission_request_params(
-                        "toolu_123",
-                        "Bash",
-                        "Run command?",
-                        &serde_json::json!({ "command": "echo hi" }),
-                    );
-                let report = send_channel_permission_request_to_relays(&params).await;
-                assert!(!report.enabled);
-                assert_eq!(report.attempted, 0);
-                assert_eq!(report.sent, 0);
-                assert_eq!(report.failed, 0);
-            });
-    }
-
-    #[test]
     fn channel_permission_custom_notification_emits_callback_observation() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         tokio::runtime::Builder::new_current_thread()
@@ -6644,11 +6634,11 @@ rl.on('line', line => {
         id: message.id,
         error: {
           code: -32042,
-          message: 'URL elicitation required',
+          message: 'URL elicitation required: Unauthorized',
           data: {
             elicitations: [{
               mode: 'url',
-              url: 'https://example.com/auth',
+              url: 'https://example.com/auth?state=401',
               elicitationId: 'fixture-elicit',
               message: 'Authorize this MCP tool'
             }]
@@ -6676,6 +6666,7 @@ rl.on('line', line => {
             .unwrap()
             .block_on(async {
                 let _ = runtime::drain_mcp_connection_callback_observations().await;
+                runtime::clear_mcp_auth_cache();
                 const SERVER: &str = "url-elicit-stdio-fixture";
                 let config = ScopedMcpServerConfig {
                     name: None,
@@ -6701,8 +6692,21 @@ rl.on('line', line => {
                 );
                 assert_eq!(tool_names(&discovery.tools), vec!["login"]);
 
-                let call = tokio::spawn(async {
-                    runtime::call_mcp_tool(SERVER, "login", Map::new()).await
+                let client = discovery
+                    .server
+                    .as_connected()
+                    .expect("a connected record")
+                    .client
+                    .clone();
+                let call = tokio::spawn(async move {
+                    runtime::call_mcp_tool_with_elicitation(
+                        &client,
+                        "login",
+                        Map::new(),
+                        None,
+                        crate::tool::HandleElicitationCallback::default(),
+                    )
+                    .await
                 });
                 let request_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
@@ -6733,6 +6737,10 @@ rl.on('line', line => {
                     value["content"][0]["text"].as_str(),
                     Some("retried after url")
                 );
+                // CC judges auth by a 401 status or `UnauthorizedError`
+                // (`client.ts:3197-3199`); the elicitation's "401" and
+                // "Unauthorized" text is no auth failure.
+                assert!(!runtime::is_mcp_auth_cached(SERVER));
                 runtime::clear_server_cache(SERVER, None).await;
                 let _ = runtime::drain_mcp_connection_callback_observations().await;
             });
@@ -6748,10 +6756,6 @@ rl.on('line', line => {
             .build()
             .unwrap()
             .block_on(test);
-    }
-
-    fn registered_connection_id(name: &str) -> Option<u64> {
-        runtime::registered_connection_id(name)
     }
 
     /// The server's own names of fetched MCP tools (`mcpInfo.toolName`).
@@ -6794,7 +6798,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("tools/list"), 0);
 
             runtime::clear_server_cache(SERVER, Some(&config)).await;
-            assert!(!runtime::is_connected_mcp_client(SERVER).await);
+            assert_eq!(registered_connection_id(SERVER), None);
             let fresh = runtime::connect_to_server(SERVER, &config).await;
             assert_ne!(connection_id(&fresh), connection_id(&first));
             assert_eq!(fixture.count("initialize"), 2);
@@ -6939,7 +6943,8 @@ rl.on('line', line => {
             );
             let _ = runtime::drain_mcp_connection_callback_observations().await;
 
-            runtime::call_mcp_tool(SERVER, "complete", Map::new())
+            let client = &connected.as_connected().expect("a connected record").client;
+            runtime::call_mcp_tool(client, "complete", Map::new(), None)
                 .await
                 .expect("tool call");
             let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -7012,7 +7017,8 @@ rl.on('line', line => {
             );
 
             // Any tool call makes the fixture exit.
-            let _ = runtime::call_mcp_tool(SERVER, "lookup_1", Map::new()).await;
+            let client = &first.as_connected().expect("a connected record").client;
+            let _ = runtime::call_mcp_tool(client, "lookup_1", Map::new(), None).await;
             fixture
                 .until("the closed connection to leave the registry", |_| {
                     registered_connection_id(SERVER).is_none()

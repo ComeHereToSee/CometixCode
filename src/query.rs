@@ -582,14 +582,6 @@ where
     D: crate::query::deps::QueryDeps,
 {
     let event_tx = event_tx.into();
-    // Maps to CC REPL `diagnosticTracker.handleQueryStart(freshClients)`:
-    // reset per user query while connected-client lookup remains lazy in the
-    // Rust diagnostic service. Subagent actors do not own the singleton.
-    // A2: a direct query() generator does not enter REPL.handleQueryStart.
-    // In particular, an agent hook must retain its parent's diagnostic baseline.
-    if !event_tx.is_pull() && !params.query_source.is_agent() {
-        crate::services::diagnostic_tracking::reset();
-    }
 
     // Keep the very large query-loop state machine off the actor thread's
     // fixed stack. The production actor and direct test runtimes both use a
@@ -3273,7 +3265,6 @@ where
                         &current_tool_use_context,
                         &permission_request,
                     )
-                    .await
                 } else {
                     None
                 };

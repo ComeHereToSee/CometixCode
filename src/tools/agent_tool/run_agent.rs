@@ -3122,10 +3122,13 @@ mod tests {
                     .find(|server| server.name() == "broken")
                     .expect("the agent's state holds the failed server");
                 assert_eq!(broken.connection_type(), McpServerConnectionType::Failed);
-                assert!(crate::services::mcp::client::is_connected_mcp_client("inline").await);
+                assert!(crate::services::mcp::client::registered_connection_id("inline").is_some());
 
                 drop(initialized);
-                assert!(!crate::services::mcp::client::is_connected_mcp_client("inline").await);
+                assert_eq!(
+                    crate::services::mcp::client::registered_connection_id("inline"),
+                    None
+                );
                 let again =
                     crate::services::mcp::client::connect_to_server("inline", &config).await;
                 assert_eq!(again.connection_type(), McpServerConnectionType::Connected);
@@ -3184,8 +3187,9 @@ mod tests {
                             .is_empty()
                     })
                     .await;
-                assert!(
-                    !crate::services::mcp::client::is_connected_mcp_client("slow-inline").await
+                assert_eq!(
+                    crate::services::mcp::client::registered_connection_id("slow-inline"),
+                    None
                 );
                 assert_eq!(fixture.count("initialize"), 1);
             });

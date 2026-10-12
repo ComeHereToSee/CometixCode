@@ -397,7 +397,6 @@ pub fn skips_channel_permission_relay_for_user_interaction(tool_name: &str) -> b
 pub struct ChannelPermissionRelayRegistration {
     pub request_id: String,
     pub receiver: async_channel::Receiver<PermissionPromptResponse>,
-    pub send_report: crate::services::mcp::channel_permissions::ChannelPermissionRelaySendReport,
     unsubscribe: Option<crate::services::mcp::channel_permissions::ChannelPermissionUnsubscribe>,
 }
 
@@ -418,7 +417,6 @@ impl Drop for ChannelPermissionRelayRegistration {
 fn register_channel_permission_response(
     callbacks: &crate::services::mcp::channel_permissions::ChannelPermissionCallbacks,
     request_id: &str,
-    send_report: crate::services::mcp::channel_permissions::ChannelPermissionRelaySendReport,
 ) -> ChannelPermissionRelayRegistration {
     let (tx, rx) = async_channel::bounded(1);
     let unsubscribe = callbacks.on_response(request_id, move |response| {
@@ -435,39 +433,79 @@ fn register_channel_permission_response(
     ChannelPermissionRelayRegistration {
         request_id: request_id.to_string(),
         receiver: rx,
-        send_report,
         unsubscribe: Some(unsubscribe),
     }
 }
 
-/// Maps to CC `interactiveHandler.ts` channel permission relay block:
-/// construct `ChannelPermissionRequestParams`, send fire-and-forget MCP
-/// notifications, then subscribe to `channelCallbacks.onResponse(...)` so the
-/// remote structured reply can race the local dialog.
-pub async fn start_channel_permission_relay(
+/// Maps to CC `interactiveHandler.ts:315-405` channel permission relay
+/// block: the relay clients among `getAppState().mcp.clients` each get a
+/// fire-and-forget `permission_request` notification, then
+/// `channelCallbacks.onResponse(...)` subscribes so the remote structured
+/// reply can race the local dialog. With no relay client, nothing is
+/// subscribed.
+pub fn start_channel_permission_relay(
     context: &crate::tool::ToolUseContext,
     request: &PermissionRequest,
 ) -> Option<ChannelPermissionRelayRegistration> {
+    use crate::services::mcp::channel_permissions;
+
+    if !channel_permissions::is_channel_permission_relay_enabled() {
+        return None;
+    }
     let callbacks = context.channel_permission_callbacks.as_ref()?;
     if skips_channel_permission_relay_for_user_interaction(&request.tool_name) {
         return None;
     }
-    let params = crate::services::mcp::channel_permissions::channel_permission_request_params(
+    let allowed_channels = crate::bootstrap::state::get_allowed_channels();
+    let app_state = context.get_app_state();
+    let channel_clients = channel_permissions::filter_permission_relay_clients(
+        app_state
+            .as_ref()
+            .map_or(&[][..], |state| &state.mcp.clients),
+        |name| {
+            crate::services::mcp::channel_notification::find_channel_entry(name, &allowed_channels)
+                .is_some()
+        },
+    );
+    if channel_clients.is_empty() {
+        return None;
+    }
+
+    let params = channel_permissions::channel_permission_request_params(
         &request.tool_use_id,
         &request.tool_name,
         &request.description,
         &request.input,
     );
-    let send_report =
-        crate::services::mcp::client::send_channel_permission_request_to_relays(&params).await;
-    if send_report.attempted == 0 {
-        return None;
+    // Subscribed before any send goes out: CC sends and subscribes in one
+    // synchronous stretch, so no reply can arrive in between; the sends
+    // here run on another thread.
+    let registration = register_channel_permission_response(callbacks, &params.request_id);
+    // CC `:343-353`: `void client.client.notification(...).catch(...)`.
+    if let (Ok(params), Some(handle)) = (
+        serde_json::to_value(&params),
+        crate::utils::process_runtime::runtime_handle_for_detached_work(),
+    ) {
+        for client in channel_clients {
+            let (name, client) = (client.name.clone(), client.client.clone());
+            let params = params.clone();
+            handle.spawn(async move {
+                if let Err(error) = client
+                    .notification(
+                        crate::services::mcp::channel_notification::CHANNEL_PERMISSION_REQUEST_METHOD,
+                        params,
+                    )
+                    .await
+                {
+                    crate::utils::debug::log_for_debugging_with_level(
+                        &format!("Channel permission_request failed for {name}: {error}"),
+                        crate::utils::debug::DebugLogLevel::Error,
+                    );
+                }
+            });
+        }
     }
-    Some(register_channel_permission_response(
-        callbacks,
-        &params.request_id,
-        send_report,
-    ))
+    Some(registration)
 }
 
 #[cfg(test)]
@@ -1034,16 +1072,7 @@ mod tests {
     fn channel_permission_response_registration_maps_allow_and_deny_to_prompt_responses() {
         let callbacks =
             crate::services::mcp::channel_permissions::ChannelPermissionCallbacks::default();
-        let mut allow_registration = register_channel_permission_response(
-            &callbacks,
-            "abcde",
-            crate::services::mcp::channel_permissions::ChannelPermissionRelaySendReport {
-                enabled: true,
-                attempted: 1,
-                sent: 1,
-                failed: 0,
-            },
-        );
+        let mut allow_registration = register_channel_permission_response(&callbacks, "abcde");
         assert!(callbacks.resolve(
             "ABCDE",
             crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Allow,
@@ -1055,16 +1084,7 @@ mod tests {
         );
         allow_registration.unsubscribe();
 
-        let _deny_registration = register_channel_permission_response(
-            &callbacks,
-            "fghij",
-            crate::services::mcp::channel_permissions::ChannelPermissionRelaySendReport {
-                enabled: true,
-                attempted: 1,
-                sent: 1,
-                failed: 0,
-            },
-        );
+        let _deny_registration = register_channel_permission_response(&callbacks, "fghij");
         assert!(callbacks.resolve(
             "fghij",
             crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Deny,
@@ -1083,22 +1103,14 @@ mod tests {
             crate::services::mcp::channel_permissions::ChannelPermissionCallbacks::default();
         let context = crate::tool::ToolUseContext::default()
             .with_channel_permission_callbacks(Some(callbacks));
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let registration =
-                    start_channel_permission_relay(&context, &bash_request("toolu_123")).await;
-                assert!(registration.is_none());
-
-                let registration = start_channel_permission_relay(
-                    &context,
-                    &request_for_tool("AskUserQuestion", "toolu_question"),
-                )
-                .await;
-                assert!(registration.is_none());
-            });
+        assert!(start_channel_permission_relay(&context, &bash_request("toolu_123")).is_none());
+        assert!(
+            start_channel_permission_relay(
+                &context,
+                &request_for_tool("AskUserQuestion", "toolu_question"),
+            )
+            .is_none()
+        );
     }
     #[test]
     fn queue_display_input_matches_official_ask_updated_input_and_keeps_call_transport() {

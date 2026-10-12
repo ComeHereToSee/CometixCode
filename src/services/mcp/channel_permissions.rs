@@ -9,7 +9,7 @@
 //! permission handler boundary.
 
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Maps to: CC `ChannelPermissionResponse['behavior']`.
@@ -77,15 +77,6 @@ pub fn channel_permission_request_notification_value(
         "method": crate::services::mcp::channel_notification::CHANNEL_PERMISSION_REQUEST_METHOD,
         "params": params,
     })
-}
-
-/// Service send report for CC channel permission relay fire-and-forget sends.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ChannelPermissionRelaySendReport {
-    pub enabled: bool,
-    pub attempted: usize,
-    pub sent: usize,
-    pub failed: usize,
 }
 
 type ChannelPermissionHandler = Arc<dyn Fn(ChannelPermissionResponse) + Send + Sync + 'static>;
@@ -280,47 +271,30 @@ pub fn truncate_for_preview(input: &impl Serialize) -> String {
     }
 }
 
-/// Maps to: CC generic candidate shape consumed by
-/// `filterPermissionRelayClients(...)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChannelPermissionRelayClientCandidate {
-    pub client_type: String,
-    pub name: String,
-    pub experimental_capabilities: BTreeMap<String, serde_json::Value>,
-}
-
-impl ChannelPermissionRelayClientCandidate {
-    pub fn connected(
-        name: impl Into<String>,
-        experimental_capabilities: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        Self {
-            client_type: "connected".to_string(),
-            name: name.into(),
-            experimental_capabilities: experimental_capabilities
-                .into_iter()
-                .map(|name| (name.into(), serde_json::json!({})))
-                .collect(),
-        }
-    }
-}
-
-/// Maps to: CC `filterPermissionRelayClients(...)`.
+/// Maps to: CC `filterPermissionRelayClients(clients, isInAllowlist)`
+/// (`channelPermissions.ts:177-194`): the connected clients on the
+/// allowlist that declare both `claude/channel` and
+/// `claude/channel/permission` in their experimental capabilities.
 pub fn filter_permission_relay_clients<'a>(
-    clients: &'a [ChannelPermissionRelayClientCandidate],
+    clients: &'a [crate::services::mcp::types::McpServerConnection],
     is_in_allowlist: impl Fn(&str) -> bool,
-) -> Vec<&'a ChannelPermissionRelayClientCandidate> {
+) -> Vec<&'a crate::services::mcp::types::ConnectedMcpServer> {
     clients
         .iter()
+        .filter_map(crate::services::mcp::types::McpServerConnection::as_connected)
         .filter(|client| {
-            client.client_type == "connected"
-                && is_in_allowlist(&client.name)
-                && client.experimental_capabilities.contains_key(
-                    crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY,
-                )
-                && client.experimental_capabilities.contains_key(
-                    crate::services::mcp::channel_notification::CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY,
-                )
+            let experimental = client.capabilities.experimental.as_ref();
+            is_in_allowlist(&client.name)
+                && experimental.is_some_and(|experimental| {
+                    experimental.contains_key(
+                        crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY,
+                    )
+                })
+                && experimental.is_some_and(|experimental| {
+                    experimental.contains_key(
+                        crate::services::mcp::channel_notification::CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY,
+                    )
+                })
         })
         .collect()
 }
@@ -431,36 +405,43 @@ mod tests {
 
     #[test]
     fn filter_permission_relay_clients_requires_connected_allowlist_and_both_capabilities() {
+        use crate::services::mcp::channel_notification::{
+            CHANNEL_EXPERIMENTAL_CAPABILITY as CHANNEL,
+            CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY as PERMISSION,
+        };
+        use crate::services::mcp::types::{McpServerConnection, ScopedMcpServerConfig};
+
+        let relay_client = |name: &str, capabilities: &[&str]| {
+            let mut client = McpServerConnection::connected_for_test(
+                name,
+                ScopedMcpServerConfig::stdio_for_test(name),
+            );
+            if let McpServerConnection::Connected(connected) = &mut client {
+                connected.capabilities.experimental = Some(
+                    capabilities
+                        .iter()
+                        .map(|capability| (capability.to_string(), Default::default()))
+                        .collect(),
+                );
+            }
+            client
+        };
+        // Each one but the first misses exactly one condition.
         let clients = vec![
-            ChannelPermissionRelayClientCandidate::connected(
-                "telegram",
-                [
-                    crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY,
-                    crate::services::mcp::channel_notification::CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY,
-                ],
-            ),
-            ChannelPermissionRelayClientCandidate::connected(
-                "slack",
-                [crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY],
-            ),
-            ChannelPermissionRelayClientCandidate {
-                client_type: "pending".to_string(),
-                name: "discord".to_string(),
-                experimental_capabilities: BTreeMap::from([
-                    (
-                        crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY.to_string(),
-                        serde_json::json!({}),
-                    ),
-                    (
-                        crate::services::mcp::channel_notification::CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY.to_string(),
-                        serde_json::json!({}),
-                    ),
-                ]),
-            },
+            relay_client("telegram", &[CHANNEL, PERMISSION]),
+            relay_client("channel-only", &[CHANNEL]),
+            relay_client("permission-only", &[PERMISSION]),
+            relay_client("blocked", &[CHANNEL, PERMISSION]),
+            McpServerConnection::pending("discord", ScopedMcpServerConfig::stdio_for_test("d")),
         ];
-        let filtered = filter_permission_relay_clients(&clients, |name| name != "slack");
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].name, "telegram");
+        let filtered = filter_permission_relay_clients(&clients, |name| name != "blocked");
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            ["telegram"]
+        );
     }
 
     #[test]

@@ -682,6 +682,33 @@ fn build_repl_process_user_input_context(
     context
 }
 
+/// Maps to CC `REPL.tsx:3562-3575`, the head of `onQuery` when it queries:
+/// the IDE integration is prepared for the new prompt from the fresh
+/// clients — the diagnostic tracker's query start, and
+/// `void closeOpenDiffs(ideClient)`.
+fn prepare_ide_integration_for_query(
+    fresh_clients: &[crate::services::mcp::types::McpServerConnection],
+) {
+    crate::services::diagnostic_tracking::handle_query_start(fresh_clients);
+    if let (Some(ide_client), Some(handle)) = (
+        crate::utils::ide::get_connected_ide_client(fresh_clients),
+        crate::utils::process_runtime::runtime_handle_for_detached_work(),
+    ) {
+        let ide_client = ide_client.clone();
+        handle.spawn(async move { crate::utils::ide::close_open_diffs(&ide_client).await });
+    }
+}
+
+/// Runs `diagnosticTracker.shutdown()` when dropped: the cleanup CC's REPL
+/// returns from its mount effect (`REPL.tsx:5456-5459`).
+struct DiagnosticTrackerShutdown;
+
+impl Drop for DiagnosticTrackerShutdown {
+    fn drop(&mut self) {
+        crate::services::diagnostic_tracking::shutdown();
+    }
+}
+
 /// Maps to CC `REPL.tsx`'s `hasInterruptibleToolInProgress` ref setter.  The
 /// query actor clones `ToolUseContext`, so an `Arc<AtomicBool>` gives the
 /// synchronous prompt submit callback the same live value without routing a
@@ -787,6 +814,7 @@ fn apply_repl_query_turn_context(
     if let Some(mcp_state) = mcp_state {
         params.tool_use_context.mcp_state = mcp_state;
     }
+    prepare_ide_integration_for_query(&params.tool_use_context.mcp_state.clients);
     // The MCP-prompt path's context never met the builder, so give it the
     // builder-once fields first; everything below is per-turn and shared.
     if let Some(loaded_nested_memory_paths) = shell_context_seed {
@@ -4270,6 +4298,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         },
         (),
     );
+    // Maps to: CC `screens/REPL.tsx:5456-5459`, the same effect's unmount
+    // cleanup `void diagnosticTracker.shutdown()`; held in hook state so it
+    // runs when this component drops (`_sandbox_ask_registration` precedent).
+    let _diagnostic_tracker_shutdown = hooks.use_state(|| DiagnosticTrackerShutdown);
 
     let prompt_submit = hooks.use_const({
         let commands = commands.clone();
@@ -4519,6 +4551,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         max_turns: None,
                         tool_use_context,
                     };
+                    // `onQuery([])` prepares the IDE integration too, from
+                    // the store's clients (`REPL.tsx:3566-3569`).
+                    prepare_ide_integration_for_query(&app_store.get().mcp.clients);
                     stream_mode.set(SpinnerMode::Responding);
                     response_length_ref.set(0);
                     active_query.set(Some(spawn_query(params, production_deps())));
@@ -12751,6 +12786,87 @@ mod tests {
         assert_eq!(shell_params.system_prompt, builder_params.system_prompt);
         assert_eq!(shell_params.user_context, builder_params.user_context);
         assert_eq!(shell_params.system_context, builder_params.system_context);
+    }
+
+    /// CC `REPL.tsx:3562-3575`: a query start hands the fresh clients to
+    /// `diagnosticTracker.handleQueryStart`, which keeps the IDE client, and
+    /// sends that client `closeAllDiffTabs`.
+    #[test]
+    fn query_turn_context_prepares_the_ide_integration_from_the_fresh_clients() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::services::mcp::client::session_http_fixture::{
+                    SESSION_NOT_FOUND, SessionHttpFixture,
+                };
+                let fixture = SessionHttpFixture::spawn(|_, _| false, SESSION_NOT_FOUND).await;
+                let ide =
+                    crate::services::mcp::client::connect_to_server("ide", &fixture.config()).await;
+                let called =
+                    |tool: &str| fixture.tool_calls().iter().any(|call| call["name"] == tool);
+                crate::services::diagnostic_tracking::shutdown();
+
+                let store = crate::state::store::AppStore::new(
+                    crate::state::app_state_store::AppState::default(),
+                    None,
+                );
+                let mut params = crate::query::QueryParams {
+                    turn_id: "turn-1".to_string(),
+                    input: "hi".to_string(),
+                    messages: Vec::new(),
+                    model_messages: Vec::new(),
+                    system_prompt: Vec::new(),
+                    user_context: std::collections::BTreeMap::new(),
+                    system_context: std::collections::BTreeMap::new(),
+                    query_source: crate::constants::query_source::QuerySource::Prompt,
+                    token_budget: None,
+                    task_budget: None,
+                    max_turns: None,
+                    tool_use_context: ToolUseContext::with_permission_context(
+                        ToolPermissionContext::default(),
+                    ),
+                };
+                let _ = apply_repl_query_turn_context(
+                    &mut params,
+                    &store,
+                    ToolPermissionContext::default(),
+                    &[],
+                    crate::utils::tool_result_storage::ContentReplacementState::new(),
+                    &ResumeRestoreStores::default(),
+                    Some(crate::state::app_state_store::McpState {
+                        clients: vec![ide],
+                        ..Default::default()
+                    }),
+                    None,
+                    &[],
+                    &crate::utils::system_prompt::CliSystemPromptOverrides::default(),
+                    None,
+                    &crate::tool::InteractivePermissionSink::default(),
+                    &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    &crate::tool::SetInProgressToolUseIds::default(),
+                    &crate::utils::thinking::ThinkingConfig::Adaptive,
+                    None,
+                );
+
+                // `void closeOpenDiffs(ideClient)` runs detached.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !called("closeAllDiffTabs") {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("closeAllDiffTabs reaches the IDE client");
+                // The tracker kept the IDE client.
+                crate::services::diagnostic_tracking::before_file_edited("/tmp/edited.rs").await;
+                assert!(called("getDiagnostics"));
+
+                crate::services::diagnostic_tracking::shutdown();
+                crate::services::mcp::client::clear_server_cache("ide", None).await;
+            });
     }
 
     /// The `Agent(x,y)` frontmatter restriction has gone missing three times
