@@ -659,7 +659,7 @@ pub fn initialize_lsp_if_trusted(workspace_trusted: bool) {
 
 /// Register MCP connection handlers (non-test). IDE `selection_changed`
 /// delivery is REPL-owned (CC `useIdeSelection`): the REPL registers its
-/// per-connection sink via `services::mcp::client::register_ide_selection_sink`.
+/// handler on the IDE client itself (`hooks::use_ide_selection`).
 /// Ownership ruling, P5 G10 (2026-08-04). Kept pre-mount, deliberately.
 ///
 /// CC's counterpart is `onConnectionAttempt`

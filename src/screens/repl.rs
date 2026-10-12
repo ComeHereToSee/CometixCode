@@ -4568,13 +4568,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Maps to: CC REPL.tsx:1239-1242 `useIdeSelection(mcp.clients,
     // setIDESelection)`. CC upstream quirk preserved (do NOT "fix"): REPL
     // passes `mcp.clients` — NOT the merged `mcpClients` — so only the
-    // live-managed MCP connections ever carry a selection handler. Cometix
-    // registers the sink with the live connection registry
-    // (`CONNECTED_CLIENTS`), which holds exactly those live-managed
-    // connections; leaving the registry releases the per-connection sink clone
-    // (useIdeSelection.ts:148 "No cleanup needed") and identity changes send
-    // the CC-shaped reset object through this channel
-    // (useIdeSelection.ts:73-83).
+    // live-managed MCP connections ever carry a selection handler. CC passes
+    // an empty list for a remote session, which this port has not built. The
+    // hook's `onSelect` is this channel, drained into the state below.
     //
     // SEAM (recorded, not implemented in this slice):
     // - CC feeds `ideSelection` into handlePromptSubmit → processUserInput →
@@ -4585,10 +4581,13 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     //   the strict connected gate exists here.
     let ide_selection_channel =
         hooks.use_const(|| std::sync::Arc::new(async_channel::unbounded::<IdeSelection>()));
-    let _ide_selection_sink_registration = hooks.use_const({
-        let sink = ide_selection_channel.0.clone();
-        move || crate::services::mcp::client::register_ide_selection_sink(sink)
-    });
+    let mcp_clients =
+        crate::state::app_state::use_app_state(&mut hooks, |state| state.mcp.clients.clone());
+    crate::hooks::use_ide_selection::use_ide_selection(
+        &mut hooks,
+        &mcp_clients,
+        ide_selection_channel.0.clone(),
+    );
     let ide_selection_rx = ide_selection_channel.1.clone();
     hooks.use_future(async move {
         // Live State handle captured by the recv loop (no snapshot): each

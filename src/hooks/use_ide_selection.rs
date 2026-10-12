@@ -1,11 +1,12 @@
 //! Maps to: CC `hooks/useIdeSelection.ts`.
 //!
-//! Pure selection types + parsing. Ownership matches CC: the REPL owns the
-//! selection state (`REPL.tsx:1110-1113` `useState<IDESelection|undefined>`)
-//! and registers a per-connection sink with the MCP client registry
-//! (`services/mcp/client.rs::register_ide_selection_sink`, CC
-//! `client.setNotificationHandler(SelectionChangedSchema, ...)`). No AppState
-//! field and no process-static writer are involved.
+//! Selection types, parsing, and the hook. Ownership matches CC: the REPL owns
+//! the selection state (`REPL.tsx:1110-1113` `useState<IDESelection|undefined>`)
+//! and [`use_ide_selection`] registers the `selection_changed` handler on the
+//! IDE client itself (CC `client.setNotificationHandler(SelectionChangedSchema,
+//! ...)`). No AppState field and no process-static writer are involved.
+
+use iocraft::prelude::*;
 
 /// Maps to: CC `hooks/useIdeSelection.ts#SelectionPoint`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -126,6 +127,86 @@ pub fn ide_selection_from_notification_params(
 ) -> Option<IdeSelection> {
     let data = parse_selection_changed_params(params)?;
     ide_selection_from_selection_data(&data)
+}
+
+/// Maps to: CC `hooks/useIdeSelection.ts:59-150`
+/// `useIdeSelection(mcpClients, onSelect)`: when the connected IDE client
+/// changes, the selection resets, and the new client gets a
+/// `selection_changed` handler that delivers to `on_select` while it is still
+/// the current one.
+///
+/// CC's effect reruns on every `mcpClients` change but acts only when
+/// `getConnectedIdeClient` returns a different client; keyed on that
+/// client's connection, this effect runs exactly then. CC compares the
+/// connected record by reference, and a record is rebuilt on every
+/// `updateServer`, the IDE's own `list_changed` included; records here are
+/// values, so the comparison is the connection: a refreshed record of the
+/// same connection is no change. The current client is remembered by its
+/// connection id, so the handler, stored on the client, holds no handle to
+/// it.
+pub fn use_ide_selection(
+    hooks: &mut Hooks<'_, '_>,
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
+    on_select: async_channel::Sender<IdeSelection>,
+) {
+    let current_ide: CurrentIdeConnection = hooks.use_const(Default::default);
+    let ide_client = crate::utils::ide::get_connected_ide_client(mcp_clients)
+        .map(|client| client.client.clone());
+    let ide_connection = ide_client
+        .as_ref()
+        .map(crate::services::mcp::client::McpClient::connection_id);
+    hooks.use_effect(
+        move || run_ide_selection_effect(&current_ide, ide_client, &on_select),
+        ide_connection,
+    );
+}
+
+/// The connection id of the IDE client [`use_ide_selection`] last saw
+/// (CC `currentIDERef`).
+pub(crate) type CurrentIdeConnection = std::sync::Arc<std::sync::Mutex<Option<u64>>>;
+
+/// The body of [`use_ide_selection`]'s effect (CC `useIdeSelection.ts:66-149`)
+/// for the connected IDE client now.
+pub(crate) fn run_ide_selection_effect(
+    current_ide: &CurrentIdeConnection,
+    ide_client: Option<crate::services::mcp::client::McpClient>,
+    on_select: &async_channel::Sender<IdeSelection>,
+) {
+    let ide_connection = ide_client
+        .as_ref()
+        .map(crate::services::mcp::client::McpClient::connection_id);
+    {
+        let mut current = current_ide
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // CC `:73-83`: undefined and null both mean no IDE, so a run without
+        // one after none is no change.
+        if *current != ide_connection {
+            *current = ide_connection;
+            let _ = on_select.try_send(ide_selection_reset());
+        }
+    }
+    let (Some(ide_client), Some(registered)) = (ide_client, ide_connection) else {
+        return;
+    };
+    let current_ide = current_ide.clone();
+    let on_select = on_select.clone();
+    ide_client.set_notification_handler(SELECTION_CHANGED_METHOD, move |params| {
+        let Some(selection) = ide_selection_from_notification_params(params.as_ref()) else {
+            return;
+        };
+        // CC `:115-117`: a handler of a client no longer current is ignored.
+        // The check holds the lock through the send, as the effect holds it
+        // through its reset: CC runs both on one thread, so a selection of a
+        // client that just stopped being current never lands after the
+        // reset.
+        let current = current_ide
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current == Some(registered) {
+            let _ = on_select.try_send(selection);
+        }
+    });
 }
 
 #[cfg(test)]

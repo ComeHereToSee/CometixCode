@@ -479,9 +479,8 @@ pub fn handle_channel_permission_notification_event(
 // Cometix keeps that ownership here: App mounts [`OnConnectionAttemptHandlers`],
 // and the rmcp client handler invokes the `emit_*` entry points below.
 // IDE `selection_changed` is REPL-owned (CC `useIdeSelection`): the REPL
-// threads its per-connection selection sender through this registry via
-// [`set_ide_selection_sink`]; `replace_cached_client` clones it into each new
-// "ide" connection entry (CC `client.setNotificationHandler(...)` per client).
+// registers its handler on the IDE client itself
+// (`hooks::use_ide_selection::use_ide_selection`).
 // ---------------------------------------------------------------------------
 
 use crate::services::mcp::elicitation_handler::ElicitationRequestEvent;
@@ -496,38 +495,10 @@ static CONNECTION_ATTEMPT_HANDLERS: OnceLock<StdMutex<ConnectionAttemptRegistry>
 #[derive(Default)]
 struct ConnectionAttemptRegistry {
     handlers: Option<OnConnectionAttemptHandlers>,
-    /// Maps to: CC `useIdeSelection(mcp.clients, setIDESelection)` — the
-    /// REPL-owned selection sender. Stored here only as the threading path;
-    /// the live per-connection sink is the clone captured by each "ide"
-    /// connection in `CONNECTED_CLIENTS` (released when it leaves the
-    /// registry — CC useIdeSelection.ts:148 "No cleanup needed").
-    ide_selection_sink:
-        Option<async_channel::Sender<crate::hooks::use_ide_selection::IdeSelection>>,
 }
 
 fn connection_attempt_handlers_slot() -> &'static StdMutex<ConnectionAttemptRegistry> {
     CONNECTION_ATTEMPT_HANDLERS.get_or_init(|| StdMutex::new(ConnectionAttemptRegistry::default()))
-}
-
-/// Maps to: CC `useIdeSelection` re-running its effect with the latest
-/// `onSelect`: replaces the sender future "ide" connections will capture.
-pub(crate) fn set_ide_selection_sink(
-    sink: async_channel::Sender<crate::hooks::use_ide_selection::IdeSelection>,
-) {
-    connection_attempt_handlers_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ide_selection_sink = Some(sink);
-}
-
-/// Sender a newly cached connection should capture (None until a REPL mounts).
-pub(crate) fn current_ide_selection_sink()
--> Option<async_channel::Sender<crate::hooks::use_ide_selection::IdeSelection>> {
-    connection_attempt_handlers_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ide_selection_sink
-        .clone()
 }
 
 /// Live writers captured like CC `onConnectionAttempt` closures

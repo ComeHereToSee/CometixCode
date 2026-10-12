@@ -231,6 +231,22 @@ mod tests {
     use super::*;
     use crate::services::mcp::types::{McpServerConnection, ScopedMcpServerConfig, Transport};
 
+    /// CC `getConnectedIdeClient` (`utils/ide.ts:1251-1264`): the first
+    /// record that is connected and named exactly `ide`.
+    #[test]
+    fn connected_ide_client_is_the_connected_record_named_ide() {
+        let stdio = ScopedMcpServerConfig::stdio_for_test;
+        let clients = [
+            McpServerConnection::pending("ide", stdio("pending")),
+            McpServerConnection::connected_for_test("IDE", stdio("upper")),
+            McpServerConnection::connected_for_test("ide", stdio("first")),
+            McpServerConnection::connected_for_test("ide", stdio("second")),
+        ];
+        let found = get_connected_ide_client(&clients).expect("a connected ide");
+        assert_eq!(found.config.command.as_deref(), Some("first"));
+        assert!(get_connected_ide_client(&clients[..2]).is_none());
+    }
+
     /// An `ide` record over `transport` that configures `ide_name`.
     fn ide_client(transport: Transport, ide_name: Option<&str>) -> McpServerConnection {
         let config = ScopedMcpServerConfig {

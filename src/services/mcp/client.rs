@@ -861,9 +861,6 @@ where
 
 mod runtime {
     use super::*;
-    use crate::hooks::use_ide_selection::{
-        IdeSelection, ide_selection_reset, is_ide_mcp_server_name,
-    };
     use crate::services::mcp::sdk_control_transport::{
         SdkControlClientTransport, SendMcpMessageCallback,
     };
@@ -1051,14 +1048,13 @@ mod runtime {
         /// (`useManageMCPConnections.ts:333`), here on every registered
         /// connection, until `client.onclose = undefined` (`:809`) clears it.
         onclose: std::sync::atomic::AtomicBool,
-        /// Maps to: CC `useIdeSelection` registering `selection_changed`
-        /// handlers on the live ide client — the REPL-owned selection sender,
-        /// captured per connection (`Some` only for `name == "ide"`). Taken
-        /// when the connection leaves the registry, so the sender goes with
-        /// it however many clones of the handle remain (CC
-        /// useIdeSelection.ts:148 "No cleanup needed").
-        ide_selection_sink: std::sync::Mutex<Option<async_channel::Sender<IdeSelection>>>,
+        /// SDK `Client.setNotificationHandler`'s handlers, by method.
+        notification_handlers: std::sync::Mutex<HashMap<String, NotificationHandler>>,
     }
+
+    /// A handler [`McpClient::set_notification_handler`] registers: it gets
+    /// the notification's params.
+    type NotificationHandler = Arc<dyn Fn(Option<Value>) + Send + Sync>;
 
     impl McpClient {
         fn new(
@@ -1074,7 +1070,7 @@ mod runtime {
                 peer: Some(service.peer().clone()),
                 cancellation_token: std::sync::Mutex::new(Some(service.cancellation_token())),
                 onclose: std::sync::atomic::AtomicBool::new(true),
-                ide_selection_sink: std::sync::Mutex::new(None),
+                notification_handlers: std::sync::Mutex::new(HashMap::new()),
             }));
             let _ = service.service().client.set(Arc::downgrade(&client.0));
             client
@@ -1091,7 +1087,7 @@ mod runtime {
                 peer: None,
                 cancellation_token: std::sync::Mutex::new(None),
                 onclose: std::sync::atomic::AtomicBool::new(true),
-                ide_selection_sink: std::sync::Mutex::new(None),
+                notification_handlers: std::sync::Mutex::new(HashMap::new()),
             }))
         }
 
@@ -1162,28 +1158,28 @@ mod runtime {
             self.0.onclose.load(Ordering::SeqCst)
         }
 
-        fn ide_selection_sink(&self) -> Option<async_channel::Sender<IdeSelection>> {
+        /// Maps to: SDK `Client.setNotificationHandler(schema, handler)`
+        /// (`shared/protocol.js:905-911`): one handler per method, a later
+        /// one replacing the earlier.
+        pub(crate) fn set_notification_handler(
+            &self,
+            method: &str,
+            handler: impl Fn(Option<Value>) + Send + Sync + 'static,
+        ) {
             self.0
-                .ide_selection_sink
+                .notification_handlers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+                .insert(method.to_owned(), Arc::new(handler));
         }
 
-        fn set_ide_selection_sink(&self, sink: async_channel::Sender<IdeSelection>) {
-            *self
-                .0
-                .ide_selection_sink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
-        }
-
-        fn take_ide_selection_sink(&self) -> Option<async_channel::Sender<IdeSelection>> {
+        pub(super) fn notification_handler(&self, method: &str) -> Option<NotificationHandler> {
             self.0
-                .ide_selection_sink
+                .notification_handlers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
+                .get(method)
+                .cloned()
         }
     }
 
@@ -1252,11 +1248,9 @@ mod runtime {
     struct CometixMcpClientHandler {
         server_name: String,
         cwd: PathBuf,
-        /// Connection identity assigned by `replace_cached_client` once the
-        /// connection is cached. Backs the ide `selection_changed`
-        /// stale-identity guard (CC useIdeSelection.ts:115-117
-        /// `currentIDERef.current !== ideClient → return`): notifications from
-        /// a replaced/uncached connection never reach the REPL sink.
+        /// Set by `replace_cached_client` once the connection is registered;
+        /// only whether it is set matters, which [`Self::serving_client`]
+        /// asks.
         connection_id: Arc<OnceLock<u64>>,
         /// The connection this handler serves, set when its handle is made:
         /// CC's notification handlers close over the `client` they were
@@ -1542,44 +1536,6 @@ mod runtime {
             .is_some_and(|experimental| experimental.contains_key(capability))
     }
 
-    pub(super) async fn emit_ide_selection_event_from_custom_notification(
-        server_name: &str,
-        notification: &CustomNotification,
-        notifying_connection_id: Option<u64>,
-    ) -> bool {
-        // Maps to: CC `useIdeSelection` `SelectionChangedSchema` handler.
-        if !is_ide_mcp_server_name(server_name) {
-            return false;
-        }
-        if notification.method != crate::hooks::use_ide_selection::SELECTION_CHANGED_METHOD {
-            return false;
-        }
-        // Invalid / text-only payloads are consumed without an onSelect call
-        // (CC useIdeSelection.ts:124-138 gate).
-        let Some(selection) =
-            crate::hooks::use_ide_selection::ide_selection_from_notification_params(
-                notification.params.as_ref(),
-            )
-        else {
-            return true;
-        };
-        let sink = {
-            let clients = CONNECTED_CLIENTS.lock().unwrap();
-            clients.get(server_name).and_then(|client| {
-                // Maps to: CC useIdeSelection.ts:115-117 stale-identity guard —
-                // only the currently cached connection may deliver selections.
-                (Some(client.connection_id()) == notifying_connection_id)
-                    .then(|| client.ide_selection_sink())
-                    .flatten()
-            })
-        };
-        if let Some(sink) = sink {
-            // Maps to: CC `onSelect(selection)` — REPL's use_future drains this.
-            let _ = sink.try_send(selection);
-        }
-        true
-    }
-
     /// `peer_info` and `plugin_source` are the notifying connection's.
     pub(super) async fn emit_channel_message_event_from_custom_notification(
         server_name: String,
@@ -1837,7 +1793,14 @@ mod runtime {
             context: NotificationContext<RoleClient>,
         ) -> impl Future<Output = ()> + Send + '_ {
             let server_name = self.server_name.clone();
-            let notifying_connection_id = self.connection_id.get().copied();
+            // SDK `Protocol._onnotification`: the handler
+            // `setNotificationHandler` registered on this client for the
+            // method, if any.
+            let registered = self
+                .client
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .and_then(|client| McpClient(client).notification_handler(&notification.method));
             // CC `gateChannelServer(client.name, client.capabilities,
             // client.config.pluginSource)` (`useManageMCPConnections.ts:
             // 473-478`): the config of the client the handler closed over.
@@ -1854,13 +1817,8 @@ mod runtime {
                 ) {
                     return;
                 }
-                if emit_ide_selection_event_from_custom_notification(
-                    &server_name,
-                    &notification,
-                    notifying_connection_id,
-                )
-                .await
-                {
+                if let Some(handler) = registered {
+                    handler(notification.params);
                     return;
                 }
                 let peer_info = context.peer.peer_info();
@@ -3447,16 +3405,6 @@ mod runtime {
         None
     }
 
-    /// Maps to: CC useIdeSelection.ts:73-83 — the ide client leaving (or being
-    /// replaced in) the client set is an identity change, so the REPL selection
-    /// resets to the CC-shaped empty OBJECT before this connection's sink
-    /// clone is released as it leaves the registry.
-    pub(super) fn notify_ide_selection_identity_changed(
-        sink: &async_channel::Sender<IdeSelection>,
-    ) {
-        let _ = sink.try_send(ide_selection_reset());
-    }
-
     /// Watches `client`'s connection until it ends.
     ///
     /// CC's `onclose` fires on every close, `cleanup()` and an expired
@@ -3480,11 +3428,6 @@ mod runtime {
                 return;
             }
             delete_fetch_caches(client.name());
-            // Identity change ide → null: reset, then release the
-            // per-connection sink (CC ":148 no cleanup needed").
-            if let Some(sink) = client.take_ide_selection_sink() {
-                notify_ide_selection_identity_changed(&sink);
-            }
             if !client.has_onclose() {
                 return;
             }
@@ -3520,13 +3463,6 @@ mod runtime {
         memoized: bool,
     ) -> bool {
         let name = client.name().to_owned();
-        // Maps to: CC `useIdeSelection` registering its `selection_changed`
-        // handler on the (new) ide client: capture the REPL sink per
-        // connection, keyed by this connection's identity. Taken before the
-        // memo lock: the sink lives behind the connection-handler slot, whose
-        // holders enter the store, and the store's stale-client cleanup takes
-        // the memo lock.
-        let ide_selection_sink = ide_selection_sink_for_new_connection(&name);
         // Held through the registration, so a clear sees either the entry
         // with its connection registered or neither.
         let cache = memoized.then(connect_to_server_cache);
@@ -3542,26 +3478,12 @@ mod runtime {
         }
 
         let _ = service.service().connection_id.set(client.connection_id());
-        let previous = {
-            let mut clients = CONNECTED_CLIENTS.lock().unwrap();
-            // No reset send for the removal: replacing old → new is ONE
-            // identity change in CC (useIdeSelection.ts:73-83). Send it BEFORE
-            // attaching the sink to the entry, so no selection notification
-            // can land in between and be clobbered by the reset (CC orders the
-            // reset at useIdeSelection.ts:77 ahead of handler registration at
-            // :112).
-            let previous = clients.remove(&name);
-            if let Some(sink) = ide_selection_sink {
-                notify_ide_selection_identity_changed(&sink);
-                client.set_ide_selection_sink(sink);
-            }
-            clients.insert(name.clone(), client.clone());
-            previous
-        };
+        let previous = CONNECTED_CLIENTS
+            .lock()
+            .unwrap()
+            .insert(name.clone(), client.clone());
         drop(cache);
         if let Some(previous) = previous {
-            // The new connection's sink carried the identity change.
-            drop(previous.take_ide_selection_sink());
             previous.cancel();
             delete_fetch_caches(&name);
         }
@@ -3585,9 +3507,6 @@ mod runtime {
     fn close_registered_client(client: &McpClient) -> bool {
         if !remove_registered_client(client) {
             return false;
-        }
-        if let Some(sink) = client.take_ide_selection_sink() {
-            notify_ide_selection_identity_changed(&sink);
         }
         client.cancel();
         true
@@ -3633,47 +3552,6 @@ mod runtime {
         handle.spawn(async move {
             if let McpServerConnection::Connected(connected) = connection.await {
                 cleanup_connection(&connected.client);
-            }
-        });
-    }
-
-    /// The REPL selection sender a newly cached connection captures — `Some`
-    /// only for the strict CC ide client name gate (utils/ide.ts:1251).
-    pub(super) fn ide_selection_sink_for_new_connection(
-        name: &str,
-    ) -> Option<async_channel::Sender<IdeSelection>> {
-        if !is_ide_mcp_server_name(name) {
-            return None;
-        }
-        crate::services::mcp::use_manage_mcp_connections::current_ide_selection_sink()
-    }
-
-    /// Maps to: CC `useIdeSelection(mcp.clients, setIDESelection)`
-    /// (useIdeSelection.ts:59-150). The REPL registers its selection sender
-    /// once; the registry clones it into the live "ide" connection (if any)
-    /// and into every future one via `replace_cached_client`. Registering onto
-    /// an already-connected ide client is the CC first-effect identity change
-    /// (null → client, useIdeSelection.ts:73-83) and therefore resets.
-    pub fn register_ide_selection_sink(sink: async_channel::Sender<IdeSelection>) {
-        crate::services::mcp::use_manage_mcp_connections::set_ide_selection_sink(sink.clone());
-        // A3 audit (PORTING.md § "Node-async → tokio"): the caller is the REPL render
-        // side (repl.rs), where the ambient runtime IS the process runtime, so
-        // the old `try_current()` was accidentally correct. Use the explicit
-        // detach handle anyway per the A3 rule — the attach must survive
-        // whatever context a future caller runs in. Outside any runtime
-        // (component unit tests) there are no cached connections to attach to.
-        let Some(handle) = crate::utils::process_runtime::runtime_handle_for_detached_work() else {
-            return;
-        };
-        handle.spawn(async move {
-            let clients = CONNECTED_CLIENTS.lock().unwrap();
-            if let Some((_, entry)) = clients
-                .iter()
-                .find(|(name, _)| is_ide_mcp_server_name(name))
-            {
-                entry.set_ide_selection_sink(sink.clone());
-                drop(clients);
-                notify_ide_selection_identity_changed(&sink);
             }
         });
     }
@@ -4405,7 +4283,7 @@ pub use runtime::{
     ensure_connected_client, fetch_resources_for_client, fetch_tools_for_client,
     get_mcp_prompt_for_command, get_mcp_tools_commands_and_resources, read_mcp_resource,
     reconnect_mcp_server_impl, refresh_mcp_prompts_for_client, refresh_mcp_resources_for_client,
-    refresh_mcp_tools_for_client, register_ide_selection_sink, setup_sdk_mcp_clients,
+    refresh_mcp_tools_for_client, setup_sdk_mcp_clients,
 };
 
 /// A stdio MCP server for the connection and fetch caches. It appends each
@@ -5009,64 +4887,150 @@ mod tests {
         .expect("completion observers must not await blocked peer servers");
     }
 
-    /// Maps to: CC useIdeSelection.ts:73-83 — a new/changed ide client
-    /// identity delivers the CC-shaped reset OBJECT through the REPL sink
-    /// captured from the connection-manage registry. Non-ide names never
-    /// capture a sink (strict `name === 'ide'` gate, utils/ide.ts:1251).
+    /// CC `useIdeSelection` (`useIdeSelection.ts:59-150`): the IDE client
+    /// appearing resets the selection and gets a `selection_changed` handler
+    /// that delivers to `onSelect`; a handler whose client is no longer the
+    /// current one is ignored, and every change of client resets again.
     #[test]
-    fn ide_identity_change_sends_official_reset_object_through_registered_sink() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (tx, rx) = async_channel::unbounded();
-        crate::services::mcp::use_manage_mcp_connections::set_ide_selection_sink(tx);
-        let sink = runtime::ide_selection_sink_for_new_connection("ide")
-            .expect("ide connections capture the registered REPL sink");
-        assert!(runtime::ide_selection_sink_for_new_connection("docs").is_none());
-        assert!(runtime::ide_selection_sink_for_new_connection("IDE").is_none());
-        runtime::notify_ide_selection_identity_changed(&sink);
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            crate::hooks::use_ide_selection::ide_selection_reset()
-        );
+    fn ide_selection_handler_follows_the_current_ide_client() {
+        use crate::hooks::use_ide_selection::{
+            IdeSelection, SELECTION_CHANGED_METHOD, ide_selection_reset, run_ide_selection_effect,
+        };
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let script_path = std::env::temp_dir().join(format!(
+            "cometix-mcp-ide-selection-{}.mjs",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &script_path,
+            r#"
+import readline from 'node:readline'
+const rl = readline.createInterface({ input: process.stdin })
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + '\n')
+}
+rl.on('line', line => {
+  let message
+  try { message = JSON.parse(line) } catch { return }
+  if (message.method === 'fixture/emit') {
+    send({
+      jsonrpc: '2.0',
+      method: 'selection_changed',
+      params: {
+        selection: { start: { line: 1, character: 0 }, end: { line: 2, character: 3 } },
+        text: 'ab',
+        filePath: '/repo/a.rs'
+      }
+    })
+    return
+  }
+  if (message.id === undefined) return
+  if (message.method === 'initialize') {
+    send({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        protocolVersion: '2025-11-25',
+        capabilities: {},
+        serverInfo: { name: 'ide-fixture', version: '1.0.0' }
+      }
+    })
+  } else {
+    send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'method not found' } })
+  }
+})
+"#,
+        )
+        .expect("write MCP fixture");
+
+        block_on_with_process_runtime(async {
+            let mut config = ScopedMcpServerConfig::stdio_for_test("node");
+            config.args = vec![script_path.to_string_lossy().to_string()];
+            let ide = runtime::connect_to_server("ide", &config).await;
+            let ide = ide.as_connected().expect("a connected IDE").client.clone();
+            let selection = IdeSelection {
+                file_path: Some("/repo/a.rs".to_string()),
+                text: Some("ab".to_string()),
+                line_count: 2,
+                line_start: Some(1),
+            };
+            let params = serde_json::json!({
+                "selection": { "start": { "line": 1, "character": 0 }, "end": { "line": 2, "character": 3 } },
+                "text": "ab",
+                "filePath": "/repo/a.rs"
+            });
+            let current = Default::default();
+            let (on_select, selected) = async_channel::unbounded();
+
+            // No IDE, then none again: no change.
+            run_ide_selection_effect(&current, None, &on_select);
+            assert!(selected.try_recv().is_err());
+
+            // The IDE appears: reset, and its handler delivers.
+            run_ide_selection_effect(&current, Some(ide.clone()), &on_select);
+            assert_eq!(selected.try_recv().unwrap(), ide_selection_reset());
+            ide.notification("fixture/emit", serde_json::json!({}))
+                .await
+                .expect("the fixture is told to notify");
+            let delivered =
+                tokio::time::timeout(std::time::Duration::from_secs(5), selected.recv())
+                    .await
+                    .expect("the selection is delivered")
+                    .unwrap();
+            assert_eq!(delivered, selection);
+
+            // The IDE leaves: reset, and its handler is ignored from now on.
+            run_ide_selection_effect(&current, None, &on_select);
+            assert_eq!(selected.try_recv().unwrap(), ide_selection_reset());
+            let first_handler = ide
+                .notification_handler(SELECTION_CHANGED_METHOD)
+                .expect("the handler stays registered");
+            first_handler(Some(params.clone()));
+            assert!(selected.try_recv().is_err());
+
+            // Another IDE: reset; its handler delivers, the first's does not.
+            let other = McpClient::detached_for_test("ide", &config);
+            run_ide_selection_effect(&current, Some(other.clone()), &on_select);
+            assert_eq!(selected.try_recv().unwrap(), ide_selection_reset());
+            first_handler(Some(params.clone()));
+            assert!(selected.try_recv().is_err());
+            other
+                .notification_handler(SELECTION_CHANGED_METHOD)
+                .expect("the new IDE's handler")(Some(params));
+            assert_eq!(selected.try_recv().unwrap(), selection);
+
+            runtime::clear_server_cache("ide", None).await;
+        });
+        let _ = std::fs::remove_file(script_path);
     }
 
-    /// Per-connection sink lifecycle (CC useIdeSelection.ts:148 "No cleanup
-    /// needed"): a connection's sender is a clone of the registered one, so
-    /// releasing it — with the identity-change reset — leaves the
-    /// registry-held sender serving future ide connections. The handle-level
-    /// release is `ide_selection_sink_is_released_when_the_connection_closes`.
+    /// SDK `setNotificationHandler` (`shared/protocol.js:905-911`) keeps one
+    /// handler per method, the later replacing the earlier: a remounted
+    /// REPL's effect registers on the same IDE client, and only its channel
+    /// receives the selections.
     #[test]
-    fn per_connection_ide_sink_drop_releases_only_that_connections_sender() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (tx, rx) = async_channel::unbounded::<crate::hooks::use_ide_selection::IdeSelection>();
-        crate::services::mcp::use_manage_mcp_connections::set_ide_selection_sink(tx.clone());
-        drop(tx);
-        let entry_sink = runtime::ide_selection_sink_for_new_connection("ide")
-            .expect("ide connections capture the registered REPL sink");
-        assert_eq!(
-            rx.sender_count(),
-            2,
-            "registry sender + per-connection clone"
-        );
-        // A connection leaving the registry: reset, then release.
-        runtime::notify_ide_selection_identity_changed(&entry_sink);
-        drop(entry_sink);
-        assert_eq!(
-            rx.sender_count(),
-            1,
-            "registry sender persists for future connections"
-        );
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            crate::hooks::use_ide_selection::ide_selection_reset()
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "no further deliveries after the connection's sink is released"
-        );
+    fn a_later_notification_handler_replaces_the_earlier() {
+        use crate::hooks::use_ide_selection::{
+            SELECTION_CHANGED_METHOD, ide_selection_reset, run_ide_selection_effect,
+        };
+        let ide =
+            McpClient::detached_for_test("ide", &ScopedMcpServerConfig::stdio_for_test("ide"));
+        let params = serde_json::json!({
+            "selection": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 2 } },
+            "text": "ab"
+        });
+
+        let (first_select, first_selected) = async_channel::unbounded();
+        run_ide_selection_effect(&Default::default(), Some(ide.clone()), &first_select);
+        let (second_select, second_selected) = async_channel::unbounded();
+        run_ide_selection_effect(&Default::default(), Some(ide.clone()), &second_select);
+        assert_eq!(first_selected.try_recv().unwrap(), ide_selection_reset());
+        assert_eq!(second_selected.try_recv().unwrap(), ide_selection_reset());
+
+        ide.notification_handler(SELECTION_CHANGED_METHOD)
+            .expect("a handler")(Some(params));
+        assert!(first_selected.try_recv().is_err());
+        assert_eq!(second_selected.try_recv().unwrap().line_count, 1);
     }
 
     fn spawn_count_tokens_server(
@@ -6851,43 +6815,6 @@ rl.on('line', line => {
         );
     }
 
-    /// The ide connection's selection sender goes when the connection leaves
-    /// the registry, with the identity-change reset, not when the last clone
-    /// of its handle drops: the close watcher still holds one then.
-    #[test]
-    fn ide_selection_sink_is_released_when_the_connection_closes() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let fixture = counting_fixture::CountingFixture::new();
-        block_on_with_process_runtime(async {
-            const SERVER: &str = "ide";
-            let (tx, rx) =
-                async_channel::unbounded::<crate::hooks::use_ide_selection::IdeSelection>();
-            crate::services::mcp::use_manage_mcp_connections::set_ide_selection_sink(tx);
-            let config = fixture.config(&[]);
-            let connected = runtime::connect_to_server(SERVER, &config).await;
-            assert_eq!(
-                connected.connection_type(),
-                McpServerConnectionType::Connected,
-                "{connected:?}"
-            );
-            assert_eq!(rx.sender_count(), 2, "registry sender + the connection's");
-            assert_eq!(
-                rx.try_recv().unwrap(),
-                crate::hooks::use_ide_selection::ide_selection_reset(),
-                "null → client is an identity change"
-            );
-
-            runtime::clear_server_cache(SERVER, None).await;
-            assert_eq!(rx.sender_count(), 1);
-            assert_eq!(
-                rx.try_recv().unwrap(),
-                crate::hooks::use_ide_selection::ide_selection_reset(),
-                "client → null is an identity change"
-            );
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
-        });
-    }
-
     /// CC's `Client.connect` sends `initialize` at the SDK's
     /// `LATEST_PROTOCOL_VERSION`, 2025-11-25. rmcp's own default is the
     /// 2026-07-28 draft, which has no `initialize` handshake.
@@ -7354,44 +7281,6 @@ rl.on('line', line => {
                 .await;
             runtime::fetch_tools_for_client(&second).await;
             assert_eq!(fixture.count("tools/list"), 2);
-
-            runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
-        });
-    }
-
-    /// Replacing the ide connection is ONE identity change
-    /// (useIdeSelection.ts:73-83): the new connection resets the selection,
-    /// and the replaced one's sender is released without a second reset.
-    #[test]
-    fn replacing_the_ide_connection_releases_the_previous_sink_with_one_reset() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let fixture = counting_fixture::CountingFixture::new();
-        block_on_with_process_runtime(async {
-            const SERVER: &str = "ide";
-            let (tx, rx) =
-                async_channel::unbounded::<crate::hooks::use_ide_selection::IdeSelection>();
-            crate::services::mcp::use_manage_mcp_connections::set_ide_selection_sink(tx);
-            let reset = crate::hooks::use_ide_selection::ide_selection_reset();
-
-            let first = runtime::connect_to_server(SERVER, &fixture.config(&[])).await;
-            assert_eq!(first.connection_type(), McpServerConnectionType::Connected);
-            assert_eq!(rx.try_recv().unwrap(), reset, "null → first");
-
-            let second =
-                runtime::connect_to_server(SERVER, &fixture.config(&["another-config"])).await;
-            assert_eq!(second.connection_type(), McpServerConnectionType::Connected);
-            assert_eq!(registered_connection_id(SERVER), connection_id(&second));
-            assert_eq!(
-                rx.sender_count(),
-                2,
-                "registry sender + the second connection's"
-            );
-            assert_eq!(rx.try_recv().unwrap(), reset, "first → second");
-            assert!(
-                rx.try_recv().is_err(),
-                "the replaced connection sends no reset"
-            );
 
             runtime::clear_server_cache(SERVER, None).await;
             let _ = runtime::drain_mcp_connection_callback_observations().await;
