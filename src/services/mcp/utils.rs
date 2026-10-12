@@ -905,15 +905,14 @@ mod tests {
         assert_eq!(ProjectMcpServerStatus::Pending.as_str(), "pending");
     }
 
+    /// An MCP prompt command renamed to `name`, so a test can name it outside
+    /// the `mcp__<server>__<prompt>` form.
     fn mcp_prompt_command(name: &str) -> Command {
-        Command::from_mcp_prompt(crate::services::mcp::client::McpPromptCommandSnapshot {
-            name: name.to_string(),
-            description: String::new(),
-            has_user_specified_description: false,
-            user_facing_name: name.to_string(),
-            arg_names: Vec::new(),
-            source: "mcp",
-        })
+        let mut command =
+            crate::services::mcp::client::mcp_command_for_test("server", "prompt", None, &[]);
+        command.name = name.to_string().into();
+        command.user_facing_name = Some(name.to_string().into());
+        command
     }
 
     fn server_resource(server: &str, uri: &str) -> ServerResource {

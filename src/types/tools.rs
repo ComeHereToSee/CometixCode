@@ -107,8 +107,13 @@ pub struct McpToolInfo {
 }
 
 /// What an MCP tool's `call` closes over instead of being looked up by name.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub enum McpToolConnection {
+    /// The connected server the tool was fetched from: `fetchToolsForClient`'s
+    /// per-tool closures capture `client` (`services/mcp/client.ts:1767-1988`)
+    /// and call through `ensureConnectedClient(client)`. Shared by every tool
+    /// of one fetch.
+    Connected(std::sync::Arc<crate::services::mcp::types::ConnectedMcpServer>),
     /// `createMcpAuthTool(serverName, config)`'s capture
     /// (`tools/McpAuthTool/McpAuthTool.ts:49-52`): its `call` starts the
     /// server's OAuth flow whatever the client's status is now.
@@ -116,6 +121,42 @@ pub enum McpToolConnection {
         server_name: String,
         config: crate::services::mcp::types::ScopedMcpServerConfig,
     },
+}
+
+/// A captured connection is the same one only if it is the same capture, as
+/// JS compares the closed-over object by reference.
+impl PartialEq for McpToolConnection {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Connected(a), Self::Connected(b)) => std::sync::Arc::ptr_eq(a, b),
+            (
+                Self::Authenticate {
+                    server_name: a_name,
+                    config: a_config,
+                },
+                Self::Authenticate {
+                    server_name: b_name,
+                    config: b_config,
+                },
+            ) => a_name == b_name && a_config == b_config,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for McpToolConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connected(server) => f
+                .debug_tuple("Connected")
+                .field(&server.name)
+                .field(&server.client)
+                .finish(),
+            Self::Authenticate { server_name, .. } => {
+                f.debug_tuple("Authenticate").field(server_name).finish()
+            }
+        }
+    }
 }
 
 /// The server tool's MCP `annotations`, which the per-tool closures of CC's

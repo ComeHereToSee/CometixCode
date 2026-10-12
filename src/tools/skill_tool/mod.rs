@@ -1374,25 +1374,21 @@ mod tests {
     fn plain_mcp_prompts_are_not_skills() {
         use crate::tool::ToolCall as _;
         let _env_guard = TEST_ENV_LOCK.lock().unwrap();
-        let prompt = |name: &str| {
-            crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: name.to_string(),
-                    description: "Summarize docs".to_string(),
-                    has_user_specified_description: true,
-                    user_facing_name: "docs:summarize (MCP)".to_string(),
-                    arg_names: vec!["path".to_string()],
-                    source: "mcp",
-                },
+        let prompt = |prompt_name: &str| {
+            crate::services::mcp::client::mcp_command_for_test(
+                "docs",
+                prompt_name,
+                Some("Summarize docs"),
+                &["path"],
             )
         };
-        let mut skill = prompt("mcp__docs__skill");
+        let mut skill = prompt("skill");
         skill.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
         let mut context = crate::tool::ToolUseContext::default();
         context
             .mcp_state
             .commands
-            .extend([prompt("mcp__docs__summarize"), skill]);
+            .extend([prompt("summarize"), skill]);
 
         let catalog = get_all_commands(&context);
         assert!(

@@ -1874,34 +1874,29 @@ async fn dynamic_mcp_tool_result(
     request: &PermissionRequest,
     context: &crate::tool::ToolUseContext,
 ) -> Option<RenderableMessage> {
-    // CC `createMcpAuthTool`'s `call` (`McpAuthTool.ts:85-206`): the tool
-    // carries its server and config, and runs OAuth whatever the client's
-    // status is now.
-    if let Some(crate::types::tools::McpToolConnection::Authenticate {
-        server_name,
-        config,
-    }) = context
-        .mcp_state
-        .tools
-        .iter()
-        .find(|tool| tool.is_mcp && tool.name == request.tool_name)
-        .and_then(|tool| tool.mcp_connection.as_ref())
-    {
-        let tool = crate::tools::mcp_auth_tool::create_mcp_auth_tool(server_name, config);
-        let output = tool.call(context).await;
-        return Some(tool.map_tool_result_to_tool_result_block_param(request, output));
-    }
+    // CC `findToolByName(toolUseContext.options.tools, name)`
+    // (`toolExecution.ts:345`): the tool comes from the turn's tool pool, and
+    // its `call` uses what it closed over.
+    let tool = crate::types::tools::find_tool_by_name(&context.tools, &request.tool_name)?;
+    let client = match tool.mcp_connection.as_ref()? {
+        // CC `createMcpAuthTool`'s `call` (`McpAuthTool.ts:85-206`): the
+        // tool carries its server and config, and runs OAuth whatever the
+        // client's status is now.
+        crate::types::tools::McpToolConnection::Authenticate {
+            server_name,
+            config,
+        } => {
+            let tool = crate::tools::mcp_auth_tool::create_mcp_auth_tool(server_name, config);
+            let output = tool.call(context).await;
+            return Some(tool.map_tool_result_to_tool_result_block_param(request, output));
+        }
+        crate::types::tools::McpToolConnection::Connected(client) => client.clone(),
+    };
     // Maps to: CC dynamic MCP Tool.call created by
-    // `services/mcp/client.ts#fetchToolsForClient`.
-    let (server_name, tool_name) = crate::services::mcp::client::resolve_mcp_tool_invocation(
-        &request.tool_name,
-        &context.mcp_state,
-    )?;
-    let server = context
-        .mcp_state
-        .clients
-        .iter()
-        .find(|server| server.name() == server_name);
+    // `services/mcp/client.ts#fetchToolsForClient`: `client` is the
+    // connection the tool was fetched from, `tool.name` the server's own.
+    let server_name = client.name.clone();
+    let tool_name = tool.mcp_info.as_ref()?.tool_name.clone();
     let args = match parse_request_input(request) {
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),
@@ -1909,25 +1904,16 @@ async fn dynamic_mcp_tool_result(
     let meta = Some(crate::services::mcp::client::mcp_tool_use_id_meta(
         &request.tool_use_id,
     ));
-    let Some(server) = server else {
-        return Some(tool_error_result(
-            request,
-            format!(
-                "<tool_use_error>Error: MCP server \"{server_name}\" is not connected</tool_use_error>"
-            ),
-        ));
-    };
     // Maps to: CC `client.ts:1858-1922`: each attempt calls over
     // `ensureConnectedClient(client)`; an expired session has cleared the
     // connection, and the call is retried once on a fresh one.
     const MAX_SESSION_RETRIES: usize = 1;
     let mut attempt = 0;
     let call_result = loop {
-        let result = match crate::services::mcp::client::ensure_connected_client(server).await {
+        let result = match crate::services::mcp::client::ensure_connected_client(&client).await {
             Ok(connected) => {
                 crate::services::mcp::client::call_mcp_tool_with_elicitation(
-                    &server_name,
-                    Some(connected.client.connection_id()),
+                    &connected.client,
                     &tool_name,
                     args.clone(),
                     meta.clone(),
@@ -10130,7 +10116,8 @@ impl LocalToolExecutor {
                     // Maps to: CC dynamic MCP tools returned from
                     // `fetchToolsForClient(...)`: they are not part of the
                     // static built-in registry, but still execute in the normal
-                    // tool-execution flow using the live MCP AppState snapshot.
+                    // tool-execution flow, found in the turn's tool pool and
+                    // called through the connection they carry.
                     None => {
                         if let Some(message) = dynamic_mcp_tool_result(request, context).await {
                             LocalToolExecutionMessageResult {
@@ -10139,8 +10126,8 @@ impl LocalToolExecutor {
                             }
                         } else {
                             // Maps to: CC `runToolUse` unknown-tool handling —
-                            // a name absent from both the registry and dynamic
-                            // MCP state is not a tool.
+                            // a name in neither the registry nor the turn's
+                            // tool pool is not a tool.
                             LocalToolExecutionMessageResult {
                                 message: Some(tool_error_result(
                                     request,
@@ -10430,8 +10417,7 @@ rl.on('line', line => {
                     serde_json::json!({"query": "docs"}),
                     PermissionMode::Default,
                 );
-                let context = crate::tool::ToolUseContext::default()
-                    .with_mcp_state(mcp_state_after_attempt(discovery));
+                let context = context_after_attempt(discovery);
 
                 let message = LocalToolExecutor
                     .result_after_permission(
@@ -10471,8 +10457,8 @@ rl.on('line', line => {
         let _ = std::fs::remove_file(script_path);
     }
 
-    /// A tool request for `server`'s `tool`, with the server's discovered
-    /// snapshot as the only client in the context.
+    /// A tool request for `server`'s `tool`, in a turn whose context holds
+    /// only that server's connection attempt.
     fn dynamic_mcp_tool_call(
         discovery: crate::services::mcp::client::McpConnectionDiscovery,
         tool: &str,
@@ -10489,9 +10475,7 @@ rl.on('line', line => {
             serde_json::json!({}),
             PermissionMode::Default,
         );
-        let context = crate::tool::ToolUseContext::default()
-            .with_mcp_state(mcp_state_after_attempt(discovery));
-        (request, context)
+        (request, context_after_attempt(discovery))
     }
 
     /// `AppState.mcp` after one connection attempt went through the flush.
@@ -10503,6 +10487,19 @@ rl.on('line', line => {
             &mut state, discovery,
         );
         state
+    }
+
+    /// A turn's context after one connection attempt went through the
+    /// flush: `AppState.mcp`, and a tool pool holding the server's tools, as
+    /// CC's `options.tools` does — the pool the call finds its tool in
+    /// (`toolExecution.ts:345`).
+    fn context_after_attempt(
+        discovery: crate::services::mcp::client::McpConnectionDiscovery,
+    ) -> crate::tool::ToolUseContext {
+        let state = mcp_state_after_attempt(discovery);
+        crate::tool::ToolUseContext::default()
+            .with_tools(state.tools.clone())
+            .with_mcp_state(state)
     }
 
     /// CC's MCP tool `call` gets its client from `ensureConnectedClient`
@@ -10691,6 +10688,154 @@ rl.on('line', line => {
                 crate::services::mcp::client::clear_server_cache(SERVER, None).await;
                 let _ = crate::services::mcp::client::drain_mcp_connection_callback_observations()
                     .await;
+            });
+    }
+
+    /// CC takes the tool from the turn's pool (`findToolByName(
+    /// toolUseContext.options.tools, name)`, `toolExecution.ts:345`), and its
+    /// `call` uses the client it closed over; `mcp.clients` and `mcp.tools`
+    /// are never consulted. A pool tool calls out with no server record in
+    /// the context, and an `mcp.tools` entry missing from the pool is no
+    /// tool at all.
+    #[test]
+    fn dynamic_mcp_tool_dispatches_from_the_tool_pool_not_the_mcp_state() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::services::mcp::client::session_http_fixture::{
+                    SESSION_NOT_FOUND, SessionHttpFixture,
+                };
+                let fixture = SessionHttpFixture::spawn(|_, _| false, SESSION_NOT_FOUND).await;
+                const SERVER: &str = "tool-pool-http-fixture";
+                let config = fixture.config();
+                let discovery =
+                    crate::services::mcp::client::reconnect_mcp_server_impl(SERVER, &config).await;
+                let (request, context) = dynamic_mcp_tool_call(discovery, "lookup");
+                async fn call(
+                    request: &PermissionRequest,
+                    context: &crate::tool::ToolUseContext,
+                ) -> crate::types::message::ToolResult {
+                    let message = LocalToolExecutor
+                        .result_after_permission(
+                            request,
+                            PermissionPromptChoice::AllowOnce,
+                            context,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("dynamic MCP tool should produce a result");
+                    user_tool_result_block(&message)
+                        .expect("a tool result")
+                        .clone()
+                }
+
+                // The tool pool only: `mcp.clients` and `mcp.tools` are empty.
+                let pool_only = crate::tool::ToolUseContext::default().with_tools(context.tools);
+                assert!(pool_only.mcp_state.clients.is_empty());
+                assert!(pool_only.mcp_state.tools.is_empty());
+                let block = call(&request, &pool_only).await;
+                assert_eq!(
+                    block.derived_status(),
+                    ToolResultStatus::Success,
+                    "{}",
+                    block.content
+                );
+                assert_eq!(block.content, "ok:s1");
+
+                // `AppState.mcp` only: the tool is not in the pool.
+                let state_only =
+                    crate::tool::ToolUseContext::default().with_mcp_state(context.mcp_state);
+                let block = call(&request, &state_only).await;
+                assert_eq!(block.derived_status(), ToolResultStatus::Error);
+                assert_eq!(
+                    block.content,
+                    format!(
+                        "<tool_use_error>Error: No such tool available: {}</tool_use_error>",
+                        request.tool_name
+                    )
+                );
+                assert_eq!(fixture.log(), ["initialize s1", "tools/call s1"]);
+
+                crate::services::mcp::client::clear_server_cache(SERVER, None).await;
+                let _ = crate::services::mcp::client::drain_mcp_connection_callback_observations()
+                    .await;
+            });
+    }
+
+    /// CC's needs-auth pseudo-tool is a pool tool like any other: the
+    /// needs-auth result carries `createMcpAuthTool(name, config)`
+    /// (`client.ts:2312-2333`), and its `call` uses the server and config it
+    /// closed over (`McpAuthTool.ts:85-206`). It answers with no server
+    /// record in the context; a stdio config is answered without OAuth
+    /// (`:97-108`).
+    #[test]
+    fn mcp_auth_pseudo_tool_dispatches_from_the_tool_pool_not_the_mcp_state() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                const SERVER: &str = "needs-auth-stdio";
+                let discovery = crate::services::mcp::client::McpConnectionDiscovery::needs_auth(
+                    SERVER,
+                    &crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("unused"),
+                );
+                let (request, context) = dynamic_mcp_tool_call(discovery, "authenticate");
+                async fn call(
+                    request: &PermissionRequest,
+                    context: &crate::tool::ToolUseContext,
+                ) -> crate::types::message::ToolResult {
+                    let message = LocalToolExecutor
+                        .result_after_permission(
+                            request,
+                            PermissionPromptChoice::AllowOnce,
+                            context,
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect("the auth pseudo-tool should produce a result");
+                    user_tool_result_block(&message)
+                        .expect("a tool result")
+                        .clone()
+                }
+
+                // The tool pool only: `mcp.clients` and `mcp.tools` are empty.
+                let pool_only = crate::tool::ToolUseContext::default().with_tools(context.tools);
+                assert!(pool_only.mcp_state.clients.is_empty());
+                assert!(pool_only.mcp_state.tools.is_empty());
+                let block = call(&request, &pool_only).await;
+                let message = format!(
+                    "Server \"{SERVER}\" uses stdio transport which does not support OAuth from this tool. Ask the user to run /mcp and authenticate manually."
+                );
+                assert_eq!(block.derived_status(), ToolResultStatus::Success);
+                assert_eq!(block.content, message);
+                assert_eq!(
+                    block.tool_use_result,
+                    Some(serde_json::json!({ "status": "unsupported", "message": message }))
+                );
+
+                // `AppState.mcp` only: the tool is not in the pool.
+                let state_only =
+                    crate::tool::ToolUseContext::default().with_mcp_state(context.mcp_state);
+                let block = call(&request, &state_only).await;
+                assert_eq!(block.derived_status(), ToolResultStatus::Error);
+                assert_eq!(
+                    block.content,
+                    format!(
+                        "<tool_use_error>Error: No such tool available: {}</tool_use_error>",
+                        request.tool_name
+                    )
+                );
             });
     }
 

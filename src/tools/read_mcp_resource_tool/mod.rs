@@ -208,14 +208,10 @@ pub(crate) async fn read_mcp_resource_output(
     }
 
     // CC `ensureConnectedClient(client)` (:94), then the read over it.
-    let connected = crate::services::mcp::client::ensure_connected_client(client)
+    let connected = crate::services::mcp::client::ensure_connected_client(connected)
         .await
         .map_err(|error| error.to_string())?;
-    crate::services::mcp::client::read_mcp_resource(
-        server,
-        Some(connected.client.connection_id()),
-        uri,
-    )
+    crate::services::mcp::client::read_mcp_resource(&connected.client, uri)
         .await
         .map(|value| read_mcp_resource_result_from_value(server, value))
         .map_err(|error| error.to_string())

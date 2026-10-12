@@ -95,29 +95,26 @@ pub(crate) async fn list_mcp_resources_output(
             .clients
             .iter()
             .filter(|server| target_server.is_none_or(|target| target == server.name()))
-            .filter(|server| {
-                server.connection_type()
-                    == crate::services::mcp::types::McpServerConnectionType::Connected
-            })
+            .filter_map(|server| server.as_connected())
             .map(|server| async move {
                 match crate::services::mcp::client::ensure_connected_client(server).await {
                     Ok(fresh) => crate::services::mcp::client::fetch_resources_for_client(
                         &crate::services::mcp::types::McpServerConnection::Connected(fresh),
                     )
                     .await
-                        .into_iter()
-                        .map(|resource| McpResource {
-                            uri: resource.uri,
-                            name: resource.name,
-                            mime_type: resource.mime_type,
-                            description: resource.description,
-                            server: server.name().to_owned(),
-                        })
-                        .collect(),
+                    .into_iter()
+                    .map(|resource| McpResource {
+                        uri: resource.uri,
+                        name: resource.name,
+                        mime_type: resource.mime_type,
+                        description: resource.description,
+                        server: server.name.clone(),
+                    })
+                    .collect(),
                     // One server's reconnect failure doesn't sink the whole
                     // result.
                     Err(error) => {
-                        tracing::warn!(server = %server.name(), error = %error, "failed to reconnect MCP server for ListMcpResourcesTool");
+                        tracing::warn!(server = %server.name, error = %error, "failed to reconnect MCP server for ListMcpResourcesTool");
                         Vec::new()
                     }
                 }

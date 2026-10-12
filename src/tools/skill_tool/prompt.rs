@@ -163,15 +163,11 @@ mod tests {
     use super::*;
 
     fn command(description: &str) -> crate::commands::Command {
-        crate::commands::Command::from_mcp_prompt(
-            crate::services::mcp::client::McpPromptCommandSnapshot {
-                name: "fixture-skill".to_string(),
-                description: description.to_string(),
-                has_user_specified_description: true,
-                user_facing_name: "fixture-skill".to_string(),
-                arg_names: Vec::new(),
-                source: "fixture",
-            },
+        crate::services::mcp::client::mcp_command_for_test(
+            "fixture",
+            "skill",
+            Some(description),
+            &[],
         )
     }
 

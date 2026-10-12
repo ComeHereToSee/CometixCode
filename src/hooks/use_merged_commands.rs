@@ -140,15 +140,11 @@ mod tests {
     fn merge_order_and_local_name_precedence_match_official_uniq_by() {
         let local = crate::commands::declared_commands_for_tests();
         let duplicate = local[0].clone();
-        let dynamic = crate::commands::Command::from_mcp_prompt(
-            crate::services::mcp::client::McpPromptCommandSnapshot {
-                name: "mcp__docs__summarize".to_string(),
-                description: "Summarize docs".to_string(),
-                has_user_specified_description: true,
-                user_facing_name: "docs:summarize (MCP)".to_string(),
-                arg_names: Vec::new(),
-                source: "mcp",
-            },
+        let dynamic = crate::services::mcp::client::mcp_command_for_test(
+            "docs",
+            "summarize",
+            Some("Summarize docs"),
+            &[],
         );
 
         let merged = merge_commands(Arc::new(local.clone()), &[duplicate, dynamic]);

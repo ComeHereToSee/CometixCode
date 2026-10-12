@@ -3752,27 +3752,19 @@ mod tests {
             system.exit();
         }
         let initial = hooks.use_const(|| {
-            Arc::new(vec![crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: "mcp__old__prompt".to_string(),
-                    description: "Old prompt".to_string(),
-                    has_user_specified_description: true,
-                    user_facing_name: "old:prompt (MCP)".to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
+            Arc::new(vec![crate::services::mcp::client::mcp_command_for_test(
+                "old",
+                "prompt",
+                Some("Old prompt"),
+                &[],
             )])
         });
         let updated = hooks.use_const(|| {
-            Arc::new(vec![crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: "mcp__new__prompt".to_string(),
-                    description: "New prompt".to_string(),
-                    has_user_specified_description: true,
-                    user_facing_name: "new:prompt (MCP)".to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
+            Arc::new(vec![crate::services::mcp::client::mcp_command_for_test(
+                "new",
+                "prompt",
+                Some("New prompt"),
+                &[],
             )])
         });
         let commands = if use_updated { updated } else { initial };

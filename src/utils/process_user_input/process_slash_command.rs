@@ -9,7 +9,6 @@ use super::ProcessUserInputBaseResult;
 use crate::commands::{self, Command, CommandKind};
 use crate::constants::product;
 use crate::constants::query_source::QuerySource;
-use crate::services::mcp::client::McpPromptCommandSnapshot;
 use crate::types::message::{
     RenderableMessage, RenderableMessageKind, SystemMessage, SystemMessageLevel, UserContent,
 };
@@ -262,7 +261,7 @@ fn prompt_command_message(id: String, command: &str, args: &str) -> RenderableMe
 /// content blocks for the model turn.
 pub fn mcp_prompt_slash_command_result(
     uuid: Option<String>,
-    command: &McpPromptCommandSnapshot,
+    command: &Command,
     submitted_args: &str,
     content_blocks: &[Value],
 ) -> ProcessUserInputBaseResult {
@@ -291,7 +290,7 @@ pub fn mcp_prompt_slash_command_result(
 /// not query the model.
 pub fn mcp_prompt_slash_command_error_result(
     uuid: Option<String>,
-    command: &McpPromptCommandSnapshot,
+    command: &Command,
     submitted_args: &str,
     error: &str,
 ) -> ProcessUserInputBaseResult {
@@ -299,7 +298,11 @@ pub fn mcp_prompt_slash_command_error_result(
     let output_id = Uuid::new_v4().to_string();
     ProcessUserInputBaseResult {
         messages: vec![
-            command_message(command_id, command.name.clone(), submitted_args.to_string()),
+            command_message(
+                command_id,
+                command.name.to_string(),
+                submitted_args.to_string(),
+            ),
             local_command_output_message(output_id, error.to_string(), true),
         ],
         should_query: false,
@@ -1787,14 +1790,12 @@ mod tests {
 
     #[test]
     fn mcp_prompt_slash_command_result_matches_official_command_plus_prompt_shape() {
-        let command = McpPromptCommandSnapshot {
-            name: "mcp__docs__summarize".to_string(),
-            description: "Summarize docs".to_string(),
-            has_user_specified_description: true,
-            user_facing_name: "docs:summarize (MCP)".to_string(),
-            arg_names: vec!["path".to_string()],
-            source: "mcp",
-        };
+        let command = crate::services::mcp::client::mcp_command_for_test(
+            "docs",
+            "summarize",
+            Some("Summarize docs"),
+            &["path"],
+        );
         let result = mcp_prompt_slash_command_result(
             Some("cmd-1".to_string()),
             &command,
@@ -1826,14 +1827,12 @@ mod tests {
 
     #[test]
     fn mcp_prompt_slash_command_error_result_matches_official_stderr_shape() {
-        let command = McpPromptCommandSnapshot {
-            name: "mcp__docs__summarize".to_string(),
-            description: "Summarize docs".to_string(),
-            has_user_specified_description: true,
-            user_facing_name: "docs:summarize (MCP)".to_string(),
-            arg_names: vec!["path".to_string()],
-            source: "mcp",
-        };
+        let command = crate::services::mcp::client::mcp_command_for_test(
+            "docs",
+            "summarize",
+            Some("Summarize docs"),
+            &["path"],
+        );
         let result = mcp_prompt_slash_command_error_result(
             Some("cmd-1".to_string()),
             &command,

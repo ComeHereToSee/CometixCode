@@ -46,7 +46,7 @@ use crate::query::{
     PendingQueryMessage, QueryCommand, QueryEvent, QueryHandle, StopHookProgressEvent,
     deps::production_deps, spawn_query,
 };
-use crate::services::mcp::client::{McpPromptCommandSnapshot, respond_to_mcp_elicitation};
+use crate::services::mcp::client::respond_to_mcp_elicitation;
 use crate::services::mcp::elicitation_handler::{
     ElicitationAction, ElicitationRequestParams, ElicitationWaitingDismissAction,
     url_retry_waiting_dismiss_result,
@@ -1588,11 +1588,9 @@ struct SpeculationAcceptanceOutcome {
 struct McpPromptSlashCommandSubmit {
     input: String,
     turn_id: String,
-    command: McpPromptCommandSnapshot,
-    /// The client the prompt command was fetched from, and the server's own
-    /// prompt name (CC's command record closes over both).
-    server: crate::services::mcp::types::McpServerConnection,
-    prompt_name: String,
+    /// The `mcp.commands` entry, which carries the client it was fetched from
+    /// and the server's own prompt name (CC's command closes over both).
+    command: crate::commands::Command,
     args: String,
     tool_permission_context: ToolPermissionContext,
 }
@@ -5829,10 +5827,20 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 Arc::clone(&has_interruptible_tool_in_progress);
             let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
             async move {
+                // `find_mcp_prompt_command` only yields bound commands.
+                let Some(binding) = submit.command.mcp_prompt.clone() else {
+                    return;
+                };
+                let arg_names = submit
+                    .command
+                    .arg_names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>();
                 let blocks = match crate::services::mcp::client::get_mcp_prompt_for_command(
-                &submit.server,
-                &submit.prompt_name,
-                &submit.command.arg_names,
+                &binding.connection,
+                &binding.prompt_name,
+                &arg_names,
                 &submit.args,
             )
             .await
@@ -7126,20 +7134,16 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             .map(|context| context.current())
             .unwrap_or_default();
         if let Some(parsed) = crate::utils::slash_command_parsing::parse_slash_command(&text) {
-            if let Some((server, command, prompt_name)) =
-                crate::services::mcp::client::resolve_mcp_prompt_command_invocation(
-                    &parsed.name,
-                    &runtime_mcp_state_for_submit,
-                )
-            {
+            if let Some(command) = crate::services::mcp::client::find_mcp_prompt_command(
+                &parsed.name,
+                &commands_for_submit,
+            ) {
                 // MCP prompt slash commands dispatch a query now (REPL.tsx:4525).
                 clear_ide_selection_for_submit();
                 mcp_prompt_submit_action(McpPromptSlashCommandSubmit {
                     input: text,
                     turn_id: Uuid::new_v4().to_string(),
-                    command,
-                    server,
-                    prompt_name,
+                    command: command.clone(),
                     args: parsed.args,
                     tool_permission_context: tool_permission_context_for_submit,
                 });

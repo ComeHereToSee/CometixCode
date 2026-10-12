@@ -476,15 +476,11 @@ mod tests {
                     "annotations": {"title": "Search Docs", "readOnlyHint": true}
                 }),
             )],
-            commands: vec![crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: "mcp__docs__summarize".to_string(),
-                    description: "Summarize docs".to_string(),
-                    has_user_specified_description: true,
-                    user_facing_name: "docs:summarize (MCP)".to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
+            commands: vec![crate::services::mcp::client::mcp_command_for_test(
+                "docs",
+                "summarize",
+                Some("Summarize docs"),
+                &[],
             )],
             resources: BTreeMap::from([(
                 "docs".to_string(),

@@ -1206,13 +1206,10 @@ async fn process_mcp_resource_attachments(
         };
         let description = resource.description.clone();
         // CC reads over the AppState client itself (`client.client.readResource`).
-        let connection_id = server
-            .as_connected()
-            .map(|connected| connected.client.connection_id());
-        let content =
-            crate::services::mcp::client::read_mcp_resource(server_name, connection_id, uri)
-                .await
-                .ok()?;
+        let client = &server.as_connected()?.client;
+        let content = crate::services::mcp::client::read_mcp_resource(client, uri)
+            .await
+            .ok()?;
         let attachment = AttachmentMessage::new(serde_json::json!({
             "type": "mcp_resource",
             "server": server_name,
@@ -3452,18 +3449,17 @@ mod tests {
                 .clone(),
         );
         reset_sent_skill_names_for_test();
-        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`.
+        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`, named
+        // `name`.
         let make_command = |name: &str| {
-            let mut command = crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: name.to_string(),
-                    description: format!("Use {name}"),
-                    has_user_specified_description: true,
-                    user_facing_name: name.to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
+            let mut command = crate::services::mcp::client::mcp_command_for_test(
+                "mcp",
+                name,
+                Some(&format!("Use {name}")),
+                &[],
             );
+            command.name = name.to_string().into();
+            command.user_facing_name = Some(name.to_string().into());
             command.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
             command
         };
@@ -3519,18 +3515,17 @@ mod tests {
         );
         reset_sent_skill_names_for_test();
 
-        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`.
+        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`, named
+        // `name`.
         let make_command = |name: &str| {
-            let mut command = crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: name.to_string(),
-                    description: format!("Use {name}"),
-                    has_user_specified_description: true,
-                    user_facing_name: name.to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
+            let mut command = crate::services::mcp::client::mcp_command_for_test(
+                "mcp",
+                name,
+                Some(&format!("Use {name}")),
+                &[],
             );
+            command.name = name.to_string().into();
+            command.user_facing_name = Some(name.to_string().into());
             command.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
             command
         };

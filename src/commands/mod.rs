@@ -115,14 +115,33 @@ pub struct PluginInfo {
     pub repository: String,
 }
 
-/// The server and prompt an MCP prompt command was fetched for: what CC's
-/// prompt command closes over (`services/mcp/client.ts:2054-2097`, `client`
-/// and `prompt.name`). The server is held by name; the connection handle
-/// itself is not carried yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What CC's MCP prompt command closes over
+/// (`services/mcp/client.ts:2054-2097`): the `client` it was fetched from and
+/// `prompt.name`. Its `getPromptForCommand` goes through
+/// `ensureConnectedClient(client)`.
+#[derive(Clone)]
 pub struct McpPromptBinding {
-    pub server_name: String,
+    pub connection: Arc<crate::services::mcp::types::ConnectedMcpServer>,
     pub prompt_name: String,
+}
+
+/// The same capture, as JS compares the closed-over client by reference.
+impl PartialEq for McpPromptBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.connection, &other.connection) && self.prompt_name == other.prompt_name
+    }
+}
+
+impl Eq for McpPromptBinding {}
+
+impl std::fmt::Debug for McpPromptBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpPromptBinding")
+            .field("server", &self.connection.name)
+            .field("client", &self.connection.client)
+            .field("prompt_name", &self.prompt_name)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,8 +193,9 @@ pub struct Command {
     /// getPromptForCommand closure. Domain logic stays in loadPluginCommands.
     pub plugin_context:
         Option<Arc<crate::utils::plugins::load_plugin_commands::PluginCommandContext>>,
-    /// An MCP prompt command's server and prompt; `None` for every other
-    /// command.
+    /// What an MCP prompt command's `getPromptForCommand` closes over: the
+    /// connection it was fetched from and the server's prompt name
+    /// (`client.ts:2073-2093`). `None` for every other command.
     pub mcp_prompt: Option<McpPromptBinding>,
 }
 
@@ -344,21 +364,32 @@ impl Command {
         self
     }
 
+    /// Maps to: CC `fetchCommandsForClient`'s per-prompt command
+    /// (`services/mcp/client.ts:2054-2097`): the server's prompt, bound to the
+    /// `client` it was fetched from.
     pub(crate) fn from_mcp_prompt(
-        prompt: crate::services::mcp::client::McpPromptCommandSnapshot,
+        client: &Arc<crate::services::mcp::types::ConnectedMcpServer>,
+        prompt_name: &str,
+        description: Option<&str>,
+        arg_names: Vec<String>,
     ) -> Self {
+        let description = description.unwrap_or_default().to_string();
         Self {
-            name: Cow::Owned(prompt.name),
+            name: Cow::Owned(crate::services::mcp::client::mcp_prompt_command_name(
+                &client.name,
+                prompt_name,
+            )),
             aliases: Vec::new(),
-            description: Cow::Owned(prompt.description),
+            // `!!prompt.description`.
+            has_user_specified_description: !description.is_empty(),
+            description: Cow::Owned(description),
             description_resolver: None,
-            has_user_specified_description: prompt.has_user_specified_description,
             // CC's prompt command has `argNames` and no `argumentHint`; its
             // suggestion row lists the names instead
             // (`commandSuggestions.ts:274-278`).
             argument_hint: None,
             argument_hint_resolver: None,
-            arg_names: prompt.arg_names.into_iter().map(Cow::Owned).collect(),
+            arg_names: arg_names.into_iter().map(Cow::Owned).collect(),
             when_to_use: None,
             version: None,
             disable_model_invocation: false,
@@ -367,13 +398,19 @@ impl Command {
             // `'mcp'` marks MCP skills, which SkillTool and the skill listing
             // take and plain prompts must not reach (`SkillTool.ts:82-90`).
             loaded_from: None,
-            user_facing_name: Some(Cow::Owned(prompt.user_facing_name)),
+            user_facing_name: Some(Cow::Owned(
+                crate::services::mcp::client::mcp_prompt_user_facing_name(
+                    &client.name,
+                    prompt_name,
+                ),
+            )),
             kind: CommandKind::Prompt,
             source: CommandSource::Mcp,
             availability: Vec::new(),
             is_enabled: None,
-            // MCP prompt retrieval is async and remains owned by REPL's
-            // `get_mcp_prompt_for_command` action before generic slash dispatch.
+            // MCP prompt retrieval is async: REPL's prompt action calls
+            // `get_mcp_prompt_for_command` over `mcp_prompt` before generic
+            // slash dispatch.
             get_prompt_for_command: None,
             call: None,
             is_hidden: false,
@@ -387,7 +424,10 @@ impl Command {
             prompt_command: None,
             plugin_info: None,
             plugin_context: None,
-            mcp_prompt: None,
+            mcp_prompt: Some(McpPromptBinding {
+                connection: client.clone(),
+                prompt_name: prompt_name.to_string(),
+            }),
         }
     }
 
@@ -2009,15 +2049,12 @@ mod tests {
 
         // A plain MCP prompt carries no `loadedFrom`, so it is never an MCP
         // skill; one marked `'mcp'` is.
-        let plain =
-            Command::from_mcp_prompt(crate::services::mcp::client::McpPromptCommandSnapshot {
-                name: "mcp:plain".to_string(),
-                description: "Plain MCP prompt".to_string(),
-                has_user_specified_description: true,
-                user_facing_name: "mcp:plain".to_string(),
-                arg_names: Vec::new(),
-                source: "mcp",
-            });
+        let plain = crate::services::mcp::client::mcp_command_for_test(
+            "mcp",
+            "plain",
+            Some("Plain MCP prompt"),
+            &[],
+        );
         assert_eq!(plain.loaded_from, None);
         // CC `client.ts:2056-2095`: `argNames`, but no `argumentHint`.
         assert_eq!(plain.argument_hint, None);

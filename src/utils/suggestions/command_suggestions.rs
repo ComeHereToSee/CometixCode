@@ -849,16 +849,13 @@ mod tests {
 
     #[test]
     fn command_suggestions_read_flat_mcp_commands_and_accept_executable_name() {
-        let prompt = crate::services::mcp::client::McpPromptCommandSnapshot {
-            name: "mcp__docs__summarize".to_string(),
-            description: "Summarize docs".to_string(),
-            has_user_specified_description: true,
-            user_facing_name: "docs:summarize (MCP)".to_string(),
-            arg_names: vec!["path".to_string(), "style".to_string()],
-            source: "mcp",
-        };
         let mut available_commands = commands();
-        available_commands.push(crate::commands::Command::from_mcp_prompt(prompt));
+        available_commands.push(crate::services::mcp::client::mcp_command_for_test(
+            "docs",
+            "summarize",
+            Some("Summarize docs"),
+            &["path", "style"],
+        ));
 
         let suggestions = generate_command_suggestions("/summ", &available_commands);
         let first = suggestions
