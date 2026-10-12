@@ -3121,13 +3121,23 @@ mod tests {
                     .find(|server| server.name() == "broken")
                     .expect("the agent's state holds the failed server");
                 assert_eq!(broken.connection_type(), McpServerConnectionType::Failed);
-                assert!(crate::services::mcp::client::registered_connection_id("inline").is_some());
+                let inline = initialized
+                    .mcp_state
+                    .clients
+                    .iter()
+                    .find_map(|server| {
+                        server
+                            .as_connected()
+                            .filter(|connected| connected.name == "inline")
+                    })
+                    .expect("the agent's state holds the inline connection")
+                    .client
+                    .clone();
+                assert!(!inline.is_closed());
 
                 drop(initialized);
-                assert_eq!(
-                    crate::services::mcp::client::registered_connection_id("inline"),
-                    None
-                );
+                assert!(inline.is_closed());
+                assert!(crate::services::mcp::client::memoized_connection_ids("inline").is_empty());
                 let again =
                     crate::services::mcp::client::connect_to_server("inline", &config).await;
                 assert_eq!(again.connection_type(), McpServerConnectionType::Connected);
@@ -3180,18 +3190,130 @@ mod tests {
                     }) => {}
                 }
 
+                // The connection still being made, as the memo hands it to
+                // any caller.
+                let made =
+                    crate::services::mcp::client::connect_to_server("slow-inline", &config).await;
+                let made = &made.as_connected().expect("the connection is made").client;
                 fixture
-                    .until("the connection to be made and closed", |_| {
+                    .until("the connection to be closed and leave the memo", |_| {
                         crate::services::mcp::client::memoized_connection_ids("slow-inline")
                             .is_empty()
                     })
                     .await;
-                assert_eq!(
-                    crate::services::mcp::client::registered_connection_id("slow-inline"),
-                    None
-                );
+                assert!(made.is_closed());
                 assert_eq!(fixture.count("initialize"), 1);
             });
+    }
+
+    /// CC's `connectToServer` memo is keyed by name and config
+    /// (`client.ts:581-595`), and an inline server's config is scoped
+    /// `dynamic` (`runAgent.ts:166-169`): the parent's `github` and the
+    /// agent's inline `github` are two connections. The agent's end closes
+    /// its own only, and the parent's tool still calls the parent's.
+    #[test]
+    fn an_inline_mcp_server_named_like_the_parents_closes_only_its_own() {
+        use crate::services::mcp::client::session_http_fixture::{
+            SESSION_NOT_FOUND, SessionHttpFixture,
+        };
+        use crate::services::mcp::types::{ConfigScope, McpServerConnectionType};
+        let _env_guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let managed_dir =
+            std::env::temp_dir().join(format!("cometix-agent-mcp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        let _managed = EnvVarGuard::set("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &managed_dir);
+        crate::utils::settings::settings_cache::reset_settings_cache();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let fixture = SessionHttpFixture::spawn(|_, _| false, SESSION_NOT_FOUND).await;
+                let parent_config = fixture.config();
+                let parent = crate::services::mcp::client::reconnect_mcp_server_impl(
+                    "github",
+                    &parent_config,
+                )
+                .await;
+                assert_eq!(
+                    parent.server.connection_type(),
+                    McpServerConnectionType::Connected,
+                    "{:?}",
+                    parent.server
+                );
+                let parent_client = parent
+                    .server
+                    .as_connected()
+                    .expect("the parent's connection")
+                    .client
+                    .clone();
+                let Some(crate::types::tools::McpToolConnection::Connected(parent_binding)) =
+                    parent.tools[0].mcp_connection.clone()
+                else {
+                    panic!("the parent's tool carries its client");
+                };
+                let mut parent_state = crate::state::app_state_store::McpState::default();
+                crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
+                    &mut parent_state,
+                    parent,
+                );
+
+                let mut agent = AgentDefinition::new(
+                    "custom",
+                    "Use custom",
+                    AgentDefinitionSource::UserSettings,
+                );
+                agent.mcp_servers = Some(vec![AgentMcpServerSpec::Inline {
+                    name: "github".to_string(),
+                    config: crate::services::mcp::types::ScopedMcpServerConfig {
+                        scope: ConfigScope::Dynamic,
+                        ..parent_config.clone()
+                    },
+                }]);
+                let initialized = initialize_agent_mcp_servers(&agent, &parent_state).await;
+                let inline = initialized.cleanup.newly_created_clients[0]
+                    .as_connected()
+                    .expect("the agent's connection")
+                    .client
+                    .clone();
+                assert_ne!(inline, parent_client);
+                assert!(!inline.is_closed());
+                assert!(!parent_client.is_closed());
+
+                drop(initialized);
+                assert!(inline.is_closed());
+                assert!(!parent_client.is_closed());
+
+                // The parent's tool `call`: `ensureConnectedClient(client)`
+                // (`client.ts:1858-1862`), then the request on it.
+                let connected =
+                    crate::services::mcp::client::ensure_connected_client(&parent_binding)
+                        .await
+                        .expect("the parent's connection");
+                assert_eq!(connected.client, parent_client);
+                let value = crate::services::mcp::client::call_mcp_tool_with_elicitation(
+                    &connected.client,
+                    "lookup",
+                    serde_json::Map::new(),
+                    None,
+                    crate::tool::HandleElicitationCallback::default(),
+                )
+                .await
+                .expect("the call succeeds");
+                assert_eq!(value["content"][0]["text"].as_str(), Some("ok:s1"));
+                assert_eq!(
+                    fixture.log(),
+                    ["initialize s1", "initialize s2", "tools/call s1"]
+                );
+
+                crate::services::mcp::client::clear_server_cache("github", None).await;
+            });
+        crate::utils::settings::settings_cache::reset_settings_cache();
+        let _ = std::fs::remove_dir_all(&managed_dir);
     }
 
     /// CC `runAgent.ts:213-214` appends the agent's clients to the parent's:

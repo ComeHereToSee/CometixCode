@@ -10544,8 +10544,8 @@ rl.on('line', line => {
                     );
                     assert_eq!(fixture.count("initialize"), expected_initializes);
                     fixture
-                        .until("the exited server's connection to close", |_| {
-                            crate::services::mcp::client::registered_connection_id(SERVER).is_none()
+                        .until("the exited server's connection to leave the memo", |_| {
+                            crate::services::mcp::client::memoized_connection_ids(SERVER).is_empty()
                         })
                         .await;
                 }
