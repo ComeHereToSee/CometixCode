@@ -3005,15 +3005,14 @@ mod tests {
                     parent.server
                 );
                 let parent_connection_id = connection_id(&parent.server);
+                let parent_record = parent.server.clone();
                 let mut parent_state = crate::state::app_state_store::McpState::default();
                 crate::services::mcp::use_manage_mcp_connections::apply_mcp_server_update(
                     &mut parent_state,
                     parent,
                 );
                 // `tools/list_changed` after the parent's snapshot was taken.
-                crate::services::mcp::client::refresh_mcp_tools_for_client("shared")
-                    .await
-                    .expect("the server is connected");
+                crate::services::mcp::client::refresh_mcp_tools_for_client(&parent_record).await;
 
                 let mut agent = AgentDefinition::new(
                     "custom",

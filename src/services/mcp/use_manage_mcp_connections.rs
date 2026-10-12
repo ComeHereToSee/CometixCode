@@ -335,59 +335,67 @@ pub async fn handle_mcp_server_closed_event(
 /// Maps to: CC `ToolListChangedNotificationSchema` handler in
 /// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`
 /// (`updateServer({ ...client, tools: newTools })`, :656).
-pub async fn handle_mcp_tools_list_changed_event(name: String, runtime_mcp: McpWriter) {
-    match refresh_mcp_tools_for_client(&name).await {
-        Ok((server, tools)) => {
-            runtime_mcp.apply_server_update(McpPendingUpdate {
-                server,
-                tools: Some(tools),
-                commands: None,
-                resources: None,
-            });
-        }
-        Err(error) => {
-            tracing::warn!(server = %name, error = %error, "failed to refresh MCP tools after list_changed notification")
-        }
-    }
+pub async fn handle_mcp_tools_list_changed_event(
+    client: McpServerConnection,
+    runtime_mcp: McpWriter,
+) {
+    let tools = refresh_mcp_tools_for_client(&client).await;
+    runtime_mcp.apply_server_update(McpPendingUpdate {
+        server: client,
+        tools: Some(tools),
+        commands: None,
+        resources: None,
+    });
 }
 
 /// Maps to: CC `PromptListChangedNotificationSchema` handler in
 /// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`
 /// (`updateServer({ ...client, commands: [...] })`, :688-691).
-pub async fn handle_mcp_prompts_list_changed_event(name: String, runtime_mcp: McpWriter) {
-    match refresh_mcp_prompts_for_client(&name).await {
-        Ok((server, commands)) => {
-            runtime_mcp.apply_server_update(McpPendingUpdate {
-                server,
-                tools: None,
-                commands: Some(commands),
-                resources: None,
-            });
-        }
-        Err(error) => {
-            tracing::warn!(server = %name, error = %error, "failed to refresh MCP prompts after list_changed notification")
-        }
-    }
+pub async fn handle_mcp_prompts_list_changed_event(
+    client: McpServerConnection,
+    runtime_mcp: McpWriter,
+) {
+    let commands = refresh_mcp_prompts_for_client(&client).await;
+    runtime_mcp.apply_server_update(McpPendingUpdate {
+        server: client,
+        tools: None,
+        commands: Some(commands),
+        resources: None,
+    });
 }
 
-/// Maps to: CC `ResourceListChangedNotificationSchema` handler in the
-/// non-`MCP_SKILLS` branch (`updateServer({ ...client, resources })`, :741).
-/// MCP skill refresh/index invalidation remains tied to the separate Skill
-/// runtime parity item.
-pub async fn handle_mcp_resources_list_changed_event(name: String, runtime_mcp: McpWriter) {
-    match refresh_mcp_resources_for_client(&name).await {
-        Ok((server, resources)) => {
-            runtime_mcp.apply_server_update(McpPendingUpdate {
-                server,
-                tools: None,
-                commands: None,
-                resources: Some(resources),
-            });
-        }
-        Err(error) => {
-            tracing::warn!(server = %name, error = %error, "failed to refresh MCP resources after list_changed notification")
-        }
+/// Maps to: CC `ResourceListChangedNotificationSchema` handler
+/// (`useManageMCPConnections.ts:705-751`). With `MCP_SKILLS`, the build CC
+/// ships, the prompts are refetched alongside the resources and written
+/// with them (`:718-738`); the MCP skill producer is a stub in the source
+/// (`skills/mcpSkills.ts`), so its share of the commands is empty, and the
+/// skill index clear is `EXPERIMENTAL_SKILL_SEARCH`'s, which is off.
+pub async fn handle_mcp_resources_list_changed_event(
+    client: McpServerConnection,
+    runtime_mcp: McpWriter,
+) {
+    if crate::utils::feature_flags::feature_enabled(
+        crate::utils::feature_flags::FeatureFlag::McpSkills,
+    ) {
+        let (resources, commands) = tokio::join!(
+            refresh_mcp_resources_for_client(&client),
+            refresh_mcp_prompts_for_client(&client),
+        );
+        runtime_mcp.apply_server_update(McpPendingUpdate {
+            server: client,
+            tools: None,
+            commands: Some(commands),
+            resources: Some(resources),
+        });
+        return;
     }
+    let resources = refresh_mcp_resources_for_client(&client).await;
+    runtime_mcp.apply_server_update(McpPendingUpdate {
+        server: client,
+        tools: None,
+        commands: None,
+        resources: Some(resources),
+    });
 }
 
 /// Maps to: CC `useManageMCPConnections.ts` channel notification handler after
@@ -547,18 +555,18 @@ impl OnConnectionAttemptHandlers {
     }
 
     /// Maps to: CC `ToolListChangedNotificationSchema` handler.
-    pub async fn on_tools_list_changed(&self, name: String) {
-        handle_mcp_tools_list_changed_event(name, self.mcp.clone()).await;
+    pub async fn on_tools_list_changed(&self, client: McpServerConnection) {
+        handle_mcp_tools_list_changed_event(client, self.mcp.clone()).await;
     }
 
     /// Maps to: CC `PromptListChangedNotificationSchema` handler.
-    pub async fn on_prompts_list_changed(&self, name: String) {
-        handle_mcp_prompts_list_changed_event(name, self.mcp.clone()).await;
+    pub async fn on_prompts_list_changed(&self, client: McpServerConnection) {
+        handle_mcp_prompts_list_changed_event(client, self.mcp.clone()).await;
     }
 
     /// Maps to: CC `ResourceListChangedNotificationSchema` handler.
-    pub async fn on_resources_list_changed(&self, name: String) {
-        handle_mcp_resources_list_changed_event(name, self.mcp.clone()).await;
+    pub async fn on_resources_list_changed(&self, client: McpServerConnection) {
+        handle_mcp_resources_list_changed_event(client, self.mcp.clone()).await;
     }
 
     /// Maps to: CC channel message notification handler in `onConnectionAttempt`.
@@ -723,43 +731,45 @@ pub(crate) fn declares_resources_list_changed(
         .unwrap_or(false)
 }
 
-pub(crate) async fn emit_tools_list_changed(name: String) {
+/// `client` is the connected record of the connection that sent the
+/// notification, as CC's handler closes over it.
+pub(crate) async fn emit_tools_list_changed(client: McpServerConnection) {
     let handled = with_connection_handlers_async({
-        let name = name.clone();
-        |hooks| async move { hooks.on_tools_list_changed(name).await }
+        let client = client.clone();
+        |hooks| async move { hooks.on_tools_list_changed(client).await }
     })
     .await
     .is_some();
     if handled {
         return;
     }
-    observe_for_test(McpConnectionCallbackObservation::ToolsListChanged { name }).await;
+    observe_for_test(McpConnectionCallbackObservation::ToolsListChanged { client }).await;
 }
 
-pub(crate) async fn emit_prompts_list_changed(name: String) {
+pub(crate) async fn emit_prompts_list_changed(client: McpServerConnection) {
     let handled = with_connection_handlers_async({
-        let name = name.clone();
-        |hooks| async move { hooks.on_prompts_list_changed(name).await }
+        let client = client.clone();
+        |hooks| async move { hooks.on_prompts_list_changed(client).await }
     })
     .await
     .is_some();
     if handled {
         return;
     }
-    observe_for_test(McpConnectionCallbackObservation::PromptsListChanged { name }).await;
+    observe_for_test(McpConnectionCallbackObservation::PromptsListChanged { client }).await;
 }
 
-pub(crate) async fn emit_resources_list_changed(name: String) {
+pub(crate) async fn emit_resources_list_changed(client: McpServerConnection) {
     let handled = with_connection_handlers_async({
-        let name = name.clone();
-        |hooks| async move { hooks.on_resources_list_changed(name).await }
+        let client = client.clone();
+        |hooks| async move { hooks.on_resources_list_changed(client).await }
     })
     .await
     .is_some();
     if handled {
         return;
     }
-    observe_for_test(McpConnectionCallbackObservation::ResourcesListChanged { name }).await;
+    observe_for_test(McpConnectionCallbackObservation::ResourcesListChanged { client }).await;
 }
 
 pub(crate) async fn emit_channel_message_received(
@@ -849,14 +859,16 @@ pub enum McpConnectionCallbackObservation {
         name: String,
         config: ScopedMcpServerConfig,
     },
+    /// The `client` each carries is the connection that sent the
+    /// notification.
     ToolsListChanged {
-        name: String,
+        client: McpServerConnection,
     },
     PromptsListChanged {
-        name: String,
+        client: McpServerConnection,
     },
     ResourcesListChanged {
-        name: String,
+        client: McpServerConnection,
     },
     ChannelMessageReceived {
         name: String,
@@ -887,8 +899,16 @@ fn test_observations() -> &'static AsyncMutex<VecDeque<McpConnectionCallbackObse
     TEST_OBSERVATIONS.get_or_init(|| AsyncMutex::new(VecDeque::new()))
 }
 
+/// Queued in test builds only. A production run without App's hooks is a
+/// print run, whose CC counterpart registers only elicitation-complete and
+/// channel handlers on its connections (`print.ts:1358`, `:4733`,
+/// `:4809`): the event is dropped there rather than kept unread, as an
+/// observation holds the connection's handle.
 async fn observe_for_test(observation: McpConnectionCallbackObservation) {
+    #[cfg(test)]
     test_observations().lock().await.push_back(observation);
+    #[cfg(not(test))]
+    drop(observation);
 }
 
 /// Drain unhandled MCP session callback observations (tests without App hooks).
