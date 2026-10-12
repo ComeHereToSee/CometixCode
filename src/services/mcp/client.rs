@@ -21,8 +21,6 @@ use super::types::{
     ServerResource, Transport,
 };
 use crate::state::app_state_store::McpState;
-#[cfg(test)]
-use crate::utils::test_env::TestStateLock;
 // CC's `String(...)` / template-literal conversion on MCP payload fields
 // (`client.ts:2505` `String(resultContent.data)`, `:2670`
 // `String(result.toolResult)`, and the `${resource.uri}` / `${resource.text}` /
@@ -32,62 +30,6 @@ use crate::utils::test_env::TestStateLock;
 // array comma-join are implemented.
 use crate::utils::zod::js_string;
 use serde_json::{Map, Value};
-
-/// Server-authored `InitializeResult.instructions` for live MCP connections,
-/// by name. CC's `utils/mcpInstructionsDelta.ts` reads them off the connected
-/// records (`ConnectedMCPServer.instructions`); the records here carry them
-/// too, but the delta still reads this table, which changes with the
-/// connection registry.
-static MCP_SERVER_INSTRUCTIONS: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::BTreeMap<String, String>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
-
-fn set_mcp_server_instructions(name: &str, instructions: Option<String>) {
-    let mut state = MCP_SERVER_INSTRUCTIONS
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(instructions) = instructions.filter(|value| !value.is_empty()) {
-        state.insert(name.to_string(), instructions);
-    } else {
-        state.remove(name);
-    }
-}
-
-fn clear_mcp_server_instructions(name: &str) {
-    MCP_SERVER_INSTRUCTIONS
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(name);
-}
-
-/// Snapshot server-authored instructions for currently connected AppState
-/// clients. Disconnected stale registry entries are never exposed.
-pub(crate) fn connected_mcp_server_instructions(
-    state: &McpState,
-) -> std::collections::BTreeMap<String, String> {
-    let connected = state
-        .clients
-        .iter()
-        .filter(|server| server.connection_type() == McpServerConnectionType::Connected)
-        .map(|server| server.name())
-        .collect::<std::collections::HashSet<_>>();
-    MCP_SERVER_INSTRUCTIONS
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .filter(|(name, _)| connected.contains(name.as_str()))
-        .map(|(name, instructions)| (name.clone(), instructions.clone()))
-        .collect()
-}
-
-#[cfg(test)]
-pub(crate) static TEST_MCP_INSTRUCTIONS_LOCK: std::sync::LazyLock<TestStateLock> =
-    std::sync::LazyLock::new(TestStateLock::new);
-
-#[cfg(test)]
-pub(crate) fn set_mcp_server_instructions_for_test(name: &str, instructions: Option<&str>) {
-    set_mcp_server_instructions(name, instructions.map(str::to_string));
-}
 
 /// Maps to: CC MCP client lifecycle callbacks that feed `updateServer(...)`.
 /// Prefer [`crate::services::mcp::use_manage_mcp_connections::OnConnectionAttemptHandlers`]
@@ -3640,7 +3582,6 @@ mod runtime {
     /// One slot per name is Rust's; CC keeps every connection it makes.
     fn replace_cached_client(
         client: McpClient,
-        instructions: Option<String>,
         service: RunningService<RoleClient, CometixMcpClientHandler>,
         memoized: bool,
     ) -> bool {
@@ -3681,9 +3622,6 @@ mod runtime {
                 client.set_ide_selection_sink(sink);
             }
             clients.insert(name.clone(), client.clone());
-            // The instructions table changes with the registry entry, under
-            // its lock.
-            set_mcp_server_instructions(&name, instructions);
             previous
         };
         drop(cache);
@@ -3697,14 +3635,13 @@ mod runtime {
         true
     }
 
-    /// Removes `client` from the registry, and its instructions with it, if
-    /// it is still the connection registered under its name.
+    /// Removes `client` from the registry if it is still the connection
+    /// registered under its name.
     fn remove_registered_client(client: &McpClient) -> bool {
         let mut clients = CONNECTED_CLIENTS.lock().unwrap();
         if clients.get(client.name()) != Some(client) {
             return false;
         }
-        clear_mcp_server_instructions(client.name());
         clients.remove(client.name());
         true
     }
@@ -4026,7 +3963,7 @@ mod runtime {
         // connected, as CC's do: CC's clear awaits the connect and then
         // `cleanup()`s the client they hold. Fetches through it come back
         // empty, and an automatic reconnect that made it stops, as in CC.
-        if replace_cached_client(client, connected.instructions.clone(), service, memoized) {
+        if replace_cached_client(client, service, memoized) {
             let subscribe = connected.capabilities.resources.is_some();
             crate::utils::debug::log_for_debugging(&format!(
                 "[MCP] Server \"{name}\" connected with subscribe={subscribe}"
@@ -4065,7 +4002,6 @@ mod runtime {
             let config = config.clone();
             let send_mcp_message = send_mcp_message.clone();
             async move {
-                clear_mcp_server_instructions(&name);
                 let mut connected_config = config.clone();
                 connected_config.scope = crate::services::mcp::types::ConfigScope::Dynamic;
                 let transport = SdkControlClientTransport::new(name.clone(), send_mcp_message);
@@ -4078,7 +4014,7 @@ mod runtime {
                         // `client.ts:3296-3310`: capabilities only.
                         let connected = connected_mcp_server(client.clone());
                         let has_tools = connected.capabilities.tools.is_some();
-                        replace_cached_client(client, connected.instructions.clone(), service, false);
+                        replace_cached_client(client, service, false);
                         let server = McpServerConnection::Connected(connected);
                         // CC `fetchToolsForClient(connectedClient)` when the
                         // server has tools (`client.ts:3312-3317`).
@@ -6087,13 +6023,6 @@ mod tests {
         // nor `instructions`, though the server sent both during `initialize`.
         assert_eq!(connected.server_info, None);
         assert_eq!(connected.instructions, None);
-        assert!(
-            !connected_mcp_server_instructions(&McpState {
-                clients: vec![client.clone()],
-                ..McpState::default()
-            })
-            .contains_key("sdk-connected")
-        );
         assert_eq!(
             client.config().scope,
             crate::services::mcp::types::ConfigScope::Dynamic

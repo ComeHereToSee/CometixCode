@@ -321,6 +321,18 @@ impl McpServerConnection {
             config,
         })
     }
+
+    /// A connected record for a stdio server `name` whose initialize result
+    /// carried `instructions`.
+    #[cfg(test)]
+    pub(crate) fn connected_with_instructions_for_test(name: &str, instructions: &str) -> Self {
+        let mut client =
+            Self::connected_for_test(name, ScopedMcpServerConfig::stdio_for_test(name));
+        if let Self::Connected(connected) = &mut client {
+            connected.instructions = Some(instructions.to_owned());
+        }
+        client
+    }
 }
 
 #[cfg(test)]

@@ -491,19 +491,39 @@ fn get_output_style_section(
     ))
 }
 
-/// Maps to CC `constants/prompts.ts:160-166` `getMcpInstructionsSection(
+/// Maps to CC `constants/prompts.ts:160-165` `getMcpInstructionsSection(
 /// mcpClients)`.
 fn get_mcp_instructions_section(
     mcp_clients: &[crate::services::mcp::types::McpServerConnection],
 ) -> Option<String> {
-    // CC :164 `if (!mcpClients || mcpClients.length === 0) return null`.
+    // CC :163 `if (!mcpClients || mcpClients.length === 0) return null`.
     if mcp_clients.is_empty() {
         return None;
     }
-    // TODO seam: CC :165 `getMcpInstructions(mcpClients)` — the per-server
-    // instruction renderer is not yet ported, so connected clients still
-    // produce no section.
-    None
+    get_mcp_instructions(mcp_clients)
+}
+
+/// Maps to CC `constants/prompts.ts:579-604` `getMcpInstructions(mcpClients)`:
+/// the connected servers whose initialize result carried instructions, one
+/// block each.
+fn get_mcp_instructions(
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
+) -> Option<String> {
+    let instruction_blocks = mcp_clients
+        .iter()
+        .filter_map(crate::services::mcp::types::McpServerConnection::as_connected)
+        .filter_map(|client| {
+            let instructions = client.instructions.as_deref().filter(|s| !s.is_empty())?;
+            Some(format!("## {}\n{instructions}", client.name))
+        })
+        .collect::<Vec<_>>();
+    if instruction_blocks.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "# MCP Server Instructions\n\nThe following MCP servers have provided instructions for how to use their tools and resources:\n\n{}",
+        instruction_blocks.join("\n\n")
+    ))
 }
 
 /// Maps to CC `constants/prompts.ts` `getScratchpadInstructions()`.
@@ -907,6 +927,53 @@ mod tests {
                 .iter()
                 .any(|section| section == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
         );
+    }
+
+    /// CC `prompts.ts:513-520`, `:579-604`: with the delta off, the connected
+    /// records that carry instructions make the section; with it on, the
+    /// delta attachments announce them instead.
+    #[test]
+    fn default_system_prompt_carries_connected_mcp_instructions_unless_delta() {
+        use crate::services::mcp::types::{McpServerConnection, ScopedMcpServerConfig};
+
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
+        let _memory = EnvVarGuard::set("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+        let clients = [
+            McpServerConnection::connected_with_instructions_for_test("docs", "Read first."),
+            McpServerConnection::connected_with_instructions_for_test("lint", "Run last."),
+            McpServerConnection::connected_with_instructions_for_test("empty", ""),
+            McpServerConnection::connected_for_test(
+                "bare",
+                ScopedMcpServerConfig::stdio_for_test("bare"),
+            ),
+            McpServerConnection::failed(
+                "down",
+                ScopedMcpServerConfig::stdio_for_test("down"),
+                None,
+            ),
+        ];
+        let section = |prompt: &[String]| {
+            prompt
+                .iter()
+                .find(|section| section.starts_with("# MCP Server Instructions"))
+                .cloned()
+        };
+
+        let _delta = EnvVarGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "false");
+        let prompt = get_system_prompt(&[], "claude-sonnet-4-6", &[], &clients);
+        assert_eq!(
+            section(&prompt).as_deref(),
+            Some(
+                "# MCP Server Instructions\n\nThe following MCP servers have provided instructions for how to use their tools and resources:\n\n## docs\nRead first.\n\n## lint\nRun last."
+            )
+        );
+        let prompt = get_system_prompt(&[], "claude-sonnet-4-6", &[], &clients[2..]);
+        assert_eq!(section(&prompt), None);
+
+        let _delta = EnvVarGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+        let prompt = get_system_prompt(&[], "claude-sonnet-4-6", &[], &clients);
+        assert_eq!(section(&prompt), None);
     }
 
     #[cfg(feature = "anthropic_internal")]
