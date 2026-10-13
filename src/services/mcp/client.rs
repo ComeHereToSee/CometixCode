@@ -1051,8 +1051,10 @@ mod runtime {
     }
 
     /// A handler [`McpClient::set_notification_handler`] registers: it gets
-    /// the notification's params.
-    type NotificationHandler = Arc<dyn Fn(Option<Value>) + Send + Sync>;
+    /// the notification's params, and its work is the future it returns, as
+    /// an SDK handler's is the promise it returns.
+    pub(super) type NotificationHandler =
+        Arc<dyn Fn(Option<Value>) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
     /// A handler [`McpClient::set_onclose`] assigns.
     pub(crate) type OncloseHandler =
@@ -1205,13 +1207,21 @@ mod runtime {
         pub(crate) fn set_notification_handler(
             &self,
             method: &str,
-            handler: impl Fn(Option<Value>) + Send + Sync + 'static,
+            handler: impl Fn(Option<Value>) -> futures::future::BoxFuture<'static, ()>
+            + Send
+            + Sync
+            + 'static,
         ) {
             self.0
                 .notification_handlers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(method.to_owned(), Arc::new(handler));
+        }
+
+        /// What a handler stored on this connection may hold of it.
+        pub(crate) fn downgrade(&self) -> WeakMcpClient {
+            WeakMcpClient(Arc::downgrade(&self.0))
         }
 
         pub(super) fn notification_handler(&self, method: &str) -> Option<NotificationHandler> {
@@ -1221,6 +1231,22 @@ mod runtime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(method)
                 .cloned()
+        }
+    }
+
+    /// A [`McpClient`] that does not keep the connection's handle alive. A
+    /// handler stored on a connection holds its client this way: a JS
+    /// closure holds the client itself and the garbage collector reclaims
+    /// the cycle, which a strong handle here would leak.
+    #[derive(Clone)]
+    pub(crate) struct WeakMcpClient(std::sync::Weak<McpClientInner>);
+
+    impl WeakMcpClient {
+        /// The connection's connected record while its handle lives, built as
+        /// `connectToServer` built it: equal to the record it made.
+        pub(crate) fn connected_record(&self) -> Option<McpServerConnection> {
+            let client = McpClient(self.0.upgrade()?);
+            Some(McpServerConnection::Connected(connected_mcp_server(client)))
         }
     }
 
@@ -1309,20 +1335,20 @@ mod runtime {
             }
         }
 
-        /// The connection this handler serves, once it is kept: CC registers
-        /// its handlers in `onConnectionAttempt`, on connections that made
-        /// it. One still being set up, or one a `clearServerCache` voided
-        /// while it was made, has none, and its notifications are dropped as
-        /// CC's SDK drops one without a handler.
+        /// The connection this handler serves, once it is kept; `None` for
+        /// one still being set up, or one a `clearServerCache` voided while it
+        /// was made. Only the channel gate's `plugin_source` reads it now; it
+        /// goes with the channel handlers' move onto the connection.
         fn serving_client(&self) -> Option<McpClient> {
             self.serving.get()?;
             Some(McpClient(self.client.get()?.upgrade()?))
         }
 
-        /// The connected record of [`Self::serving_client`].
-        fn connected_record(&self) -> Option<McpServerConnection> {
-            let client = self.serving_client()?;
-            Some(McpServerConnection::Connected(connected_mcp_server(client)))
+        /// SDK `Protocol._onnotification` (`shared/protocol.js:269-279`): the
+        /// handler registered on this client for `method`. Without one the
+        /// SDK drops the notification.
+        fn registered_handler(&self, method: &str) -> Option<NotificationHandler> {
+            McpClient(self.client.get()?.upgrade()?).notification_handler(method)
         }
     }
 
@@ -1739,91 +1765,50 @@ mod runtime {
             }
         }
 
+        // The three list_changed notifications go to the handler registered
+        // for them on this client — `onConnectionAttempt` registers one per
+        // list the server declared can change
+        // (`useManageMCPConnections.ts:615-751`) — or nowhere.
+
         fn on_tool_list_changed(
             &self,
-            context: NotificationContext<RoleClient>,
+            _context: NotificationContext<RoleClient>,
         ) -> impl Future<Output = ()> + Send + '_ {
-            let server_name = self.server_name.clone();
-            // The capability gate itself belongs to `use_manage_mcp_connections`
-            // (CC `useManageMCPConnections.ts:618`); this handler only supplies
-            // the peer info, which is the transport's to know.
-            let declared = context.peer.peer_info().is_some_and(|info| {
-                crate::services::mcp::use_manage_mcp_connections::declares_tools_list_changed(
-                    &info.capabilities,
-                )
-            });
+            use rmcp::model::ConstString as _;
+            let handler =
+                self.registered_handler(rmcp::model::ToolListChangedNotificationMethod::VALUE);
             async move {
-                if !declared {
-                    tracing::debug!(server = %server_name, "ignoring tools/list_changed from a server that did not declare tools.listChanged");
-                    return;
+                if let Some(handler) = handler {
+                    handler(None).await;
                 }
-                let Some(client) = self.connected_record() else {
-                    tracing::debug!(server = %server_name, "ignoring tools/list_changed from a connection with no handlers");
-                    return;
-                };
-                // Maps to: CC `ToolListChangedNotificationSchema` handler in
-                // `useManageMCPConnections.ts`, on the client it closed over.
-                tracing::debug!(server = %server_name, "received MCP tools/list_changed notification");
-                crate::services::mcp::use_manage_mcp_connections::emit_tools_list_changed(client)
-                    .await;
             }
         }
 
         fn on_prompt_list_changed(
             &self,
-            context: NotificationContext<RoleClient>,
+            _context: NotificationContext<RoleClient>,
         ) -> impl Future<Output = ()> + Send + '_ {
-            let server_name = self.server_name.clone();
-            // Gate owned by `use_manage_mcp_connections` (CC `:667`).
-            let declared = context.peer.peer_info().is_some_and(|info| {
-                crate::services::mcp::use_manage_mcp_connections::declares_prompts_list_changed(
-                    &info.capabilities,
-                )
-            });
+            use rmcp::model::ConstString as _;
+            let handler =
+                self.registered_handler(rmcp::model::PromptListChangedNotificationMethod::VALUE);
             async move {
-                if !declared {
-                    tracing::debug!(server = %server_name, "ignoring prompts/list_changed from a server that did not declare prompts.listChanged");
-                    return;
+                if let Some(handler) = handler {
+                    handler(None).await;
                 }
-                let Some(client) = self.connected_record() else {
-                    tracing::debug!(server = %server_name, "ignoring prompts/list_changed from a connection with no handlers");
-                    return;
-                };
-                // Maps to: CC `PromptListChangedNotificationSchema` handler,
-                // on the client it closed over.
-                tracing::debug!(server = %server_name, "received MCP prompts/list_changed notification");
-                crate::services::mcp::use_manage_mcp_connections::emit_prompts_list_changed(client)
-                    .await;
             }
         }
 
         fn on_resource_list_changed(
             &self,
-            context: NotificationContext<RoleClient>,
+            _context: NotificationContext<RoleClient>,
         ) -> impl Future<Output = ()> + Send + '_ {
-            let server_name = self.server_name.clone();
-            // Gate owned by `use_manage_mcp_connections` (CC `:705`).
-            let declared = context.peer.peer_info().is_some_and(|info| {
-                crate::services::mcp::use_manage_mcp_connections::declares_resources_list_changed(
-                    &info.capabilities,
-                )
-            });
+            use rmcp::model::ConstString as _;
+            let handler =
+                self.registered_handler(rmcp::model::ResourceListChangedNotificationMethod::VALUE);
             async move {
-                if !declared {
-                    tracing::debug!(server = %server_name, "ignoring resources/list_changed from a server that did not declare resources.listChanged");
-                    return;
+                if let Some(handler) = handler {
+                    handler(None).await;
                 }
-                let Some(client) = self.connected_record() else {
-                    tracing::debug!(server = %server_name, "ignoring resources/list_changed from a connection with no handlers");
-                    return;
-                };
-                // Maps to: CC `ResourceListChangedNotificationSchema` handler,
-                // on the client it closed over.
-                tracing::debug!(server = %server_name, "received MCP resources/list_changed notification");
-                crate::services::mcp::use_manage_mcp_connections::emit_resources_list_changed(
-                    client,
-                )
-                .await;
             }
         }
 
@@ -1833,14 +1818,7 @@ mod runtime {
             context: NotificationContext<RoleClient>,
         ) -> impl Future<Output = ()> + Send + '_ {
             let server_name = self.server_name.clone();
-            // SDK `Protocol._onnotification`: the handler
-            // `setNotificationHandler` registered on this client for the
-            // method, if any.
-            let registered = self
-                .client
-                .get()
-                .and_then(std::sync::Weak::upgrade)
-                .and_then(|client| McpClient(client).notification_handler(&notification.method));
+            let registered = self.registered_handler(&notification.method);
             // CC `gateChannelServer(client.name, client.capabilities,
             // client.config.pluginSource)` (`useManageMCPConnections.ts:
             // 473-478`): the config of the client the handler closed over.
@@ -1858,7 +1836,7 @@ mod runtime {
                     return;
                 }
                 if let Some(handler) = registered {
-                    handler(notification.params);
+                    handler(notification.params).await;
                     return;
                 }
                 let peer_info = context.peer.peer_info();
@@ -3459,8 +3437,8 @@ mod runtime {
         });
     }
 
-    /// Keeps a connection just made: its handlers start serving its
-    /// notifications, and its close is watched — the rest of CC's
+    /// Keeps a connection just made: it is marked kept, and its close is
+    /// watched — the rest of CC's
     /// `connectToServer` once `client.connect` resolves, which wraps the
     /// client's `onerror` and `onclose` (`client.ts:1216-1402`).
     ///
@@ -4939,18 +4917,19 @@ rl.on('line', line => {
             let first_handler = ide
                 .notification_handler(SELECTION_CHANGED_METHOD)
                 .expect("the handler stays registered");
-            first_handler(Some(params.clone()));
+            first_handler(Some(params.clone())).await;
             assert!(selected.try_recv().is_err());
 
             // Another IDE: reset; its handler delivers, the first's does not.
             let other = McpClient::detached_for_test("ide", &config);
             run_ide_selection_effect(&current, Some(other.clone()), &on_select);
             assert_eq!(selected.try_recv().unwrap(), ide_selection_reset());
-            first_handler(Some(params.clone()));
+            first_handler(Some(params.clone())).await;
             assert!(selected.try_recv().is_err());
             other
                 .notification_handler(SELECTION_CHANGED_METHOD)
-                .expect("the new IDE's handler")(Some(params));
+                .expect("the new IDE's handler")(Some(params))
+            .await;
             assert_eq!(selected.try_recv().unwrap(), selection);
 
             runtime::clear_server_cache("ide", None).await;
@@ -4981,8 +4960,10 @@ rl.on('line', line => {
         assert_eq!(first_selected.try_recv().unwrap(), ide_selection_reset());
         assert_eq!(second_selected.try_recv().unwrap(), ide_selection_reset());
 
-        ide.notification_handler(SELECTION_CHANGED_METHOD)
-            .expect("a handler")(Some(params));
+        let handler = ide
+            .notification_handler(SELECTION_CHANGED_METHOD)
+            .expect("a handler");
+        futures::executor::block_on(handler(Some(params)));
         assert!(first_selected.try_recv().is_err());
         assert_eq!(second_selected.try_recv().unwrap().line_count, 1);
     }
@@ -7463,6 +7444,121 @@ rl.on('line', line => {
         });
     }
 
+    /// Waits until `condition` holds of the store's state; fails after five
+    /// seconds.
+    async fn until_state(
+        store: &crate::state::store::AppStore,
+        what: &str,
+        condition: impl Fn(&crate::state::app_state_store::AppState) -> bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !condition(&store.get()) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// CC registers a list_changed handler only for a list the server
+    /// declared can change (`useManageMCPConnections.ts:618`, `:667`,
+    /// `:705`), and only through `onConnectionAttempt`.
+    #[test]
+    fn list_changed_handlers_follow_the_declared_capabilities() {
+        use rmcp::model::{
+            ConstString as _, PromptListChangedNotificationMethod,
+            ResourceListChangedNotificationMethod, ToolListChangedNotificationMethod,
+        };
+        let mut server = McpServerConnection::connected_for_test(
+            "docs",
+            ScopedMcpServerConfig::stdio_for_test("docs"),
+        );
+        if let McpServerConnection::Connected(connected) = &mut server {
+            let mut tools = rmcp::model::ToolsCapability::default();
+            tools.list_changed = Some(true);
+            connected.capabilities.tools = Some(tools);
+            connected.capabilities.prompts = Some(Default::default());
+        }
+        let client = server.as_connected().expect("connected").client.clone();
+        assert!(
+            client
+                .notification_handler(ToolListChangedNotificationMethod::VALUE)
+                .is_none()
+        );
+
+        let store = crate::state::store::AppStore::new(
+            crate::state::app_state_store::AppState::default(),
+            None,
+        );
+        let writer = crate::state::app_state_store::McpWriter::new(store);
+        crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+            McpConnectionDiscovery::from(server),
+            &writer,
+        );
+        assert!(
+            client
+                .notification_handler(ToolListChangedNotificationMethod::VALUE)
+                .is_some()
+        );
+        assert!(
+            client
+                .notification_handler(PromptListChangedNotificationMethod::VALUE)
+                .is_none()
+        );
+        assert!(
+            client
+                .notification_handler(ResourceListChangedNotificationMethod::VALUE)
+                .is_none()
+        );
+    }
+
+    /// A list_changed handler lives on the connection it refreshes and holds
+    /// it weakly: once the state moves on from its record, nothing keeps the
+    /// connection's handle alive.
+    #[test]
+    fn list_changed_handlers_do_not_keep_their_connection_alive() {
+        let mut server = McpServerConnection::connected_for_test(
+            "docs",
+            ScopedMcpServerConfig::stdio_for_test("docs"),
+        );
+        if let McpServerConnection::Connected(connected) = &mut server {
+            let mut tools = rmcp::model::ToolsCapability::default();
+            tools.list_changed = Some(true);
+            connected.capabilities.tools = Some(tools);
+        }
+        let weak = server.as_connected().expect("connected").client.downgrade();
+        let store = crate::state::store::AppStore::new(
+            crate::state::app_state_store::AppState::default(),
+            None,
+        );
+        let writer = crate::state::app_state_store::McpWriter::new(store);
+        crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+            McpConnectionDiscovery::from(server),
+            &writer,
+        );
+        {
+            use rmcp::model::ConstString as _;
+            let record = weak.connected_record().expect("the record is in the state");
+            assert!(
+                record
+                    .as_connected()
+                    .expect("connected")
+                    .client
+                    .notification_handler(rmcp::model::ToolListChangedNotificationMethod::VALUE)
+                    .is_some()
+            );
+        }
+
+        let config = ScopedMcpServerConfig::stdio_for_test("docs");
+        writer.apply_client_update(McpConnectionDiscovery::disabled("docs", &config).server);
+        assert!(weak.connected_record().is_none());
+    }
+
+    /// CC's `onConnectionAttempt` registers a `tools/list_changed` handler on
+    /// a client whose server declares `tools.listChanged`
+    /// (`useManageMCPConnections.ts:618-665`): the notification refetches
+    /// the tools on that client and writes them with its record. A
+    /// connection made outside `onConnectionAttempt` has no handler.
     #[test]
     fn stdio_tools_list_changed_notification_refreshes_live_tools() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
@@ -7507,11 +7603,9 @@ rl.on('line', line => {
       id: message.id,
       result: { tools: [tool(listCount === 1 ? 'first' : 'second')] }
     })
-    if (listCount === 1) {
-      setTimeout(() => send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }), 10)
-    }
   } else if (message.method === 'tools/call') {
     send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text: 'ok' }] } })
+    send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })
   } else {
     send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'method not found' } })
   }
@@ -7525,7 +7619,6 @@ rl.on('line', line => {
             .build()
             .unwrap()
             .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
                 const SERVER: &str = "tools-list-changed-stdio-fixture";
                 let config = ScopedMcpServerConfig {
                     name: None,
@@ -7544,37 +7637,55 @@ rl.on('line', line => {
                     id: None,
                     plugin_source: None,
                 };
+                let store = crate::state::store::AppStore::new(
+                    crate::state::app_state_store::AppState::default(),
+                    None,
+                );
+                let writer = crate::state::app_state_store::McpWriter::new(store.clone());
                 let discovery = runtime::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
                     discovery.server.connection_type(),
                     McpServerConnectionType::Connected
                 );
                 assert_eq!(tool_names(&discovery.tools), vec!["first"]);
-
-                let notified = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        for event in runtime::drain_mcp_connection_callback_observations().await {
-                            if let crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ToolsListChanged { client } = event {
-                                return client;
-                            }
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    }
-                })
-                .await
-                .expect("tools/list_changed should be emitted");
-                // CC's handler closes over the `client` it was registered on:
-                // the notification carries that very connection.
-                assert_eq!(notified.name(), SERVER);
-                assert_eq!(
-                    notified.as_connected().map(|record| &record.client),
-                    discovery.server.as_connected().map(|record| &record.client)
+                let client = discovery
+                    .server
+                    .as_connected()
+                    .expect("connected")
+                    .client
+                    .clone();
+                {
+                    use rmcp::model::ConstString as _;
+                    assert!(
+                        client
+                            .notification_handler(
+                                rmcp::model::ToolListChangedNotificationMethod::VALUE
+                            )
+                            .is_none()
+                    );
+                }
+                crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+                    discovery, &writer,
                 );
+                assert_eq!(tool_names(&store.get().mcp.tools), vec!["first"]);
 
-                let refreshed = runtime::refresh_mcp_tools_for_client(&notified).await;
-                assert_eq!(tool_names(&refreshed), vec!["second"]);
+                // Any tool call makes the fixture announce a changed list.
+                runtime::call_mcp_tool(&client, "first", Map::new(), None)
+                    .await
+                    .expect("the tool call");
+                until_state(&store, "the refetched tools", |state| {
+                    tool_names(&state.mcp.tools) == ["second"]
+                })
+                .await;
+                // Still this connection's record; which record a handler
+                // writes is told apart by the same-name test.
+                assert_eq!(
+                    store.get().mcp.clients[0]
+                        .as_connected()
+                        .map(|record| &record.client),
+                    Some(&client)
+                );
                 runtime::clear_server_cache(SERVER, None).await;
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
             });
         let _ = std::fs::remove_file(script_path);
     }
@@ -7583,8 +7694,8 @@ rl.on('line', line => {
     /// registered on (`useManageMCPConnections.ts:474-751`): a list_changed
     /// refetches on that connection and writes `updateServer({ ...client,
     /// .. })`, and the channel gate reads `client.config.pluginSource`
-    /// (`:473-478`). With another connection open under the same name, the
-    /// notifications carry the connection that sent them.
+    /// (`:473-478`). With another connection open under the same name, each
+    /// notification acts for the connection that sent it.
     #[test]
     fn notifications_carry_the_connection_that_sent_them() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
@@ -7610,6 +7721,10 @@ rl.on('line', line => {
       method: 'notifications/claude/channel',
       params: { content: 'hello from the channel' }
     })
+    return
+  }
+  if (message.method === 'fixture/emit-resources') {
+    send({ jsonrpc: '2.0', method: 'notifications/resources/list_changed' })
     return
   }
   if (message.id === undefined) return
@@ -7668,8 +7783,8 @@ rl.on('line', line => {
             // the sender.
             let mut other_config = config.clone();
             other_config.plugin_source = Some("other@elsewhere".to_string());
-            let other = runtime::connect_to_server(SERVER, &other_config).await;
-            let other = other
+            let other_record = runtime::connect_to_server(SERVER, &other_config).await;
+            let other = other_record
                 .as_connected()
                 .expect("another connection")
                 .client
@@ -7677,80 +7792,81 @@ rl.on('line', line => {
             assert_ne!(other, sender);
             assert!(!sender.is_closed());
 
-            // Tells `emitter` to notify, then waits for the connection the
-            // `tools/list_changed` carries and the channel message's plugin
-            // source.
-            async fn notify_through(emitter: &McpClient) -> (McpServerConnection, Option<String>) {
-                emitter
-                    .notification("fixture/emit", serde_json::json!({}))
-                    .await
-                    .expect("the fixture is told to notify");
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    let (mut notified, mut plugin_source) = (None, None);
-                    loop {
-                        for event in runtime::drain_mcp_connection_callback_observations().await {
-                            match event {
-                                McpConnectionCallbackObservation::ToolsListChanged { client } => {
-                                    notified = Some(client);
-                                }
-                                McpConnectionCallbackObservation::ChannelMessageReceived {
-                                    plugin_source: source,
-                                    ..
-                                } => plugin_source = Some(source),
-                                _ => {}
-                            }
-                        }
-                        if let (Some(notified), Some(plugin_source)) = (&notified, &plugin_source) {
-                            return (notified.clone(), plugin_source.clone());
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    }
-                })
-                .await
-                .expect("both notifications are emitted")
-            }
-
-            // Each connection under the name in turn: whichever one a lookup
-            // by name would find, one of the two turns tells it apart.
-            let (notified, plugin_source) = notify_through(&other).await;
-            assert_eq!(
-                notified.as_connected().map(|record| &record.client),
-                Some(&other)
-            );
-            assert_eq!(plugin_source.as_deref(), Some("other@elsewhere"));
-            let (notified, plugin_source) = notify_through(&sender).await;
-            assert_eq!(
-                notified.as_connected().map(|record| &record.client),
-                Some(&sender)
-            );
-            assert_eq!(plugin_source.as_deref(), Some("telegram@official"));
-
-            // App's handlers write the update with the sender's record; with
-            // `MCP_SKILLS` the resources refresh writes the prompts too.
+            // Both go through the session's `onConnectionAttempt`, the sender
+            // last, so the state holds the sender's record.
             let store = crate::state::store::AppStore::new(
                 crate::state::app_state_store::AppState::default(),
                 None,
             );
             let writer = crate::state::app_state_store::McpWriter::new(store.clone());
-            crate::services::mcp::use_manage_mcp_connections::handle_mcp_tools_list_changed_event(
-                notified.clone(),
-                writer.clone(),
-            )
-            .await;
-            crate::services::mcp::use_manage_mcp_connections::handle_mcp_resources_list_changed_event(
-                notified,
-                writer,
-            )
+            for server in [&other_record, &record] {
+                crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+                    McpConnectionDiscovery::from(server.clone()),
+                    &writer,
+                );
+            }
+            let record_client = |state: &crate::state::app_state_store::AppState| {
+                state.mcp.clients[0]
+                    .as_connected()
+                    .map(|record| record.client.clone())
+            };
+            assert_eq!(record_client(&store.get()), Some(sender.clone()));
+
+            // Tells `emitter` to notify, then waits until its
+            // `tools/list_changed` has written its record, and for the channel
+            // message's plugin source.
+            async fn notify_through(
+                emitter: &McpClient,
+                store: &crate::state::store::AppStore,
+                record_client: impl Fn(&crate::state::app_state_store::AppState) -> Option<McpClient>,
+            ) -> Option<String> {
+                emitter
+                    .notification("fixture/emit", serde_json::json!({}))
+                    .await
+                    .expect("the fixture is told to notify");
+                until_state(store, "the emitter's record", |state| {
+                    record_client(state).as_ref() == Some(emitter)
+                })
+                .await;
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        for event in runtime::drain_mcp_connection_callback_observations().await {
+                            if let McpConnectionCallbackObservation::ChannelMessageReceived {
+                                plugin_source,
+                                ..
+                            } = event
+                            {
+                                return plugin_source;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .expect("the channel message is emitted")
+            }
+
+            // Each connection under the name in turn: whichever one a lookup
+            // by name would find, one of the two turns tells it apart.
+            let plugin_source = notify_through(&other, &store, record_client).await;
+            assert_eq!(plugin_source.as_deref(), Some("other@elsewhere"));
+            let plugin_source = notify_through(&sender, &store, record_client).await;
+            assert_eq!(plugin_source.as_deref(), Some("telegram@official"));
+            assert_eq!(tool_names(&store.get().mcp.tools), ["lookup"]);
+
+            // The resources handler writes its own record too, and with
+            // `MCP_SKILLS` the prompts alongside the resources.
+            other
+                .notification("fixture/emit-resources", serde_json::json!({}))
+                .await
+                .expect("the fixture is told to notify");
+            until_state(&store, "the other's refetched resources", |state| {
+                record_client(state).as_ref() == Some(&other)
+                    && state.mcp.resources.contains_key(SERVER)
+            })
             .await;
             let state = store.get();
             assert_eq!(state.mcp.clients.len(), 1);
-            assert_eq!(
-                state.mcp.clients[0]
-                    .as_connected()
-                    .map(|record| &record.client),
-                Some(&sender)
-            );
-            assert_eq!(tool_names(&state.mcp.tools), ["lookup"]);
             assert_eq!(
                 state
                     .mcp
@@ -7827,9 +7943,6 @@ rl.on('line', line => {
       id: message.id,
       result: { prompts: [prompt(promptListCount === 1 ? 'first_prompt' : 'second_prompt')] }
     })
-    if (promptListCount === 1) {
-      setTimeout(() => send({ jsonrpc: '2.0', method: 'notifications/prompts/list_changed' }), 10)
-    }
   } else if (message.method === 'resources/list') {
     resourceListCount += 1
     send({
@@ -7837,9 +7950,9 @@ rl.on('line', line => {
       id: message.id,
       result: { resources: [resource(resourceListCount === 1 ? 'first_resource' : 'second_resource')] }
     })
-    if (resourceListCount === 1) {
-      setTimeout(() => send({ jsonrpc: '2.0', method: 'notifications/resources/list_changed' }), 10)
-    }
+  } else if (message.method === 'tools/call') {
+    send({ jsonrpc: '2.0', id: message.id, result: { content: [] } })
+    send({ jsonrpc: '2.0', method: `notifications/${message.params.name}/list_changed` })
   } else {
     send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'method not found' } })
   }
@@ -7853,7 +7966,6 @@ rl.on('line', line => {
             .build()
             .unwrap()
             .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
                 const SERVER: &str = "prompts-resources-list-changed-stdio-fixture";
                 let config = ScopedMcpServerConfig {
                     name: None,
@@ -7886,62 +7998,66 @@ rl.on('line', line => {
                     "first_resource"
                 );
 
-                let (prompts_client, resources_client) =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                        let mut prompts_client = None;
-                        let mut resources_client = None;
-                        loop {
-                            for event in runtime::drain_mcp_connection_callback_observations().await {
-                                match event {
-                                    crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::PromptsListChanged { client } => {
-                                        prompts_client = Some(client);
-                                    }
-                                    crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ResourcesListChanged { client } => {
-                                        resources_client = Some(client);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            if let (Some(prompts), Some(resources)) =
-                                (&prompts_client, &resources_client)
-                            {
-                                return (prompts.clone(), resources.clone());
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                        }
-                    })
+                let client = discovery
+                    .server
+                    .as_connected()
+                    .expect("connected")
+                    .client
+                    .clone();
+                let store = crate::state::store::AppStore::new(
+                    crate::state::app_state_store::AppState::default(),
+                    None,
+                );
+                let writer = crate::state::app_state_store::McpWriter::new(store.clone());
+                crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+                    discovery, &writer,
+                );
+
+                // The fixture announces a changed list named by the tool
+                // called.
+                runtime::call_mcp_tool(&client, "prompts", Map::new(), None)
                     .await
-                    .expect("prompts/resources list_changed should be emitted");
-                let handle = |client: &McpServerConnection| {
-                    client.as_connected().map(|record| record.client.clone())
-                };
-                assert_eq!(handle(&prompts_client), handle(&discovery.server));
-                assert_eq!(handle(&resources_client), handle(&discovery.server));
+                    .expect("the tool call");
+                let second_prompt = mcp_prompt_command_name(SERVER, "second_prompt");
+                until_state(&store, "the refetched prompts", |state| {
+                    state
+                        .mcp
+                        .commands
+                        .iter()
+                        .any(|command| command.name == second_prompt)
+                })
+                .await;
+                let commands = store.get().mcp.commands.clone();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0].arg_names, vec!["topic"]);
 
-                let refreshed_prompts =
-                    runtime::refresh_mcp_prompts_for_client(&prompts_client).await;
-                assert_eq!(refreshed_prompts.len(), 1);
+                runtime::call_mcp_tool(&client, "resources", Map::new(), None)
+                    .await
+                    .expect("the tool call");
+                until_state(&store, "the refetched resources", |state| {
+                    state
+                        .mcp
+                        .resources
+                        .get(SERVER)
+                        .and_then(|resources| resources.first())
+                        .is_some_and(|resource| resource.name == "second_resource")
+                })
+                .await;
+                let state = store.get();
+                let resources = &state.mcp.resources[SERVER];
+                assert_eq!(resources.len(), 1);
+                assert_eq!(resources[0].uri, "file:///tmp/second_resource.txt");
+                assert_eq!(resources[0].mime_type.as_deref(), Some("text/plain"));
+                // Still this connection's record; which record a handler
+                // writes is told apart by the same-name test.
                 assert_eq!(
-                    refreshed_prompts[0].name,
-                    mcp_prompt_command_name(SERVER, "second_prompt")
-                );
-                assert_eq!(refreshed_prompts[0].arg_names, vec!["topic"]);
-
-                let refreshed_resources =
-                    runtime::refresh_mcp_resources_for_client(&resources_client).await;
-                assert_eq!(refreshed_resources.len(), 1);
-                assert_eq!(refreshed_resources[0].name, "second_resource");
-                assert_eq!(
-                    refreshed_resources[0].uri,
-                    "file:///tmp/second_resource.txt"
-                );
-                assert_eq!(
-                    refreshed_resources[0].mime_type.as_deref(),
-                    Some("text/plain")
+                    state.mcp.clients[0]
+                        .as_connected()
+                        .map(|record| &record.client),
+                    Some(&client)
                 );
 
                 runtime::clear_server_cache(SERVER, None).await;
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
             });
         let _ = std::fs::remove_file(script_path);
     }

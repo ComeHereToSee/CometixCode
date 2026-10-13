@@ -192,20 +192,21 @@ pub(crate) fn run_ide_selection_effect(
     let current_ide = current_ide.clone();
     let on_select = on_select.clone();
     ide_client.set_notification_handler(SELECTION_CHANGED_METHOD, move |params| {
-        let Some(selection) = ide_selection_from_notification_params(params.as_ref()) else {
-            return;
-        };
-        // CC `:115-117`: a handler of a client no longer current is ignored.
-        // The check holds the lock through the send, as the effect holds it
-        // through its reset: CC runs both on one thread, so a selection of a
-        // client that just stopped being current never lands after the
-        // reset.
-        let current = current_ide
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *current == Some(registered) {
-            let _ = on_select.try_send(selection);
+        use futures::FutureExt as _;
+        if let Some(selection) = ide_selection_from_notification_params(params.as_ref()) {
+            // CC `:115-117`: a handler of a client no longer current is
+            // ignored. The check holds the lock through the send, as the
+            // effect holds it through its reset: CC runs both on one thread,
+            // so a selection of a client that just stopped being current
+            // never lands after the reset.
+            let current = current_ide
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *current == Some(registered) {
+                let _ = on_select.try_send(selection);
+            }
         }
+        futures::future::ready(()).boxed()
     });
 }
 

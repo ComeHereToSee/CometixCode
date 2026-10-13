@@ -470,10 +470,11 @@ pub fn handle_channel_permission_notification_event(
 //
 // Claude Code registers `onclose` / `setNotificationHandler` closures inside
 // `onConnectionAttempt` that call `updateServer` / `setAppState` directly.
-// `onclose` is assigned on the client itself here too
-// ([`install_connection_handlers`]). The notification handlers are not yet:
-// App mounts [`OnConnectionAttemptHandlers`], and the rmcp client handler
-// invokes the `emit_*` entry points below for every connection.
+// `onclose` and the list_changed handlers are assigned on the client itself
+// here too ([`install_connection_handlers`]). The channel and elicitation
+// handlers are not yet: App mounts [`OnConnectionAttemptHandlers`], and the
+// rmcp client handler invokes the `emit_*` entry points below for every
+// connection.
 // IDE `selection_changed` is REPL-owned (CC `useIdeSelection`): the REPL
 // registers its handler on the IDE client itself
 // (`hooks::use_ide_selection::use_ide_selection`).
@@ -495,23 +496,71 @@ pub(crate) fn on_connection_attempt(result: McpConnectionDiscovery, writer: &Mcp
 
 /// Maps to: CC what `onConnectionAttempt` installs on a connected client
 /// (`useManageMCPConnections.ts:326-753`): its `onclose`
-/// (`client.client.onclose = () => { ... }`, `:333-468`). The handler
-/// captures the writer where CC's captures `updateServer`; the writer
-/// applies its updates at once, CC's queue batches them.
+/// (`client.client.onclose = () => { ... }`, `:333-468`) and a list_changed
+/// handler per list the server declared can change (`:616-751`). The
+/// handlers capture the writer where CC's capture `updateServer`; the
+/// writer applies its updates at once, CC's queue batches them.
 fn install_connection_handlers(server: &McpServerConnection, writer: &McpWriter) {
+    use futures::FutureExt as _;
+    use rmcp::model::ConstString as _;
     let Some(connected) = server.as_connected() else {
         return;
     };
-    let (name, config, writer) = (
-        connected.name.clone(),
-        connected.config.clone(),
-        writer.clone(),
-    );
-    connected.client.set_onclose(move || {
-        use futures::FutureExt as _;
-        handle_mcp_server_closed_event(name.clone(), config.clone(), writer.clone()).boxed()
-    });
+    {
+        let (name, config, writer) = (
+            connected.name.clone(),
+            connected.config.clone(),
+            writer.clone(),
+        );
+        connected.client.set_onclose(move || {
+            handle_mcp_server_closed_event(name.clone(), config.clone(), writer.clone()).boxed()
+        });
+    }
+
+    // Maps to: CC `:616-751`: a handler for each list the server declared
+    // can change, refreshing it on the client it closed over. The handler
+    // lives on that client, so it holds it weakly.
+    let capabilities = &connected.capabilities;
+    let lists: [(bool, &str, &'static str, ListChangedHandler); 3] = [
+        (
+            declares_tools_list_changed(capabilities),
+            rmcp::model::ToolListChangedNotificationMethod::VALUE,
+            "Received tools/list_changed notification, refreshing tools",
+            |client, writer| handle_mcp_tools_list_changed_event(client, writer).boxed(),
+        ),
+        (
+            declares_prompts_list_changed(capabilities),
+            rmcp::model::PromptListChangedNotificationMethod::VALUE,
+            "Received prompts/list_changed notification, refreshing prompts",
+            |client, writer| handle_mcp_prompts_list_changed_event(client, writer).boxed(),
+        ),
+        (
+            declares_resources_list_changed(capabilities),
+            rmcp::model::ResourceListChangedNotificationMethod::VALUE,
+            "Received resources/list_changed notification, refreshing resources",
+            |client, writer| handle_mcp_resources_list_changed_event(client, writer).boxed(),
+        ),
+    ];
+    for (declared, method, message, refresh) in lists {
+        if !declared {
+            continue;
+        }
+        let (client, writer) = (connected.client.downgrade(), writer.clone());
+        connected.client.set_notification_handler(method, move |_| {
+            match client.connected_record() {
+                Some(client) => {
+                    crate::utils::log::log_mcp_debug(client.name(), message);
+                    refresh(client, writer.clone())
+                }
+                None => futures::future::ready(()).boxed(),
+            }
+        });
+    }
 }
+
+/// The body of a list_changed handler: refetch on `client`, write with it.
+type ListChangedHandler =
+    fn(McpServerConnection, McpWriter) -> futures::future::BoxFuture<'static, ()>;
 
 use crate::services::mcp::elicitation_handler::ElicitationRequestEvent;
 use std::collections::VecDeque;
@@ -548,21 +597,6 @@ impl OnConnectionAttemptHandlers {
             mcp,
             channel_permission_callbacks,
         }
-    }
-
-    /// Maps to: CC `ToolListChangedNotificationSchema` handler.
-    pub async fn on_tools_list_changed(&self, client: McpServerConnection) {
-        handle_mcp_tools_list_changed_event(client, self.mcp.clone()).await;
-    }
-
-    /// Maps to: CC `PromptListChangedNotificationSchema` handler.
-    pub async fn on_prompts_list_changed(&self, client: McpServerConnection) {
-        handle_mcp_prompts_list_changed_event(client, self.mcp.clone()).await;
-    }
-
-    /// Maps to: CC `ResourceListChangedNotificationSchema` handler.
-    pub async fn on_resources_list_changed(&self, client: McpServerConnection) {
-        handle_mcp_resources_list_changed_event(client, self.mcp.clone()).await;
     }
 
     /// Maps to: CC channel message notification handler in `onConnectionAttempt`.
@@ -644,37 +678,12 @@ fn with_connection_handlers<R>(f: impl FnOnce(&OnConnectionAttemptHandlers) -> R
     guard.handlers.as_ref().map(f)
 }
 
-async fn with_connection_handlers_async<R, Fut>(
-    f: impl FnOnce(OnConnectionAttemptHandlers) -> Fut,
-) -> Option<R>
-where
-    Fut: std::future::Future<Output = R>,
-{
-    let hooks = {
-        let guard = connection_attempt_handlers_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.handlers.clone()
-    };
-    if let Some(hooks) = hooks {
-        Some(f(hooks).await)
-    } else {
-        None
-    }
-}
-
-// --- emit helpers used by the rmcp client handler (CC setNotificationHandler bodies) ---
+// --- list_changed registration gates and the emit helpers the rmcp client handler calls ---
 
 /// Maps to: CC `useManageMCPConnections.ts:618`
-/// `if (client.capabilities?.tools?.listChanged)`.
-///
-/// At the source this gates handler REGISTRATION — a server that never declared
-/// the capability simply has no handler installed. rmcp installs its handler
-/// trait methods unconditionally, so the gate has to be evaluated per
-/// notification instead. The predicate lives here rather than at the rmcp
-/// handler in `client.rs` because the decision is this file's: `client.rs` is
-/// the transport seam that happens to receive the notification, and
-/// `useManageMCPConnections.ts` is what CC gives the choice to.
+/// `if (client.capabilities?.tools?.listChanged)`: it gates the handler's
+/// registration — a server that never declared the capability has none
+/// ([`install_connection_handlers`]).
 pub(crate) fn declares_tools_list_changed(capabilities: &rmcp::model::ServerCapabilities) -> bool {
     capabilities
         .tools
@@ -684,8 +693,8 @@ pub(crate) fn declares_tools_list_changed(capabilities: &rmcp::model::ServerCapa
 }
 
 /// Maps to: CC `useManageMCPConnections.ts:667`
-/// `if (client.capabilities?.prompts?.listChanged)` — see
-/// [`declares_tools_list_changed`] for why the gate moved inside.
+/// `if (client.capabilities?.prompts?.listChanged)`, the prompts handler's
+/// registration gate.
 pub(crate) fn declares_prompts_list_changed(
     capabilities: &rmcp::model::ServerCapabilities,
 ) -> bool {
@@ -697,8 +706,8 @@ pub(crate) fn declares_prompts_list_changed(
 }
 
 /// Maps to: CC `useManageMCPConnections.ts:705`
-/// `if (client.capabilities?.resources?.listChanged)` — see
-/// [`declares_tools_list_changed`] for why the gate moved inside.
+/// `if (client.capabilities?.resources?.listChanged)`, the resources
+/// handler's registration gate.
 ///
 /// Note this is the `listChanged` sub-capability, NOT `!!capabilities.resources`
 /// (CC `client.ts:2169`), which is a separate question: a connected record's
@@ -711,47 +720,6 @@ pub(crate) fn declares_resources_list_changed(
         .as_ref()
         .and_then(|capability| capability.list_changed)
         .unwrap_or(false)
-}
-
-/// `client` is the connected record of the connection that sent the
-/// notification, as CC's handler closes over it.
-pub(crate) async fn emit_tools_list_changed(client: McpServerConnection) {
-    let handled = with_connection_handlers_async({
-        let client = client.clone();
-        |hooks| async move { hooks.on_tools_list_changed(client).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ToolsListChanged { client }).await;
-}
-
-pub(crate) async fn emit_prompts_list_changed(client: McpServerConnection) {
-    let handled = with_connection_handlers_async({
-        let client = client.clone();
-        |hooks| async move { hooks.on_prompts_list_changed(client).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::PromptsListChanged { client }).await;
-}
-
-pub(crate) async fn emit_resources_list_changed(client: McpServerConnection) {
-    let handled = with_connection_handlers_async({
-        let client = client.clone();
-        |hooks| async move { hooks.on_resources_list_changed(client).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ResourcesListChanged { client }).await;
 }
 
 pub(crate) async fn emit_channel_message_received(
@@ -837,17 +805,6 @@ pub(crate) async fn emit_elicitation_completed(name: String, elicitation_id: Str
 /// (unit tests that exercise the rmcp client without mounting App).
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpConnectionCallbackObservation {
-    /// The `client` each carries is the connection that sent the
-    /// notification.
-    ToolsListChanged {
-        client: McpServerConnection,
-    },
-    PromptsListChanged {
-        client: McpServerConnection,
-    },
-    ResourcesListChanged {
-        client: McpServerConnection,
-    },
     ChannelMessageReceived {
         name: String,
         content: String,
@@ -880,8 +837,7 @@ fn test_observations() -> &'static AsyncMutex<VecDeque<McpConnectionCallbackObse
 /// Queued in test builds only. A production run without App's hooks is a
 /// print run, whose CC counterpart registers only elicitation-complete and
 /// channel handlers on its connections (`print.ts:1358`, `:4733`,
-/// `:4809`): the event is dropped there rather than kept unread, as an
-/// observation holds the connection's handle.
+/// `:4809`): the event is dropped there rather than kept unread.
 async fn observe_for_test(observation: McpConnectionCallbackObservation) {
     #[cfg(test)]
     test_observations().lock().await.push_back(observation);
