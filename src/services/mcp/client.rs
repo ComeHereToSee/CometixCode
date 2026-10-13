@@ -12,9 +12,9 @@
 //! components and slash commands must not instantiate transports directly.
 
 use super::elicitation_handler::{
-    ElicitationAction, ElicitationRequestEvent, ElicitationRequestParams, ElicitationResult,
-    reduce_elicitation_hook_results, reduce_elicitation_result_hook_results,
-    url_elicitation_required_result_message,
+    ElicitationAction, ElicitationRequestEvent, ElicitationResult, ElicitationWaitingState,
+    PENDING_ELICITATION_RESPONSES, elicitation_request_json,
+    rmcp_elicitation_params_to_event_params, run_elicitation_hooks, run_elicitation_result_hooks,
 };
 use super::types::{
     ConnectedMcpServer, McpServerConnection, McpServerConnectionType, ScopedMcpServerConfig,
@@ -35,16 +35,6 @@ use serde_json::{Map, Value};
 /// ([`crate::services::mcp::use_manage_mcp_connections::OnConnectionAttemptHandlers`],
 /// which App registers): a tool call's URL elicitation queue push.
 pub use crate::services::mcp::use_manage_mcp_connections::drain_mcp_connection_callback_observations;
-
-/// Maps to: CC `ElicitationRequestEvent.respond(...)` callback stored in
-/// `services/mcp/elicitationHandler.ts`.
-pub async fn respond_to_mcp_elicitation(
-    server_name: &str,
-    request_id: &str,
-    result: ElicitationResult,
-) -> bool {
-    runtime::respond_to_mcp_elicitation(server_name, request_id, result).await
-}
 
 /// Maps to: CC `DEFAULT_MCP_TOOL_TIMEOUT_MS`.
 pub const DEFAULT_MCP_TOOL_TIMEOUT_MS: u64 = 100_000_000;
@@ -903,7 +893,7 @@ mod runtime {
     use std::sync::{Arc, LazyLock, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::process::Command;
-    use tokio::sync::{Mutex, oneshot};
+    use tokio::sync::oneshot;
 
     const DEFAULT_MCP_CONNECTION_TIMEOUT_MS: u64 = 30_000;
     const MCP_AUTH_CACHE_TTL_MS: u64 = 15 * 60 * 1000;
@@ -911,8 +901,6 @@ mod runtime {
     /// CC SDK `ErrorCode.UrlElicitationRequired` (`types.ts`). rmcp dropped
     /// the constant in 3.x along with its URL-elicitation error helpers.
     pub(super) const URL_ELICITATION_REQUIRED: ErrorCode = ErrorCode(-32042);
-    /// CC SDK `ElicitationCompleteNotificationSchema.method`.
-    const ELICITATION_COMPLETE_NOTIFICATION_METHOD: &str = "notifications/elicitation/complete";
     /// CC SDK `LATEST_PROTOCOL_VERSION`, the version `Client.connect` sends
     /// in `initialize`. rmcp's default (`ProtocolVersion::LATEST`) is the
     /// 2026-07-28 draft, which has no `initialize` handshake at all.
@@ -944,9 +932,6 @@ mod runtime {
         Ok(service)
     }
 
-    static PENDING_ELICITATION_RESPONSES: LazyLock<
-        Mutex<HashMap<(String, String), oneshot::Sender<ElicitationResult>>>,
-    > = LazyLock::new(|| Mutex::new(HashMap::new()));
     static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
     /// A connection being made or made, shared by every caller that asks for
@@ -1397,38 +1382,6 @@ mod runtime {
         }
     }
 
-    fn rmcp_elicitation_params_to_event_params(
-        params: &RmcpElicitRequestParams,
-    ) -> ElicitationRequestParams {
-        match params {
-            RmcpElicitRequestParams::FormElicitationParams {
-                message,
-                requested_schema,
-                ..
-            } => ElicitationRequestParams::Form {
-                message: message.clone(),
-                requested_schema: serde_json::to_value(requested_schema)
-                    .unwrap_or_else(|_| Value::Object(Map::new())),
-            },
-            RmcpElicitRequestParams::UrlElicitationParams {
-                message,
-                url,
-                elicitation_id,
-                ..
-            } => ElicitationRequestParams::Url {
-                message: message.clone(),
-                url: url.clone(),
-                elicitation_id: Some(elicitation_id.clone()),
-            },
-            _ => ElicitationRequestParams::Form {
-                // Safe fallback for future rmcp variants; current MCP variants
-                // map above and match CC `getElicitationMode(...)`.
-                message: "Unsupported MCP elicitation request".to_string(),
-                requested_schema: Value::Object(Map::new()),
-            },
-        }
-    }
-
     fn elicitation_result_to_rmcp(result: ElicitationResult) -> RmcpElicitResult {
         let action = match result.action {
             ElicitationAction::Accept => RmcpElicitationAction::Accept,
@@ -1440,307 +1393,6 @@ mod runtime {
             out.content = Some(content);
         }
         out
-    }
-
-    fn cancel_elicitation_result() -> RmcpElicitResult {
-        RmcpElicitResult::new(RmcpElicitationAction::Cancel)
-    }
-
-    fn rmcp_elicitation_hook_details(
-        params: &RmcpElicitRequestParams,
-    ) -> (
-        String,
-        Option<Value>,
-        &'static str,
-        Option<String>,
-        Option<String>,
-    ) {
-        match params {
-            RmcpElicitRequestParams::FormElicitationParams {
-                message,
-                requested_schema,
-                ..
-            } => (
-                message.clone(),
-                Some(
-                    serde_json::to_value(requested_schema)
-                        .unwrap_or_else(|_| Value::Object(Map::new())),
-                ),
-                "form",
-                None,
-                None,
-            ),
-            RmcpElicitRequestParams::UrlElicitationParams {
-                message,
-                url,
-                elicitation_id,
-                ..
-            } => (
-                message.clone(),
-                None,
-                "url",
-                Some(url.clone()),
-                Some(elicitation_id.clone()),
-            ),
-            _ => (
-                "Unsupported MCP elicitation request".to_string(),
-                None,
-                "form",
-                None,
-                None,
-            ),
-        }
-    }
-
-    fn load_mcp_elicitation_hooks_config_and_env() -> Option<(
-        crate::services::hooks::RegisteredHooks,
-        crate::services::hooks::HookContext,
-        Vec<(String, String)>,
-    )> {
-        let loaded_hooks =
-            crate::utils::hooks::hooks_config_snapshot::load_hooks_config_from_settings_sources();
-        let config = loaded_hooks.config;
-        if config.is_empty() {
-            return None;
-        }
-        let cwd = std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
-        let hook_context = crate::services::hooks::HookContext {
-            cwd,
-            permission_mode: loaded_hooks.merged_settings.default_permission_mode,
-            ..Default::default()
-        };
-        Some((config, hook_context, Vec::new()))
-    }
-
-    async fn run_elicitation_hooks_for_request(
-        server_name: &str,
-        request: &RmcpElicitRequestParams,
-    ) -> Option<ElicitationResult> {
-        let (config, hook_context, base_env) = load_mcp_elicitation_hooks_config_and_env()?;
-        let (message, requested_schema, mode, url, elicitation_id) =
-            rmcp_elicitation_hook_details(request);
-        let results = crate::services::hooks::elicitation::execute_elicitation_hooks(
-            &config,
-            &hook_context,
-            server_name,
-            &message,
-            requested_schema,
-            Some(mode),
-            url.as_deref(),
-            elicitation_id.as_deref(),
-            base_env,
-        )
-        .await;
-        let (response, blocking_error) = reduce_elicitation_hook_results(&results);
-        if blocking_error.is_some() {
-            Some(ElicitationResult::new(ElicitationAction::Decline))
-        } else {
-            response
-        }
-    }
-
-    pub(super) fn elicitation_complete_notification_message(
-        server_name: &str,
-        elicitation_id: &str,
-    ) -> String {
-        // Maps to: CC `registerElicitationHandler(...)` completion
-        // notification hook message.
-        format!("MCP server \"{server_name}\" confirmed elicitation {elicitation_id} complete")
-    }
-
-    pub(super) fn elicitation_response_notification_message(
-        server_name: &str,
-        action: &str,
-    ) -> String {
-        // Maps to: CC `runElicitationResultHooks(...)` response
-        // notification hook message.
-        format!("Elicitation response for server \"{server_name}\": {action}")
-    }
-
-    fn spawn_elicitation_notification_hooks(message: String, notification_type: &'static str) {
-        let Some((config, _, base_env)) = load_mcp_elicitation_hooks_config_and_env() else {
-            return;
-        };
-        tokio::spawn(async move {
-            crate::services::hooks::lifecycle::execute_notification_hooks(
-                &config,
-                &message,
-                notification_type,
-                None,
-                base_env,
-            )
-            .await;
-        });
-    }
-
-    /// Maps to: CC `registerElicitationHandler(client, serverName,
-    /// setAppState)` (`elicitationHandler.ts:68-212`), which
-    /// `onConnectionAttempt` calls in place of the default handler
-    /// `connectToServer` registered. The request handler lets the elicitation
-    /// hooks answer first, else queues the request for the dialog and waits
-    /// for its answer or the request's cancellation, then runs the result
-    /// hooks. The completion handler marks the queued request complete.
-    ///
-    /// Placed with the rest of the elicitation runtime, which sits on the
-    /// rmcp side here rather than in `elicitation_handler.rs`.
-    pub(crate) fn register_elicitation_handler(
-        client: &McpClient,
-        server_name: &str,
-        writer: &crate::state::app_state_store::McpWriter,
-    ) {
-        use futures::FutureExt as _;
-        {
-            let (server_name, writer) = (server_name.to_owned(), writer.clone());
-            client.set_elicitation_handler(move |request, request_id, cancelled| {
-                queue_elicitation_request(
-                    server_name.clone(),
-                    request,
-                    request_id,
-                    cancelled,
-                    writer.clone(),
-                )
-                .boxed()
-            });
-        }
-        // `:175-207`. rmcp has no typed variant for
-        // `notifications/elicitation/complete`, so it arrives as a custom
-        // notification. A payload without a string `elicitationId` fails the
-        // SDK schema and never reaches CC's handler; it is dropped the same
-        // way.
-        let (server_name, writer) = (server_name.to_owned(), writer.clone());
-        client.set_notification_handler(ELICITATION_COMPLETE_NOTIFICATION_METHOD, move |params| {
-            if let Some(elicitation_id) = params
-                .as_ref()
-                .and_then(|params| params.get("elicitationId"))
-                .and_then(Value::as_str)
-            {
-                crate::utils::log::log_mcp_debug(
-                    &server_name,
-                    &format!("Received elicitation completion notification: {elicitation_id}"),
-                );
-                spawn_elicitation_notification_hooks(
-                    elicitation_complete_notification_message(&server_name, elicitation_id),
-                    "elicitation_complete",
-                );
-                writer.mark_elicitation_complete(&server_name, elicitation_id);
-            }
-            futures::future::ready(()).boxed()
-        });
-    }
-
-    /// The request handler of [`register_elicitation_handler`]
-    /// (`elicitationHandler.ts:77-171`).
-    async fn queue_elicitation_request(
-        server_name: String,
-        request: RmcpElicitRequestParams,
-        request_id: String,
-        mut cancelled: futures::future::BoxFuture<'static, ()>,
-        writer: crate::state::app_state_store::McpWriter,
-    ) -> ElicitationResult {
-        use futures::FutureExt as _;
-        crate::utils::log::log_mcp_debug(
-            &server_name,
-            &format!(
-                "Received elicitation request: {}",
-                elicitation_request_json(&request)
-            ),
-        );
-        if let Some(hook_response) = run_elicitation_hooks_for_request(&server_name, &request).await
-        {
-            crate::utils::log::log_mcp_debug(
-                &server_name,
-                &format!(
-                    "Elicitation resolved by hook: {}",
-                    elicitation_result_json(&hook_response)
-                ),
-            );
-            return hook_response;
-        }
-
-        // `:119-122`: a request already cancelled is not queued.
-        if (&mut cancelled).now_or_never().is_some() {
-            return ElicitationResult::new(ElicitationAction::Cancel);
-        }
-        let (sender, receiver) = oneshot::channel::<ElicitationResult>();
-        PENDING_ELICITATION_RESPONSES
-            .lock()
-            .await
-            .insert((server_name.clone(), request_id.clone()), sender);
-        writer.push_elicitation_event(ElicitationRequestEvent::new(
-            server_name.clone(),
-            request_id.clone(),
-            rmcp_elicitation_params_to_event_params(&request),
-        ));
-        let raw_result = tokio::select! {
-            _ = cancelled => {
-                // `:115-117`, and the dialog that cancels on the abort
-                // (`ElicitationDialog.tsx:193-209`): the request leaves the
-                // queue as it is answered with a cancel.
-                PENDING_ELICITATION_RESPONSES
-                    .lock()
-                    .await
-                    .remove(&(server_name.clone(), request_id.clone()));
-                writer.remove_elicitation_event(&server_name, &request_id);
-                ElicitationResult::new(ElicitationAction::Cancel)
-            }
-            response = receiver => {
-                response.unwrap_or_else(|_| ElicitationResult::new(ElicitationAction::Cancel))
-            }
-        };
-        crate::utils::log::log_mcp_debug(
-            &server_name,
-            &format!(
-                "Elicitation response: {}",
-                elicitation_result_json(&raw_result)
-            ),
-        );
-        run_elicitation_result_hooks_for_response(&server_name, &request, raw_result).await
-    }
-
-    /// CC `jsonStringify(request)` of an `elicitation/create` request.
-    fn elicitation_request_json(request: &RmcpElicitRequestParams) -> Value {
-        serde_json::json!({ "method": "elicitation/create", "params": request })
-    }
-
-    /// CC `jsonStringify(result)` of an `ElicitResult`.
-    fn elicitation_result_json(result: &ElicitationResult) -> Value {
-        let mut json = serde_json::json!({ "action": result.action.as_str() });
-        if let Some(content) = &result.content {
-            json["content"] = content.clone();
-        }
-        json
-    }
-
-    async fn run_elicitation_result_hooks_for_response(
-        server_name: &str,
-        request: &RmcpElicitRequestParams,
-        result: ElicitationResult,
-    ) -> ElicitationResult {
-        let Some((config, hook_context, base_env)) = load_mcp_elicitation_hooks_config_and_env()
-        else {
-            return result;
-        };
-        let (_, _, mode, _, elicitation_id) = rmcp_elicitation_hook_details(request);
-        let results = crate::services::hooks::elicitation::execute_elicitation_result_hooks(
-            &config,
-            &hook_context,
-            server_name,
-            result.action.as_str(),
-            result.content.clone(),
-            Some(mode),
-            elicitation_id.as_deref(),
-            base_env,
-        )
-        .await;
-        let final_result = reduce_elicitation_result_hook_results(&result, &results).0;
-        spawn_elicitation_notification_hooks(
-            elicitation_response_notification_message(server_name, final_result.action.as_str()),
-            "elicitation_response",
-        );
-        final_result
     }
 
     impl ClientHandler for CometixMcpClientHandler {
@@ -3359,20 +3011,6 @@ mod runtime {
         crate::services::mcp::use_manage_mcp_connections::drain_mcp_connection_callback_observations().await
     }
 
-    pub async fn respond_to_mcp_elicitation(
-        server_name: &str,
-        request_id: &str,
-        result: ElicitationResult,
-    ) -> bool {
-        // Maps to: CC `ElicitationRequestEvent.respond` resolving the pending
-        // `ElicitResult` promise inside `registerElicitationHandler(...)`.
-        let sender = PENDING_ELICITATION_RESPONSES
-            .lock()
-            .await
-            .remove(&(server_name.to_string(), request_id.to_string()));
-        sender.is_some_and(|sender| sender.send(result).is_ok())
-    }
-
     async fn wait_for_url_elicitation_retry(
         server_name: &str,
         request: &RmcpElicitRequestParams,
@@ -3391,16 +3029,38 @@ mod runtime {
             .lock()
             .await
             .insert((server_name.to_string(), request_id.clone()), sender);
-        let event = ElicitationRequestEvent::new(
+        let mut event = ElicitationRequestEvent::new(
             server_name.to_string(),
             request_id,
             rmcp_elicitation_params_to_event_params(request),
-        )
-        .with_error_retry_waiting_state();
+        );
+        // `waitingState: { actionLabel: 'Retry now', showCancel: true }`
+        // (`client.ts:2950-2953`).
+        event.waiting_state = Some(ElicitationWaitingState {
+            action_label: "Retry now".to_string(),
+            show_cancel: true,
+        });
         crate::services::mcp::use_manage_mcp_connections::emit_elicitation_requested(event).await;
         receiver
             .await
             .unwrap_or_else(|_| ElicitationResult::new(ElicitationAction::Cancel))
+    }
+
+    /// The tool result `callMCPToolWithUrlElicitationRetry` returns when a hook
+    /// or the user does not accept (`client.ts:2936`, `:3014`).
+    fn url_elicitation_required_result_message(
+        action: ElicitationAction,
+        source: &str,
+        tool: &str,
+    ) -> String {
+        let verb = match action {
+            ElicitationAction::Decline => "declined",
+            ElicitationAction::Cancel => "canceled",
+            ElicitationAction::Accept => "accepted",
+        };
+        format!(
+            "URL elicitation was {verb} by {source}. The tool \"{tool}\" could not complete because it requires the user to open a URL."
+        )
     }
 
     pub(super) async fn process_url_elicitation_required(
@@ -3410,9 +3070,7 @@ mod runtime {
         handle_elicitation: crate::tool::HandleElicitationCallback,
     ) -> Option<Value> {
         for elicitation in elicitations {
-            if let Some(hook_response) =
-                run_elicitation_hooks_for_request(server_name, &elicitation).await
-            {
+            if let Some(hook_response) = run_elicitation_hooks(server_name, &elicitation).await {
                 if hook_response.action != ElicitationAction::Accept {
                     return Some(mcp_tool_text_result(
                         url_elicitation_required_result_message(
@@ -3437,8 +3095,7 @@ mod runtime {
                 wait_for_url_elicitation_retry(server_name, &elicitation).await
             };
             let final_result =
-                run_elicitation_result_hooks_for_response(server_name, &elicitation, user_result)
-                    .await;
+                run_elicitation_result_hooks(server_name, &elicitation, user_result).await;
             if final_result.action != ElicitationAction::Accept {
                 return Some(mcp_tool_text_result(
                     url_elicitation_required_result_message(final_result.action, "the user", tool),
@@ -4248,7 +3905,6 @@ mod runtime {
     }
 }
 
-pub(crate) use runtime::register_elicitation_handler;
 pub use runtime::{
     McpClient, call_ide_rpc, call_mcp_tool, call_mcp_tool_with_elicitation, cleanup_connection,
     cleanup_memoized_connection, clear_mcp_auth_cache, clear_server_cache, connect_to_server,
@@ -6218,18 +5874,6 @@ rl.on('line', line => {
     }
 
     #[test]
-    fn elicitation_notification_messages_match_official_hooks() {
-        assert_eq!(
-            runtime::elicitation_complete_notification_message("docs", "elicit-1"),
-            "MCP server \"docs\" confirmed elicitation elicit-1 complete"
-        );
-        assert_eq!(
-            runtime::elicitation_response_notification_message("docs", "decline"),
-            "Elicitation response for server \"docs\": decline"
-        );
-    }
-
-    #[test]
     fn url_elicitation_required_error_parsing_matches_official_validation() {
         let error = anyhow::Error::new(rmcp::ErrorData::new(
             runtime::URL_ELICITATION_REQUIRED,
@@ -6597,7 +6241,7 @@ rl.on('line', line => {
                     other => panic!("expected one URL elicitation event, got {other:?}"),
                 };
                 assert!(
-                    runtime::respond_to_mcp_elicitation(
+                    crate::services::mcp::elicitation_handler::respond_to_mcp_elicitation(
                         SERVER_ACCEPT,
                         &request_id,
                         ElicitationResult::new(ElicitationAction::Accept),
@@ -6626,7 +6270,7 @@ rl.on('line', line => {
                     other => panic!("expected one URL elicitation event, got {other:?}"),
                 };
                 assert!(
-                    runtime::respond_to_mcp_elicitation(
+                    crate::services::mcp::elicitation_handler::respond_to_mcp_elicitation(
                         SERVER_DECLINE,
                         &request_id,
                         ElicitationResult::new(ElicitationAction::Decline),
@@ -6637,12 +6281,7 @@ rl.on('line', line => {
                 assert_eq!(
                     result["content"][0]["text"].as_str(),
                     Some(
-                        url_elicitation_required_result_message(
-                            ElicitationAction::Decline,
-                            "the user",
-                            "login",
-                        )
-                        .as_str()
+                        "URL elicitation was declined by the user. The tool \"login\" could not complete because it requires the user to open a URL."
                     )
                 );
 
@@ -6791,7 +6430,7 @@ rl.on('line', line => {
                 .expect("URL elicitation event should be queued");
 
                 assert!(
-                    runtime::respond_to_mcp_elicitation(
+                    crate::services::mcp::elicitation_handler::respond_to_mcp_elicitation(
                         SERVER,
                         &request_id,
                         ElicitationResult::new(ElicitationAction::Accept),
@@ -7157,7 +6796,7 @@ rl.on('line', line => {
             ));
             assert_eq!(event.waiting_state, None);
             assert!(
-                runtime::respond_to_mcp_elicitation(
+                crate::services::mcp::elicitation_handler::respond_to_mcp_elicitation(
                     SERVER,
                     &event.request_id,
                     ElicitationResult::new(ElicitationAction::Accept),
@@ -7182,7 +6821,7 @@ rl.on('line', line => {
             })
             .await;
             assert!(
-                !runtime::respond_to_mcp_elicitation(
+                !crate::services::mcp::elicitation_handler::respond_to_mcp_elicitation(
                     SERVER,
                     "srv-2",
                     ElicitationResult::new(ElicitationAction::Accept),

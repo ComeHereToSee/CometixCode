@@ -555,7 +555,11 @@ fn install_connection_handlers(server: &McpServerConnection, writer: &McpWriter)
         return;
     };
     // Maps to: CC `:327-331`, in place of `connectToServer`'s default.
-    super::client::register_elicitation_handler(&connected.client, &connected.name, writer);
+    super::elicitation_handler::register_elicitation_handler(
+        &connected.client,
+        &connected.name,
+        writer,
+    );
     {
         let (name, config, writer) = (
             connected.name.clone(),

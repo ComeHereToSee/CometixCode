@@ -46,10 +46,9 @@ use crate::query::{
     PendingQueryMessage, QueryCommand, QueryEvent, QueryHandle, StopHookProgressEvent,
     deps::production_deps, spawn_query,
 };
-use crate::services::mcp::client::respond_to_mcp_elicitation;
 use crate::services::mcp::elicitation_handler::{
     ElicitationAction, ElicitationRequestParams, ElicitationWaitingDismissAction,
-    url_retry_waiting_dismiss_result,
+    respond_to_mcp_elicitation, url_retry_waiting_dismiss_result,
 };
 use crate::services::tools::tool_execution::{
     check_permissions_and_call_tool, check_permissions_and_call_tool_with_response,
