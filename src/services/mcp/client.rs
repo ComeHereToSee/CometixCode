@@ -12,8 +12,8 @@
 //! components and slash commands must not instantiate transports directly.
 
 use super::elicitation_handler::{
-    ElicitationAction, ElicitationRequestEvent, ElicitationResult, ElicitationWaitingState,
-    PENDING_ELICITATION_RESPONSES, elicitation_request_json,
+    ElicitationAction, ElicitationMode, ElicitationRequestEvent, ElicitationResult,
+    ElicitationWaitingState, PENDING_ELICITATION_RESPONSES, elicitation_request_json,
     rmcp_elicitation_params_to_event_params, run_elicitation_hooks, run_elicitation_result_hooks,
 };
 use super::types::{
@@ -883,7 +883,7 @@ mod runtime {
     };
     use rmcp::{ErrorData as McpError, RoleClient};
     use serde::{Deserialize, Serialize};
-    use std::collections::{BTreeMap, HashMap, VecDeque};
+    use std::collections::{BTreeMap, HashMap};
     use std::fmt;
     use std::future::Future;
     use std::path::PathBuf;
@@ -3006,11 +3006,6 @@ mod runtime {
         fetch_resources_for_client(client).await
     }
 
-    pub async fn drain_mcp_connection_callback_observations()
-    -> Vec<crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation> {
-        crate::services::mcp::use_manage_mcp_connections::drain_mcp_connection_callback_observations().await
-    }
-
     async fn wait_for_url_elicitation_retry(
         server_name: &str,
         request: &RmcpElicitRequestParams,
@@ -3094,8 +3089,21 @@ mod runtime {
             } else {
                 wait_for_url_elicitation_retry(server_name, &elicitation).await
             };
-            let final_result =
-                run_elicitation_result_hooks(server_name, &elicitation, user_result).await;
+            let elicitation_id = match &elicitation {
+                RmcpElicitRequestParams::UrlElicitationParams { elicitation_id, .. } => {
+                    Some(elicitation_id.as_str())
+                }
+                _ => None,
+            };
+            // `client.ts:3000-3006`: `runElicitationResultHooks(serverName,
+            // userResult, signal, 'url', elicitationId)`.
+            let final_result = run_elicitation_result_hooks(
+                server_name,
+                user_result,
+                Some(ElicitationMode::Url),
+                elicitation_id,
+            )
+            .await;
             if final_result.action != ElicitationAction::Accept {
                 return Some(mcp_tool_text_result(
                     url_elicitation_required_result_message(final_result.action, "the user", tool),
@@ -6153,12 +6161,14 @@ rl.on('line', line => {
     #[test]
     fn url_elicitation_prefers_the_sdk_handler_over_the_queue() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
+        // Elicitation notification hooks are detached onto it.
+        crate::utils::process_runtime::initialize_test_process_runtime();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 let elicitation =
                     |id: &str| rmcp::model::ElicitRequestParams::UrlElicitationParams {
                         meta: None,
@@ -6180,7 +6190,7 @@ rl.on('line', line => {
                 )
                 .await;
                 assert!(result.is_none(), "accept lets the retry proceed");
-                let events = runtime::drain_mcp_connection_callback_observations().await;
+                let events = drain_mcp_connection_callback_observations().await;
                 assert!(
                     events.is_empty(),
                     "the SDK handler bypasses the dialog queue: {events:?}"
@@ -6209,12 +6219,14 @@ rl.on('line', line => {
     #[test]
     fn url_elicitation_required_retry_queue_accept_and_decline_paths() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
+        // Elicitation notification hooks are detached onto it.
+        crate::utils::process_runtime::initialize_test_process_runtime();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
 
                 const SERVER_ACCEPT: &str = "docs-url-elicit-accept";
                 let accept = rmcp::model::ElicitRequestParams::UrlElicitationParams {
@@ -6230,7 +6242,7 @@ rl.on('line', line => {
                     crate::tool::HandleElicitationCallback::default(),
                 ));
                 tokio::task::yield_now().await;
-                let events = runtime::drain_mcp_connection_callback_observations().await;
+                let events = drain_mcp_connection_callback_observations().await;
                 let request_id = match events.as_slice() {
                     [crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ElicitationRequested { event }] => {
                         assert_eq!(event.server_name, SERVER_ACCEPT);
@@ -6264,7 +6276,7 @@ rl.on('line', line => {
                     crate::tool::HandleElicitationCallback::default(),
                 ));
                 tokio::task::yield_now().await;
-                let events = runtime::drain_mcp_connection_callback_observations().await;
+                let events = drain_mcp_connection_callback_observations().await;
                 let request_id = match events.as_slice() {
                     [crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ElicitationRequested { event }] => event.request_id.clone(),
                     other => panic!("expected one URL elicitation event, got {other:?}"),
@@ -6285,13 +6297,15 @@ rl.on('line', line => {
                     )
                 );
 
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
     }
 
     #[test]
     fn stdio_url_elicitation_required_retries_after_user_accepts() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
+        // Elicitation notification hooks are detached onto it.
+        crate::utils::process_runtime::initialize_test_process_runtime();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-mcp-url-elicit-{}.mjs",
             uuid::Uuid::new_v4()
@@ -6370,7 +6384,7 @@ rl.on('line', line => {
             .build()
             .unwrap()
             .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 runtime::clear_mcp_auth_cache();
                 const SERVER: &str = "url-elicit-stdio-fixture";
                 let config = ScopedMcpServerConfig {
@@ -6416,7 +6430,7 @@ rl.on('line', line => {
                 let request_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
                         for crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ElicitationRequested { event } in
-                            runtime::drain_mcp_connection_callback_observations().await
+                            drain_mcp_connection_callback_observations().await
                         {
                             assert_eq!(event.server_name, SERVER);
                             assert_eq!(event.request_id, "error-elicit-fixture-elicit");
@@ -6447,7 +6461,7 @@ rl.on('line', line => {
                 // "Unauthorized" text is no auth failure.
                 assert!(!runtime::is_mcp_auth_cached(SERVER));
                 runtime::clear_server_cache(SERVER, None).await;
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
         let _ = std::fs::remove_file(script_path);
     }
@@ -6511,7 +6525,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("initialize"), 2);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -6555,7 +6569,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("protocolVersion 2025-11-25"), 1);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -6591,7 +6605,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("resources/read"), 2);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -6861,7 +6875,7 @@ rl.on('line', line => {
                     runtime::cleanup_connection(client);
                     assert!(client.is_closed());
                 }
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
     }
 
@@ -6902,7 +6916,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("tools/list"), 2);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7074,7 +7088,7 @@ rl.on('line', line => {
                     client.is_closed()
                 })
                 .await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7122,7 +7136,7 @@ rl.on('line', line => {
             );
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7150,7 +7164,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("initialize"), 2);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7192,7 +7206,7 @@ rl.on('line', line => {
                 format!("MCP server \"{FAILING}\" is not connected")
             );
             runtime::clear_server_cache(FAILING, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7232,7 +7246,7 @@ rl.on('line', line => {
             );
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7335,7 +7349,7 @@ rl.on('line', line => {
             );
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7388,7 +7402,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("initialize"), 2);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7432,7 +7446,7 @@ rl.on('line', line => {
             assert_eq!(fixture.count("tools/list"), 3);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
     }
 
@@ -7842,7 +7856,7 @@ rl.on('line', line => {
             assert_eq!(state.mcp.resources[SERVER][0].uri, "file:///tmp/notes.txt");
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
         let _ = std::fs::remove_file(script_path);
     }
@@ -8092,7 +8106,7 @@ rl.on('line', line => {
             .build()
             .unwrap()
             .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 const SERVER: &str = "read-resource-stdio-fixture";
                 let uri = "file:///tmp/cometix-resource.txt";
                 let config = ScopedMcpServerConfig {
@@ -8135,7 +8149,7 @@ rl.on('line', line => {
                     Some("hello from read_resource")
                 );
                 runtime::clear_server_cache(SERVER, None).await;
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
         let _ = std::fs::remove_file(script_path);
     }
@@ -8186,7 +8200,7 @@ rl.on('line', line => {
             .build()
             .unwrap()
             .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 const SERVER: &str = "read-resource-no-capability-stdio-fixture";
                 let config = ScopedMcpServerConfig {
                     name: None,
@@ -8222,7 +8236,7 @@ rl.on('line', line => {
                     "Server \"read-resource-no-capability-stdio-fixture\" does not support resources"
                 );
                 runtime::clear_server_cache(SERVER, None).await;
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
         let _ = std::fs::remove_file(script_path);
     }
@@ -8290,7 +8304,7 @@ rl.on('line', line => {
         .expect("write MCP fixture");
 
         block_on_with_process_runtime(async {
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
             const SERVER: &str = "get-prompt-stdio-fixture";
             let config = ScopedMcpServerConfig {
                 name: None,
@@ -8343,7 +8357,7 @@ rl.on('line', line => {
             assert_eq!(blocks[0]["type"].as_str(), Some("text"));
             assert_eq!(blocks[0]["text"].as_str(), Some("summarize:roadmap"));
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let _ = drain_mcp_connection_callback_observations().await;
         });
         let _ = std::fs::remove_file(script_path);
     }
@@ -8360,7 +8374,7 @@ rl.on('line', line => {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpListener;
 
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 let listener = TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind streamable HTTP fixture");
@@ -8499,7 +8513,7 @@ rl.on('line', line => {
                 assert_eq!(discovery.server.config().transport, Transport::Http);
                 runtime::clear_server_cache(SERVER, None).await;
                 let _requests = server.await.expect("fixture server task");
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
     }
 
@@ -8545,7 +8559,7 @@ rl.on('line', line => {
                     String::from_utf8_lossy(&buffer).to_string()
                 }
 
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 let listener = TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind legacy SSE fixture");
@@ -8684,7 +8698,7 @@ rl.on('line', line => {
                 assert_eq!(discovery.server.config().transport, Transport::Sse);
                 runtime::clear_server_cache(SERVER, None).await;
                 let _requests = server.await.expect("fixture server task");
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
     }
 
@@ -8703,7 +8717,7 @@ rl.on('line', line => {
                 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
                 use tokio_tungstenite::tungstenite::protocol::Message;
 
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 let listener = TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind WebSocket fixture");
@@ -8847,7 +8861,7 @@ rl.on('line', line => {
                 assert_eq!(discovery.server.config().transport, Transport::Ws);
                 runtime::clear_server_cache(SERVER, None).await;
                 server.await.expect("fixture server task");
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
     }
 
@@ -8867,7 +8881,7 @@ rl.on('line', line => {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 use tokio::net::TcpListener;
 
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 let listener = TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind streamable HTTP auth fixture");
@@ -8938,7 +8952,7 @@ rl.on('line', line => {
                     )
                 );
                 server.await.expect("fixture server task");
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 assert!(!config_home.join(".credentials.json").exists());
                 assert!(!config_home.join("mcp-needs-auth-cache.json").exists());
             });
@@ -8987,7 +9001,7 @@ rl.on('line', line => {
                     String::from_utf8_lossy(&buffer).to_string()
                 }
 
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
                 let listener = TcpListener::bind("127.0.0.1:0")
                     .await
                     .expect("bind streamable HTTP call fixture");
@@ -9124,7 +9138,7 @@ rl.on('line', line => {
                 );
                 runtime::clear_server_cache(SERVER, None).await;
                 server.await.expect("fixture server task");
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
+                let _ = drain_mcp_connection_callback_observations().await;
             });
     }
 

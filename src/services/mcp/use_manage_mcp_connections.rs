@@ -26,7 +26,6 @@ use crate::state::app_state_store::{McpState, McpWriter};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Maps to: CC `useManageMCPConnections.ts:95#getErrorKey`.
@@ -294,8 +293,9 @@ pub fn cancel_pending_mcp_reconnect(name: &str) {
     }
 }
 
-/// Maps to: CC `client.client.onclose` branch that either marks stdio/sdk
-/// clients failed or starts `reconnectWithBackoff` for remote transports.
+/// Maps to: CC `client.client.onclose` (`useManageMCPConnections.ts:333-468`):
+/// a disabled server is left alone, stdio/sdk clients are marked failed, and
+/// remote transports start `reconnectWithBackoff`.
 pub async fn handle_mcp_server_closed_event(
     name: String,
     config: ScopedMcpServerConfig,
@@ -310,12 +310,24 @@ pub async fn handle_mcp_server_closed_event(
     // exactly that connection; clearing the key again here could only close a
     // newer connection made under it since.
     match closed_server_reconnect_decision(config.transport, is_mcp_server_disabled(&name)) {
-        ClosedServerReconnectDecision::SkipDisabled => {}
+        ClosedServerReconnectDecision::SkipDisabled => {
+            crate::utils::log::log_mcp_debug(
+                &name,
+                "Server is disabled, skipping automatic reconnection",
+            );
+        }
         ClosedServerReconnectDecision::MarkFailed => {
             let base = reconnect_base_server(&name, &config, runtime_mcp.clone());
             runtime_mcp.apply_client_update(failed_reconnect_server_update(&base));
         }
         ClosedServerReconnectDecision::StartAutomaticReconnect => {
+            crate::utils::log::log_mcp_debug(
+                &name,
+                &format!(
+                    "{} transport closed/disconnected, attempting automatic reconnection",
+                    get_transport_display_name(config.transport)
+                ),
+            );
             start_automatic_mcp_reconnect(name, config, runtime_mcp).await;
         }
     }
@@ -685,13 +697,6 @@ pub fn register_on_connection_attempt_handlers(hooks: OnConnectionAttemptHandler
         .handlers = Some(hooks);
 }
 
-pub fn clear_on_connection_attempt_handlers() {
-    connection_attempt_handlers_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .handlers = None;
-}
-
 fn with_connection_handlers<R>(f: impl FnOnce(&OnConnectionAttemptHandlers) -> R) -> Option<R> {
     let guard = connection_attempt_handlers_slot()
         .lock()
@@ -802,7 +807,8 @@ fn schedule_mcp_reconnect_timer(
 }
 
 /// Maps to: CC `reconnectWithBackoff` in
-/// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`.
+/// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`
+/// (`:371-464`), debug logs included.
 pub async fn start_automatic_mcp_reconnect(
     name: String,
     config: ScopedMcpServerConfig,
@@ -815,10 +821,15 @@ pub async fn start_automatic_mcp_reconnect(
     crate::utils::process_runtime::runtime_handle_for_detached_work()
         .expect("MCP process runtime")
         .spawn(async move {
+            let transport_type = get_transport_display_name(config.transport);
             for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
                 {
                     let _turn = crate::state::store::enter_store_turn_segment();
                     if is_mcp_server_disabled(&name) {
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            "Server disabled during reconnection, stopping retry",
+                        );
                         RECONNECT_TASKS
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
@@ -829,10 +840,37 @@ pub async fn start_automatic_mcp_reconnect(
                     runtime_mcp
                         .apply_client_update(pending_reconnect_server_update(&base, attempt));
                 }
+                let reconnect_start = std::time::Instant::now();
                 let result = reconnect_mcp_server_impl(&name, &config).await;
+                let elapsed = reconnect_start.elapsed().as_millis();
                 let resume = {
                     let _turn = crate::state::store::enter_store_turn_segment();
-                    if result.server.connection_type() == McpServerConnectionType::Connected
+                    let status = result.server.connection_type();
+                    if status == McpServerConnectionType::Connected {
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            &format!(
+                                "{transport_type} reconnection successful after {elapsed}ms (attempt {attempt})"
+                            ),
+                        );
+                    } else {
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            &format!(
+                                "{transport_type} reconnection attempt {attempt} completed with status: {}",
+                                status.as_str()
+                            ),
+                        );
+                        if attempt == MAX_RECONNECT_ATTEMPTS {
+                            crate::utils::log::log_mcp_debug(
+                                &name,
+                                &format!(
+                                    "Max reconnection attempts ({MAX_RECONNECT_ATTEMPTS}) reached, giving up"
+                                ),
+                            );
+                        }
+                    }
+                    if status == McpServerConnectionType::Connected
                         || attempt == MAX_RECONNECT_ATTEMPTS
                     {
                         RECONNECT_TASKS
@@ -843,7 +881,15 @@ pub async fn start_automatic_mcp_reconnect(
                         on_connection_attempt(result, &runtime_mcp);
                         return;
                     }
-                    schedule_mcp_reconnect_timer(&name, reconnect_backoff_ms(attempt))
+                    let backoff_ms = reconnect_backoff_ms(attempt);
+                    crate::utils::log::log_mcp_debug(
+                        &name,
+                        &format!(
+                            "Scheduling reconnection attempt {} in {backoff_ms}ms",
+                            attempt + 1
+                        ),
+                    );
+                    schedule_mcp_reconnect_timer(&name, backoff_ms)
                 };
                 // Aborted timer drops its resolver. Source remains suspended at
                 // this await forever; native disposal releases the inert frame.
@@ -928,13 +974,6 @@ pub fn initialize_servers_as_pending(
         stale: stale_result.stale,
         new_clients,
     }
-}
-
-/// Maps to: CC `useManageMCPConnections(...)` initial pending AppState update.
-pub fn pending_mcp_state_from_configs(
-    configs: &indexmap::IndexMap<String, ScopedMcpServerConfig>,
-) -> McpState {
-    initialize_servers_as_pending(&McpState::default(), configs).state
 }
 
 /// Maps to: CC `useManageMCPConnections.ts:207#MCP_BATCH_FLUSH_MS`.
@@ -2360,13 +2399,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_mcp_state_from_configs_matches_official_initial_pending_clients() {
+    fn initialize_servers_as_pending_from_empty_matches_official_initial_pending_clients() {
         with_isolated_config(|_| {
             let configs = indexmap::IndexMap::from([
                 ("docs".to_string(), stdio_config("docs-mcp")),
                 ("ide".to_string(), stdio_config("ide-mcp")),
             ]);
-            let state = pending_mcp_state_from_configs(&configs);
+            let state = initialize_servers_as_pending(&McpState::default(), &configs).state;
             assert_eq!(state.clients.len(), 2);
             assert_eq!(state.clients[0].name(), "docs");
             assert_eq!(
@@ -2446,7 +2485,7 @@ mod tests {
 
             let configs =
                 indexmap::IndexMap::from([("docs".to_string(), stdio_config("docs-mcp"))]);
-            let state = pending_mcp_state_from_configs(&configs);
+            let state = initialize_servers_as_pending(&McpState::default(), &configs).state;
             assert_eq!(
                 state.clients[0].connection_type(),
                 McpServerConnectionType::Disabled
@@ -3027,7 +3066,7 @@ mod tests {
     #[test]
     fn pending_start_is_nonblocking_and_connection_updates_flat_capability_arrays() {
         let configs = indexmap::IndexMap::from([("docs".to_string(), stdio_config("docs"))]);
-        let mut state = pending_mcp_state_from_configs(&configs);
+        let mut state = initialize_servers_as_pending(&McpState::default(), &configs).state;
         assert_eq!(state.clients.len(), 1);
         assert!(state.tools.is_empty());
         assert!(state.commands.is_empty());
@@ -3084,6 +3123,143 @@ mod tests {
                 McpServerConnectionType::Disabled
             );
             assert!(crate::services::mcp::config::is_mcp_server_disabled("docs"));
+        });
+    }
+
+    /// Records every `log_mcp_debug` line as `debug:<server>:<message>`.
+    fn record_mcp_debug_logs() -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use std::sync::Arc;
+        crate::utils::log::_reset_error_log_for_testing();
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let debug = logs.clone();
+        crate::utils::log::attach_error_log_sink(crate::utils::log::ErrorLogSink {
+            log_error: Arc::new(|_| Ok(())),
+            log_mcp_error: Arc::new(|_, _| Ok(())),
+            log_mcp_debug: Arc::new(move |server, message| {
+                debug
+                    .lock()
+                    .unwrap()
+                    .push(format!("debug:{server}:{message}"));
+                Ok(())
+            }),
+            get_errors_path: Arc::new(|| Ok(std::path::PathBuf::new())),
+            get_mcp_logs_path: Arc::new(|_| Ok(std::path::PathBuf::new())),
+        })
+        .unwrap();
+        logs
+    }
+
+    fn wait_for_log(logs: &std::sync::Mutex<Vec<String>>, line: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !logs.lock().unwrap().iter().any(|logged| logged == line) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never logged {line:?}; logged {:#?}",
+                logs.lock().unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The debug lines CC's `onclose` and `reconnectWithBackoff` write
+    /// (`useManageMCPConnections.ts:346-453`): the remote transport closing,
+    /// an attempt's outcome, the next attempt's backoff, a server disabled
+    /// mid-retry, and a disabled server that closes; and neither a success
+    /// nor a give-up line for a failed attempt that is not the last.
+    #[test]
+    fn closed_remote_server_logs_its_automatic_reconnection_like_official() {
+        with_isolated_config(|temp_dir| {
+            let project_dir = temp_dir.join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let _cwd_guard = ProjectCwdGuard::enter(&project_dir);
+            let _session_write = EnvVarGuard::set("SESSION_WRITE_ENABLED", "1");
+            let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+            crate::utils::process_runtime::initialize_test_process_runtime();
+            let logs = record_mcp_debug_logs();
+
+            // The server holds the first connection it gets until the test
+            // lets go, and drops every later one: the first attempt fails only
+            // once the server has been disabled, whatever the load.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (accepted, first_accepted) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let mut first = true;
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    if std::mem::take(&mut first) {
+                        let _ = accepted.send(());
+                        let _ = released.recv();
+                    }
+                    drop(stream);
+                }
+            });
+
+            let name = "docs-remote";
+            let mut config = stdio_config("unused");
+            config.transport = Transport::Http;
+            config.command = None;
+            config.url = Some(format!("http://127.0.0.1:{port}/mcp"));
+            let writer = McpWriter::new(crate::state::store::AppStore::new(
+                crate::state::app_state_store::AppState::default(),
+                None,
+            ));
+            let line = |message: &str| format!("debug:{name}:{message}");
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+
+            runtime.block_on(handle_mcp_server_closed_event(
+                name.to_string(),
+                config.clone(),
+                writer.clone(),
+            ));
+            wait_for_log(
+                &logs,
+                &line("HTTP transport closed/disconnected, attempting automatic reconnection"),
+            );
+
+            // Disabled while the first attempt is in flight: it still
+            // completes, and the loop stops before the second.
+            first_accepted
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the first attempt connects");
+            set_mcp_server_enabled(name, false).unwrap();
+            release.send(()).unwrap();
+            wait_for_log(
+                &logs,
+                &line("HTTP reconnection attempt 1 completed with status: failed"),
+            );
+            wait_for_log(&logs, &line("Scheduling reconnection attempt 2 in 1000ms"));
+            wait_for_log(
+                &logs,
+                &line("Server disabled during reconnection, stopping retry"),
+            );
+            for absent in [
+                "attempt 2 completed",
+                "(attempt 2)",
+                "reconnection successful",
+                "Max reconnection attempts",
+            ] {
+                assert!(
+                    !logs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|logged| logged.contains(absent)),
+                    "logged {absent:?}: {:#?}",
+                    logs.lock().unwrap()
+                );
+            }
+
+            runtime.block_on(handle_mcp_server_closed_event(
+                name.to_string(),
+                config,
+                writer,
+            ));
+            wait_for_log(
+                &logs,
+                &line("Server is disabled, skipping automatic reconnection"),
+            );
         });
     }
 }

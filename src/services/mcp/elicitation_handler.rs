@@ -387,6 +387,14 @@ async fn queue_elicitation_request(
         return hook_response;
     }
 
+    let params = rmcp_elicitation_params_to_event_params(&request);
+    // `:83` and `:109-112`.
+    let mode = get_elicitation_mode(&params);
+    let elicitation_id = match &params {
+        ElicitationRequestParams::Url { elicitation_id, .. } => elicitation_id.clone(),
+        ElicitationRequestParams::Form { .. } => None,
+    };
+
     // `:119-122`: a request already cancelled is not queued.
     if (&mut cancelled).now_or_never().is_some() {
         return ElicitationResult::new(ElicitationAction::Cancel);
@@ -399,7 +407,7 @@ async fn queue_elicitation_request(
     writer.push_elicitation_event(ElicitationRequestEvent::new(
         server_name.clone(),
         request_id.clone(),
-        rmcp_elicitation_params_to_event_params(&request),
+        params,
     ));
     let raw_result = tokio::select! {
         _ = cancelled => {
@@ -424,7 +432,13 @@ async fn queue_elicitation_request(
             elicitation_result_json(&raw_result)
         ),
     );
-    run_elicitation_result_hooks(&server_name, &request, raw_result).await
+    run_elicitation_result_hooks(
+        &server_name,
+        raw_result,
+        Some(mode),
+        elicitation_id.as_deref(),
+    )
+    .await
 }
 
 /// CC `jsonStringify(request)` of an `elicitation/create` request; the
@@ -556,11 +570,16 @@ fn elicitation_response_notification_message(server_name: &str, action: &str) ->
     format!("Elicitation response for server \"{server_name}\": {action}")
 }
 
+/// CC `void executeNotificationHooks({message, notificationType})`: detached
+/// for the life of the process. A -32042 retry runs this on a query's private
+/// runtime, which the turn's end would tear down (PORTING.md A2/A3).
 fn spawn_elicitation_notification_hooks(message: String, notification_type: &'static str) {
     let Some((config, _, base_env)) = load_mcp_elicitation_hooks_config_and_env() else {
         return;
     };
-    tokio::spawn(async move {
+    let runtime = crate::utils::process_runtime::runtime_handle_for_detached_work()
+        .expect("elicitation notification hooks require the process runtime");
+    runtime.spawn(async move {
         crate::services::hooks::lifecycle::execute_notification_hooks(
             &config,
             &message,
@@ -572,24 +591,25 @@ fn spawn_elicitation_notification_hooks(message: String, notification_type: &'st
     });
 }
 
-/// Maps to: CC `runElicitationResultHooks` (`elicitationHandler.ts:264-313`).
+/// Maps to: CC `runElicitationResultHooks(serverName, result, signal, mode?,
+/// elicitationId?)` (`elicitationHandler.ts:264-313`), minus the signal.
 pub(super) async fn run_elicitation_result_hooks(
     server_name: &str,
-    request: &RmcpElicitRequestParams,
     result: ElicitationResult,
+    mode: Option<ElicitationMode>,
+    elicitation_id: Option<&str>,
 ) -> ElicitationResult {
     let Some((config, hook_context, base_env)) = load_mcp_elicitation_hooks_config_and_env() else {
         return result;
     };
-    let (_, _, mode, _, elicitation_id) = rmcp_elicitation_hook_details(request);
     let results = crate::services::hooks::elicitation::execute_elicitation_result_hooks(
         &config,
         &hook_context,
         server_name,
         result.action.as_str(),
         result.content.clone(),
-        Some(mode),
-        elicitation_id.as_deref(),
+        mode.map(ElicitationMode::as_str),
+        elicitation_id,
         base_env,
     )
     .await;

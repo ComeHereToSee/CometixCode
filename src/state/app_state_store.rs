@@ -366,17 +366,6 @@ impl McpWriter {
         (*self.store.get().mcp).clone()
     }
 
-    /// Whole-`AppState.mcp` replacement. **Test-only** — every production
-    /// writer goes through `initialize_servers_as_pending` (startup) or
-    /// `apply_server_update` / `apply_client_update` (resolved, per server),
-    /// because `PORTING.md:430` forbids full-clients reprojection: it destroys
-    /// the per-server update order and prompt-cache stability CC preserves
-    /// through `updateServer` patches.
-    #[cfg(test)]
-    pub fn set_current(&self, state: McpState) {
-        self.store.replace_with(|app| app.mcp = Arc::new(state));
-    }
-
     /// Maps to: CC `useManageMCPConnections.ts:782-838` — the initialization
     /// `setAppState`. It MERGES newly-configured servers into the existing
     /// client list (`:833` `clients: [...mcpWithoutStale.clients,
@@ -385,13 +374,12 @@ impl McpWriter {
     /// service-boundary cleanup, mirroring CC's `clearServerCache`
     /// fire-and-forget loop.
     ///
-    /// Replaces `set_current(pending_mcp_state_from_configs(...))`, which built
-    /// the pending list from an EMPTY state and then overwrote the whole
-    /// `AppState.mcp`. That dropped already-resolved capabilities, and because
-    /// it was unconditional a re-seed with identical configs produced a
-    /// revision bump, an `on_change`, and a listener pass the source does not
-    /// produce — exactly what the strict/dynamic startup path does when its
-    /// synchronous seed is followed by the async one.
+    /// Building the pending list from an empty state and overwriting the
+    /// whole `AppState.mcp` instead would drop already-resolved capabilities,
+    /// and a re-seed with identical configs would produce a revision bump, an
+    /// `on_change`, and a listener pass the source does not produce — exactly
+    /// what the strict/dynamic startup path does when its synchronous seed is
+    /// followed by the async one.
     pub fn initialize_servers_as_pending(
         &self,
         configs: &indexmap::IndexMap<String, crate::services::mcp::types::ScopedMcpServerConfig>,
@@ -1018,10 +1006,9 @@ mod tests {
     /// (newClients.length === 0 && stale.length === 0) return prevState`.
     ///
     /// The strict/dynamic startup path seeds pending state synchronously and
-    /// then the async path seeds again with the same configs. The old
-    /// `set_current(pending_mcp_state_from_configs(..))` wrote unconditionally,
-    /// so that second seed produced a revision bump, an `on_change` and a
-    /// listener pass the source never produces.
+    /// then the async path seeds again with the same configs. An
+    /// unconditional write would make that second seed produce a revision
+    /// bump, an `on_change` and a listener pass the source never produces.
     #[test]
     fn reseeding_identical_configs_is_a_same_like_official_initialization_guard() {
         let store = crate::state::store::AppStore::new(AppState::default(), None);
@@ -1113,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_writer_set_current_preserves_ready_flat_aggregates_without_reprojection() {
+    fn mcp_writer_update_preserves_ready_flat_aggregates_without_reprojection() {
         let store = crate::state::store::AppStore::new(AppState::default(), None);
         let writer = McpWriter::new(store);
         let state = McpState {
@@ -1143,7 +1130,11 @@ mod tests {
             ..McpState::default()
         };
 
-        writer.set_current(state);
+        writer.update(|mcp| {
+            mcp.tools = state.tools;
+            mcp.commands = state.commands;
+            mcp.resources = state.resources;
+        });
         let current = writer.current();
         assert_eq!(current.tools[0].name, "mcp__docs__search");
         assert_eq!(current.commands[0].name, "mcp__docs__summarize");
