@@ -1040,10 +1040,12 @@ mod runtime {
         /// or its close watcher once it has quit on its own. Gone, the
         /// connection is closed.
         cancellation_token: std::sync::Mutex<Option<RunningServiceCancellationToken>>,
-        /// CC `client.onclose`: the handler `onConnectionAttempt` installs
-        /// (`useManageMCPConnections.ts:333`), here on every connection made,
-        /// until `client.onclose = undefined` (`:809`) clears it.
-        onclose: std::sync::atomic::AtomicBool,
+        /// CC `client.onclose`: none until `onConnectionAttempt` assigns its
+        /// handler (`useManageMCPConnections.ts:333`), and none again once
+        /// `client.onclose = undefined` (`:809`) clears it. A connection that
+        /// never goes through `onConnectionAttempt` — an agent's, one
+        /// `ensureConnectedClient` makes — has none.
+        onclose: std::sync::Mutex<Option<OncloseHandler>>,
         /// SDK `Client.setNotificationHandler`'s handlers, by method.
         notification_handlers: std::sync::Mutex<HashMap<String, NotificationHandler>>,
     }
@@ -1051,6 +1053,10 @@ mod runtime {
     /// A handler [`McpClient::set_notification_handler`] registers: it gets
     /// the notification's params.
     type NotificationHandler = Arc<dyn Fn(Option<Value>) + Send + Sync>;
+
+    /// A handler [`McpClient::set_onclose`] assigns.
+    pub(crate) type OncloseHandler =
+        Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
     impl McpClient {
         fn new(
@@ -1065,7 +1071,7 @@ mod runtime {
                 config,
                 peer: Some(service.peer().clone()),
                 cancellation_token: std::sync::Mutex::new(Some(service.cancellation_token())),
-                onclose: std::sync::atomic::AtomicBool::new(true),
+                onclose: std::sync::Mutex::new(None),
                 notification_handlers: std::sync::Mutex::new(HashMap::new()),
             }));
             let _ = service.service().client.set(Arc::downgrade(&client.0));
@@ -1082,7 +1088,7 @@ mod runtime {
                 config: config.clone(),
                 peer: None,
                 cancellation_token: std::sync::Mutex::new(None),
-                onclose: std::sync::atomic::AtomicBool::new(true),
+                onclose: std::sync::Mutex::new(None),
                 notification_handlers: std::sync::Mutex::new(HashMap::new()),
             }))
         }
@@ -1162,13 +1168,35 @@ mod runtime {
                 .is_none()
         }
 
-        /// CC `client.onclose = undefined`.
-        pub(crate) fn clear_onclose(&self) {
-            self.0.onclose.store(false, Ordering::SeqCst);
+        /// CC `client.onclose = handler`: replaces the one assigned before.
+        /// Its close watcher runs it if the connection ends on its own.
+        pub(crate) fn set_onclose(
+            &self,
+            handler: impl Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync + 'static,
+        ) {
+            *self
+                .0
+                .onclose
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(handler));
         }
 
-        fn has_onclose(&self) -> bool {
-            self.0.onclose.load(Ordering::SeqCst)
+        /// CC `client.onclose = undefined`.
+        pub(crate) fn clear_onclose(&self) {
+            *self
+                .0
+                .onclose
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+
+        /// CC `client.onclose`.
+        pub(crate) fn onclose(&self) -> Option<OncloseHandler> {
+            self.0
+                .onclose
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         /// Maps to: SDK `Client.setNotificationHandler(schema, handler)`
@@ -3401,7 +3429,8 @@ mod runtime {
         None
     }
 
-    /// Watches `client`'s connection until it ends.
+    /// Watches `client`'s connection until it ends, then runs the `onclose`
+    /// assigned to it, if any.
     ///
     /// CC's `onclose` fires on every close, `cleanup()` and an expired
     /// session's close included. Here it fires only for a connection that
@@ -3424,14 +3453,8 @@ mod runtime {
             // caches with it and leaves the memo.
             delete_fetch_caches(client.name());
             delete_memoized_connection(client.name(), client.connection_id());
-            if client.has_onclose() {
-                // Maps to: CC `client.client.onclose = () => { ... }` in
-                // `useManageMCPConnections.ts#onConnectionAttempt`.
-                crate::services::mcp::use_manage_mcp_connections::emit_server_closed(
-                    client.name().to_owned(),
-                    client.config().clone(),
-                )
-                .await;
+            if let Some(onclose) = client.onclose() {
+                onclose().await;
             }
         });
     }
@@ -6910,37 +6933,52 @@ rl.on('line', line => {
         });
     }
 
-    /// CC's `onclose` handler (`useManageMCPConnections.ts:333-468`) learns
-    /// of a connection that ends. Here only one that ends on its own reports
-    /// it: one closed on purpose — `cleanup()` or `clearServerCache` — does
-    /// not, and neither does one whose `onclose` was cleared (`:809`). One
-    /// that ends on its own takes the name's fetch caches with it
+    /// CC's `onclose` (`useManageMCPConnections.ts:333-468`) learns of a
+    /// connection that ends. Here it runs only for one that ends on its own:
+    /// one closed on purpose — `cleanup()` or `clearServerCache` — does not
+    /// run it, and neither does one whose `onclose` was cleared (`:809`).
+    /// One that ends on its own takes the name's fetch caches with it
     /// (`client.ts:1389-1391`), so another connection under the name fetches
     /// again.
     #[test]
-    fn only_a_connection_that_ends_on_its_own_reports_its_close() {
-        use crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation;
+    fn only_a_connection_that_ends_on_its_own_runs_its_onclose() {
+        use futures::FutureExt as _;
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let fixture = counting_fixture::CountingFixture::new();
         block_on_with_process_runtime(async {
             const SERVER: &str = "onclose-stdio-fixture";
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let (closed, closes) = async_channel::unbounded::<&'static str>();
+            // CC `client.client.onclose = () => { ... }`, here recording
+            // which connection's ran.
+            let assign_onclose = |client: &McpClient, label: &'static str| {
+                let closed = closed.clone();
+                client.set_onclose(move || {
+                    let closed = closed.clone();
+                    async move {
+                        let _ = closed.send(label).await;
+                    }
+                    .boxed()
+                });
+            };
 
             // Any tool call makes the fixture exit.
             let cleaned = runtime::connect_to_server(SERVER, &fixture.config(&["cleaned"])).await;
             let cleaned = &cleaned.as_connected().expect("connected").client;
+            assign_onclose(cleaned, "cleaned");
             runtime::cleanup_connection(cleaned);
             assert!(cleaned.is_closed());
 
             let cleared_config = fixture.config(&["cleared"]);
             let cleared = runtime::connect_to_server(SERVER, &cleared_config).await;
             let cleared = &cleared.as_connected().expect("connected").client;
+            assign_onclose(cleared, "cleared");
             runtime::clear_server_cache(SERVER, Some(&cleared_config)).await;
             assert!(cleared.is_closed());
 
             let silenced_config = fixture.config(&["silenced"]);
             let silenced = runtime::connect_to_server(SERVER, &silenced_config).await;
             let silenced = &silenced.as_connected().expect("connected").client;
+            assign_onclose(silenced, "silenced");
             silenced.clear_onclose();
             let _ = runtime::call_mcp_tool(silenced, "lookup", Map::new(), None).await;
             fixture
@@ -6961,28 +6999,19 @@ rl.on('line', line => {
             }
             let lists = fixture.count("tools/list");
 
-            let exiting_config = fixture.config(&["exiting"]);
-            let exiting = runtime::connect_to_server(SERVER, &exiting_config).await;
+            let exiting = runtime::connect_to_server(SERVER, &fixture.config(&["exiting"])).await;
             let exiting = &exiting.as_connected().expect("connected").client;
+            assign_onclose(exiting, "exiting");
             let _ = runtime::call_mcp_tool(exiting, "lookup", Map::new(), None).await;
-            let closes = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let mut closes = Vec::new();
-                while closes.is_empty() {
-                    for observation in runtime::drain_mcp_connection_callback_observations().await {
-                        if let McpConnectionCallbackObservation::ServerClosed { name, config } =
-                            observation
-                        {
-                            assert_eq!(name, SERVER);
-                            closes.push(config);
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                closes
-            })
-            .await
-            .expect("the exited connection reports its close");
-            assert_eq!(closes, [exiting_config]);
+            // The first `onclose` to run is the exited connection's. Any
+            // other would have run when its own connection ended, which was
+            // well before; `try_recv` then only sees nothing has run since.
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), closes.recv())
+                .await
+                .expect("the exited connection runs its onclose")
+                .unwrap();
+            assert_eq!(first, "exiting");
+            assert!(closes.try_recv().is_err());
             assert!(exiting.is_closed());
 
             // The exited connection took the name's fetch caches.
@@ -6993,7 +7022,62 @@ rl.on('line', line => {
             assert_eq!(fixture.count("tools/list"), lists + 1);
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+        });
+    }
+
+    /// CC `onConnectionAttempt` assigns a connected client's `onclose`
+    /// (`useManageMCPConnections.ts:333-468`): when a stdio server the
+    /// session connected exits, its record is marked failed (`:466`). A
+    /// connection of the same name made outside it, as an agent's inline
+    /// server is (`runAgent.ts:173`), has no `onclose`.
+    #[test]
+    fn the_session_marks_its_server_failed_through_the_onclose_it_assigned() {
+        use crate::services::mcp::types::ConfigScope;
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let fixture = counting_fixture::CountingFixture::new();
+        block_on_with_process_runtime(async {
+            const SERVER: &str = "session-onclose-stdio-fixture";
+            let store = crate::state::store::AppStore::new(
+                crate::state::app_state_store::AppState::default(),
+                None,
+            );
+            let writer = crate::state::app_state_store::McpWriter::new(store.clone());
+            let record_type = || {
+                store
+                    .get()
+                    .mcp
+                    .clients
+                    .iter()
+                    .find(|server| server.name() == SERVER)
+                    .map(McpServerConnection::connection_type)
+            };
+
+            let session = runtime::connect_to_server(SERVER, &fixture.config(&["session"])).await;
+            crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+                McpConnectionDiscovery::from(session.clone()),
+                &writer,
+            );
+            let session = &session.as_connected().expect("connected").client;
+            assert!(session.onclose().is_some());
+
+            let inline_config = ScopedMcpServerConfig {
+                scope: ConfigScope::Dynamic,
+                ..fixture.config(&["inline"])
+            };
+            let inline = runtime::connect_to_server(SERVER, &inline_config).await;
+            let inline = &inline.as_connected().expect("connected").client;
+            assert_ne!(inline, session);
+            assert!(inline.onclose().is_none());
+
+            // Any tool call makes the fixture exit.
+            let _ = runtime::call_mcp_tool(session, "lookup", Map::new(), None).await;
+            fixture
+                .until("the session's record to be marked failed", |_| {
+                    record_type() == Some(McpServerConnectionType::Failed)
+                })
+                .await;
+
+            runtime::clear_server_cache(SERVER, None).await;
         });
     }
 

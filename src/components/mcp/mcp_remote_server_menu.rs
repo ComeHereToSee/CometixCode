@@ -402,21 +402,33 @@ pub fn MCPRemoteServerMenu<'a>(
                                 let mut state = manual_callback_submit_state;
                                 state.set(Some(submit));
                             });
-                        match crate::services::mcp::use_manage_mcp_connections::authenticate_remote_mcp_server_once(
+                        let authenticated = crate::services::mcp::use_manage_mcp_connections::authenticate_remote_mcp_server_once(
                             &server.name,
                             &server.config,
                             server.is_authenticated.unwrap_or(false),
-                            is_effectively_authenticated(&server),
                             Some(on_authorization_url),
                             Some(on_waiting_for_callback),
                             Some(abort_handle.signal()),
                         )
-                        .await
-                        {
-                            Ok((updated, message)) => {
-                                runtime_mcp.apply_server_update(updated);
-                                pending_runtime_result.set(Some(message));
-                            }
+                        .await;
+                        match authenticated {
+                            // CC `:386` — `const result = await reconnectMcpServer(server.name)`;
+                            // the manager writes the result and gives the
+                            // connection its handlers.
+                            Ok(()) => match reconnect_mcp_server.call(&server.name).await {
+                                Some(updated) => pending_runtime_result.set(Some(
+                                    crate::services::mcp::use_manage_mcp_connections::remote_authentication_result_message(
+                                        updated.connection_type(),
+                                        &server.name,
+                                        is_effectively_authenticated(&server),
+                                    ),
+                                )),
+                                // CC's `reconnectMcpServer` throws `MCP server
+                                // ${serverName} not found` (`useManageMCPConnections.ts:1051-1053`),
+                                // which the catch shows.
+                                None => auth_error
+                                    .set(Some(format!("MCP server {} not found", server.name))),
+                            },
                             Err(error) => {
                                 if !crate::services::mcp::auth::is_authentication_cancelled_error(&error) {
                                     auth_error.set(Some(error.to_string()));

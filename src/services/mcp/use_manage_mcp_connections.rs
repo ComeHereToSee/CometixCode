@@ -203,18 +203,19 @@ pub fn remote_authentication_result_message(
     }
 }
 
-/// Maps to CC `MCPRemoteServerMenu.tsx#handleAuthenticate` side-effect order:
-/// preserve step-up OAuth state for re-auth, run the MCP OAuth service flow,
-/// then reconnect the server through the MCP connection manager.
+/// Maps to CC `MCPRemoteServerMenu.tsx#handleAuthenticate`'s OAuth half
+/// (`:361-380`): preserve step-up OAuth state for re-auth, then run the MCP
+/// OAuth service flow. The reconnect after it is the menu's, through the
+/// connection manager (`:386` `reconnectMcpServer`), whose
+/// `onConnectionAttempt` gives the new connection its handlers.
 pub async fn authenticate_remote_mcp_server_once(
     server_name: &str,
     config: &ScopedMcpServerConfig,
     was_authenticated: bool,
-    was_effectively_authenticated: bool,
     on_authorization_url: Option<super::auth::McpAuthorizationUrlCallback>,
     on_waiting_for_callback: Option<super::auth::McpWaitingForCallbackCallback>,
     abort_signal: Option<super::auth::McpOAuthAbortSignal>,
-) -> anyhow::Result<(McpConnectionDiscovery, String)> {
+) -> anyhow::Result<()> {
     if was_authenticated {
         super::auth::revoke_server_tokens(server_name, config, true).await?;
     }
@@ -230,14 +231,7 @@ pub async fn authenticate_remote_mcp_server_once(
         },
     )
     .await?;
-
-    let updated = reconnect_mcp_server_once(server_name, config).await;
-    let message = remote_authentication_result_message(
-        updated.server.connection_type(),
-        server_name,
-        was_effectively_authenticated,
-    );
-    Ok((updated, message))
+    Ok(())
 }
 
 /// Maps to: CC `MCPRemoteServerMenu.tsx:166-190`
@@ -310,7 +304,7 @@ pub async fn handle_mcp_server_closed_event(
     // (`:333`) replaced `connectToServer`'s own `onclose` wrapper
     // (`client.ts:1374`), so for the REPL's connections that call is what
     // deletes the closed connection's memo entry and the name's fetch caches.
-    // The close watcher that emitted this event has already done both for
+    // The close watcher running this `onclose` has already done both for
     // exactly that connection; clearing the key again here could only close a
     // newer connection made under it since.
     match closed_server_reconnect_decision(config.transport, is_mcp_server_disabled(&name)) {
@@ -476,12 +470,48 @@ pub fn handle_channel_permission_notification_event(
 //
 // Claude Code registers `onclose` / `setNotificationHandler` closures inside
 // `onConnectionAttempt` that call `updateServer` / `setAppState` directly.
-// Cometix keeps that ownership here: App mounts [`OnConnectionAttemptHandlers`],
-// and the rmcp client handler invokes the `emit_*` entry points below.
+// `onclose` is assigned on the client itself here too
+// ([`install_connection_handlers`]). The notification handlers are not yet:
+// App mounts [`OnConnectionAttemptHandlers`], and the rmcp client handler
+// invokes the `emit_*` entry points below for every connection.
 // IDE `selection_changed` is REPL-owned (CC `useIdeSelection`): the REPL
 // registers its handler on the IDE client itself
 // (`hooks::use_ide_selection::use_ide_selection`).
 // ---------------------------------------------------------------------------
+
+/// Maps to: CC `onConnectionAttempt(result)` (`useManageMCPConnections.ts:
+/// 310-763`) where the session writes the result at once — the automatic
+/// reconnect, the manager's reconnect and enable: the connected client gets
+/// its handlers, then `updateServer`. The initial connect batches the write
+/// instead (`McpPendingUpdates::on_connection_attempt`).
+///
+/// Only the connections the session connects, reconnects or enables go
+/// through it; an agent's, one `ensureConnectedClient` makes and one the
+/// auth tool reconnects do not, and have no handlers.
+pub(crate) fn on_connection_attempt(result: McpConnectionDiscovery, writer: &McpWriter) {
+    install_connection_handlers(&result.server, writer);
+    writer.apply_server_update(result);
+}
+
+/// Maps to: CC what `onConnectionAttempt` installs on a connected client
+/// (`useManageMCPConnections.ts:326-753`): its `onclose`
+/// (`client.client.onclose = () => { ... }`, `:333-468`). The handler
+/// captures the writer where CC's captures `updateServer`; the writer
+/// applies its updates at once, CC's queue batches them.
+fn install_connection_handlers(server: &McpServerConnection, writer: &McpWriter) {
+    let Some(connected) = server.as_connected() else {
+        return;
+    };
+    let (name, config, writer) = (
+        connected.name.clone(),
+        connected.config.clone(),
+        writer.clone(),
+    );
+    connected.client.set_onclose(move || {
+        use futures::FutureExt as _;
+        handle_mcp_server_closed_event(name.clone(), config.clone(), writer.clone()).boxed()
+    });
+}
 
 use crate::services::mcp::elicitation_handler::ElicitationRequestEvent;
 use std::collections::VecDeque;
@@ -518,11 +548,6 @@ impl OnConnectionAttemptHandlers {
             mcp,
             channel_permission_callbacks,
         }
-    }
-
-    /// Maps to: CC `client.client.onclose` body in `onConnectionAttempt`.
-    pub async fn on_server_closed(&self, name: String, config: ScopedMcpServerConfig) {
-        handle_mcp_server_closed_event(name, config, self.mcp.clone()).await;
     }
 
     /// Maps to: CC `ToolListChangedNotificationSchema` handler.
@@ -639,20 +664,6 @@ where
 }
 
 // --- emit helpers used by the rmcp client handler (CC setNotificationHandler bodies) ---
-
-pub(crate) async fn emit_server_closed(name: String, config: ScopedMcpServerConfig) {
-    let handled = with_connection_handlers_async({
-        let name = name.clone();
-        let config = config.clone();
-        |hooks| async move { hooks.on_server_closed(name, config).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ServerClosed { name, config }).await;
-}
 
 /// Maps to: CC `useManageMCPConnections.ts:618`
 /// `if (client.capabilities?.tools?.listChanged)`.
@@ -826,10 +837,6 @@ pub(crate) async fn emit_elicitation_completed(name: String, elicitation_id: Str
 /// (unit tests that exercise the rmcp client without mounting App).
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpConnectionCallbackObservation {
-    ServerClosed {
-        name: String,
-        config: ScopedMcpServerConfig,
-    },
     /// The `client` each carries is the connection that sent the
     /// notification.
     ToolsListChanged {
@@ -946,7 +953,8 @@ pub async fn start_automatic_mcp_reconnect(
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .remove(&name);
-                        runtime_mcp.apply_server_update(result);
+                        // CC `onConnectionAttempt(result)` (`:408`, `:424`).
+                        on_connection_attempt(result, &runtime_mcp);
                         return;
                     }
                     schedule_mcp_reconnect_timer(&name, reconnect_backoff_ms(attempt))
@@ -1068,6 +1076,14 @@ impl McpPendingUpdates {
             writer,
             state: Default::default(),
         }
+    }
+
+    /// Maps to: CC `onConnectionAttempt` (`useManageMCPConnections.ts:
+    /// 310-763`) for the initial connect: the connected client gets its
+    /// handlers, and the result is batched into `updateServer`.
+    fn on_connection_attempt(&self, discovery: McpConnectionDiscovery) {
+        install_connection_handlers(&discovery.server, &self.writer);
+        self.update_server(discovery);
     }
 
     /// Maps to: CC `useManageMCPConnections.ts:297#updateServer`.
@@ -1369,7 +1385,7 @@ async fn load_and_connect_mcp_configs(
         let local_pending = pending.clone();
         runtime.spawn(async move {
             get_mcp_tools_commands_and_resources(
-                |discovery| local_pending.update_server(discovery),
+                |discovery| local_pending.on_connection_attempt(discovery),
                 &enabled,
             )
             .await;
@@ -1428,7 +1444,7 @@ async fn load_and_connect_mcp_configs(
             .collect();
         runtime.spawn(async move {
             get_mcp_tools_commands_and_resources(
-                |discovery| pending.update_server(discovery),
+                |discovery| pending.on_connection_attempt(discovery),
                 &enabled,
             )
             .await;

@@ -3283,6 +3283,10 @@ mod tests {
                 assert_ne!(inline, parent_client);
                 assert!(!inline.is_closed());
                 assert!(!parent_client.is_closed());
+                // Connected outside `onConnectionAttempt` (`runAgent.ts:173`):
+                // its close, should it end on its own, reaches no session
+                // handler.
+                assert!(inline.onclose().is_none());
 
                 drop(initialized);
                 assert!(inline.is_closed());
