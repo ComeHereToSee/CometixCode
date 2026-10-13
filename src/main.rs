@@ -662,12 +662,13 @@ pub fn initialize_lsp_if_trusted(workspace_trusted: bool) {
 /// handler on the IDE client itself (`hooks::use_ide_selection`).
 /// Ownership ruling, P5 G10 (2026-08-04). Kept pre-mount, deliberately.
 ///
-/// CC's counterpart is `onConnectionAttempt`
-/// (`useManageMCPConnections.ts:310-322`), a `useCallback` inside the hook —
-/// hook-scoped, created and discarded with the mount. Rust registers a
-/// process-wide handler set instead, because the rmcp transport delivers
-/// connection callbacks through a global sink rather than a closure the caller
-/// threads in.
+/// The connection handlers `onConnectionAttempt` installs
+/// (`useManageMCPConnections.ts:310-763`) are installed on each connection
+/// (`install_connection_handlers`). What stays in this process-wide set is
+/// what CC reaches through the session rather than a connection: the channel
+/// relay callbacks (`channelPermCallbacksRef`, hook-scoped at the source) and
+/// the writer for a tool call's URL elicitation queue push (the caller's
+/// `setAppState`).
 ///
 /// That difference used to carry a real hazard: a connection resolving before
 /// `AppStateProvider` adopted the store would write through this handler while

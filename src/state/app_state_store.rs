@@ -105,6 +105,16 @@ impl ElicitationState {
         found
     }
 
+    /// The request `request_id` of `server_name` leaves the queue: CC's
+    /// dialog cancels a request whose `signal` aborts
+    /// (`ElicitationDialog.tsx:193-209`), which then leaves the queue.
+    pub fn remove(&mut self, server_name: &str, request_id: &str) -> bool {
+        let before = self.queue.len();
+        self.queue
+            .retain(|event| !(event.server_name == server_name && event.request_id == request_id));
+        self.queue.len() != before
+    }
+
     /// Maps to: CC `prev.elicitation.queue.slice(1)` after response/dismiss.
     pub fn pop_front(
         &mut self,
@@ -514,6 +524,22 @@ impl McpWriter {
         });
     }
 
+    /// A cancelled request leaves the dialog queue ([`ElicitationState::remove`]).
+    pub fn remove_elicitation_event(&self, server_name: &str, request_id: &str) {
+        self.store.set_state(|prev| {
+            let mut state = (*prev.elicitation).clone();
+            if !state.remove(server_name, request_id) {
+                return crate::state::store::UpdateDecision::Same(());
+            }
+            let mut next = (**prev).clone();
+            next.elicitation = Arc::new(state);
+            crate::state::store::UpdateDecision::Replace {
+                next: Arc::new(next),
+                result: (),
+            }
+        });
+    }
+
     /// Maps to: CC elicitation-complete notification → `setAppState` queue update.
     ///
     /// B3 flip-audit: CC elicitationHandler.ts:194 — `if (idx === -1) return
@@ -533,10 +559,11 @@ impl McpWriter {
             }
         });
         if !found {
-            tracing::debug!(
-                server = %name,
-                elicitation_id = %elicitation_id,
-                "Ignoring completion notification for unknown elicitation"
+            crate::utils::log::log_mcp_debug(
+                name,
+                &format!(
+                    "Ignoring completion notification for unknown elicitation: {elicitation_id}"
+                ),
             );
         }
     }

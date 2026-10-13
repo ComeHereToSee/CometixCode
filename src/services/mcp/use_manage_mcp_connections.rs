@@ -514,11 +514,11 @@ pub(crate) fn install_channel_handlers(
 //
 // Claude Code registers `onclose` / `setNotificationHandler` closures inside
 // `onConnectionAttempt` that call `updateServer` / `setAppState` directly.
-// `onclose`, the channel and the list_changed handlers are assigned on the
-// client itself here too ([`install_connection_handlers`]). The elicitation
-// handlers are not yet: App mounts [`OnConnectionAttemptHandlers`], and the
-// rmcp client handler invokes the `emit_*` entry points below for every
-// connection.
+// The elicitation, `onclose`, channel and list_changed handlers are assigned
+// on the client itself here too ([`install_connection_handlers`]). App still
+// mounts [`OnConnectionAttemptHandlers`] for what CC reaches through the
+// session rather than a connection: the channel relay callbacks, and the
+// queue push for a tool call's URL elicitation (`emit_elicitation_requested`).
 // IDE `selection_changed` is REPL-owned (CC `useIdeSelection`): the REPL
 // registers its handler on the IDE client itself
 // (`hooks::use_ide_selection::use_ide_selection`).
@@ -539,7 +539,8 @@ pub(crate) fn on_connection_attempt(result: McpConnectionDiscovery, writer: &Mcp
 }
 
 /// Maps to: CC what `onConnectionAttempt` installs on a connected client
-/// (`useManageMCPConnections.ts:326-753`): its `onclose`
+/// (`useManageMCPConnections.ts:326-753`): its elicitation handlers
+/// (`registerElicitationHandler`, `:327-331`), its `onclose`
 /// (`client.client.onclose = () => { ... }`, `:333-468`), the channel
 /// handlers its gate allows (`:470-614`, [`install_channel_handlers`]), and a
 /// list_changed handler per list the server declared can change
@@ -553,6 +554,8 @@ fn install_connection_handlers(server: &McpServerConnection, writer: &McpWriter)
     let Some(connected) = server.as_connected() else {
         return;
     };
+    // Maps to: CC `:327-331`, in place of `connectToServer`'s default.
+    super::client::register_elicitation_handler(&connected.client, &connected.name, writer);
     {
         let (name, config, writer) = (
             connected.name.clone(),
@@ -640,8 +643,10 @@ fn connection_attempt_handlers_slot() -> &'static StdMutex<ConnectionAttemptRegi
     CONNECTION_ATTEMPT_HANDLERS.get_or_init(|| StdMutex::new(ConnectionAttemptRegistry::default()))
 }
 
-/// Live writers captured like CC `onConnectionAttempt` closures
-/// (`updateServer` / `setAppState`).
+/// The session-level handles the MCP layer reaches outside a connection's
+/// own handlers: the channel relay callbacks (CC
+/// `channelPermCallbacksRef`), and the writer for a tool call's URL
+/// elicitation queue push (CC the caller's `setAppState`).
 #[derive(Clone)]
 pub struct OnConnectionAttemptHandlers {
     mcp: McpWriter,
@@ -659,14 +664,12 @@ impl OnConnectionAttemptHandlers {
         }
     }
 
-    /// Maps to: CC `registerElicitationHandler` → `setAppState` queue push.
+    /// Maps to: CC `callMCPToolWithUrlElicitationRetry`'s REPL branch
+    /// (`client.ts:2948-2997`, the `setAppState` at `:2964-2995`): the queue
+    /// push for a tool call's -32042 URL elicitation, which comes with the
+    /// tool call's context rather than a connection's handler.
     pub fn on_elicitation_requested(&self, event: ElicitationRequestEvent) {
         self.mcp.push_elicitation_event(event);
-    }
-
-    /// Maps to: CC elicitation-complete notification → `setAppState` queue update.
-    pub fn on_elicitation_completed(&self, name: &str, elicitation_id: &str) {
-        self.mcp.mark_elicitation_complete(name, elicitation_id);
     }
 }
 
@@ -692,7 +695,7 @@ fn with_connection_handlers<R>(f: impl FnOnce(&OnConnectionAttemptHandlers) -> R
     guard.handlers.as_ref().map(f)
 }
 
-// --- list_changed registration gates and the emit helpers the rmcp client handler calls ---
+// --- list_changed registration gates, and the URL elicitation queue push ---
 
 /// Maps to: CC `useManageMCPConnections.ts:618`
 /// `if (client.capabilities?.tools?.listChanged)`: it gates the handler's
@@ -743,30 +746,11 @@ pub(crate) async fn emit_elicitation_requested(event: ElicitationRequestEvent) {
     observe_for_test(McpConnectionCallbackObservation::ElicitationRequested { event }).await;
 }
 
-pub(crate) async fn emit_elicitation_completed(name: String, elicitation_id: String) {
-    if with_connection_handlers(|hooks| hooks.on_elicitation_completed(&name, &elicitation_id))
-        .is_some()
-    {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ElicitationCompleted {
-        name,
-        elicitation_id,
-    })
-    .await;
-}
-
 /// Observation queue used only when App has not registered session hooks
 /// (unit tests that exercise the rmcp client without mounting App).
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpConnectionCallbackObservation {
-    ElicitationRequested {
-        event: ElicitationRequestEvent,
-    },
-    ElicitationCompleted {
-        name: String,
-        elicitation_id: String,
-    },
+    ElicitationRequested { event: ElicitationRequestEvent },
 }
 
 static TEST_OBSERVATIONS: OnceLock<AsyncMutex<VecDeque<McpConnectionCallbackObservation>>> =
@@ -777,9 +761,9 @@ fn test_observations() -> &'static AsyncMutex<VecDeque<McpConnectionCallbackObse
 }
 
 /// Queued in test builds only. A production run without App's hooks is a
-/// print run, whose CC counterpart registers only elicitation-complete and
-/// channel handlers on its connections (`print.ts:1358`, `:4733`,
-/// `:4809`): the event is dropped there rather than kept unread.
+/// print run, where CC hands a URL elicitation to the SDK host's
+/// `handleElicitation` (`print.ts:2189`) instead of a queue: the event is
+/// dropped there rather than kept unread.
 async fn observe_for_test(observation: McpConnectionCallbackObservation) {
     #[cfg(test)]
     test_observations().lock().await.push_back(observation);

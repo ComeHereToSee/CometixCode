@@ -31,9 +31,9 @@ use crate::state::app_state_store::McpState;
 use crate::utils::zod::js_string;
 use serde_json::{Map, Value};
 
-/// Maps to: CC MCP client lifecycle callbacks that feed `updateServer(...)`.
-/// Prefer [`crate::services::mcp::use_manage_mcp_connections::OnConnectionAttemptHandlers`]
-/// registered by App (CC `onConnectionAttempt` closures). Observation drain is for tests without App.
+/// Test observation of the session-level MCP events
+/// ([`crate::services::mcp::use_manage_mcp_connections::OnConnectionAttemptHandlers`],
+/// which App registers): a tool call's URL elicitation queue push.
 pub use crate::services::mcp::use_manage_mcp_connections::drain_mcp_connection_callback_observations;
 
 /// Maps to: CC `ElicitationRequestEvent.respond(...)` callback stored in
@@ -1048,7 +1048,24 @@ mod runtime {
         onclose: std::sync::Mutex<Option<OncloseHandler>>,
         /// SDK `Client.setNotificationHandler`'s handlers, by method.
         notification_handlers: std::sync::Mutex<HashMap<String, NotificationHandler>>,
+        /// SDK `Client.setRequestHandler(ElicitRequestSchema, ..)`'s handler.
+        /// None stands for the default `connectToServer` registers, which
+        /// cancels (`client.ts:1188-1197`).
+        elicitation_handler: std::sync::Mutex<Option<ElicitationHandler>>,
     }
+
+    /// A handler [`McpClient::set_elicitation_handler`] registers: it gets the
+    /// request's params, its id, and a future that completes when the request
+    /// is cancelled (the SDK's `extra.signal`), and answers the request.
+    pub(crate) type ElicitationHandler = Arc<
+        dyn Fn(
+                RmcpElicitRequestParams,
+                String,
+                futures::future::BoxFuture<'static, ()>,
+            ) -> futures::future::BoxFuture<'static, ElicitationResult>
+            + Send
+            + Sync,
+    >;
 
     /// A handler [`McpClient::set_notification_handler`] registers: it gets
     /// the notification's params, and its work is the future it returns, as
@@ -1075,6 +1092,7 @@ mod runtime {
                 cancellation_token: std::sync::Mutex::new(Some(service.cancellation_token())),
                 onclose: std::sync::Mutex::new(None),
                 notification_handlers: std::sync::Mutex::new(HashMap::new()),
+                elicitation_handler: std::sync::Mutex::new(None),
             }));
             let _ = service.service().client.set(Arc::downgrade(&client.0));
             client
@@ -1092,6 +1110,7 @@ mod runtime {
                 cancellation_token: std::sync::Mutex::new(None),
                 onclose: std::sync::Mutex::new(None),
                 notification_handlers: std::sync::Mutex::new(HashMap::new()),
+                elicitation_handler: std::sync::Mutex::new(None),
             }))
         }
 
@@ -1227,6 +1246,36 @@ mod runtime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(method);
+        }
+
+        /// Maps to: SDK `Client.setRequestHandler(ElicitRequestSchema,
+        /// handler)` (`client/index.js:169-279`, over
+        /// `shared/protocol.js:886-893`), replacing the handler registered
+        /// before.
+        pub(crate) fn set_elicitation_handler(
+            &self,
+            handler: impl Fn(
+                RmcpElicitRequestParams,
+                String,
+                futures::future::BoxFuture<'static, ()>,
+            ) -> futures::future::BoxFuture<'static, ElicitationResult>
+            + Send
+            + Sync
+            + 'static,
+        ) {
+            *self
+                .0
+                .elicitation_handler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(handler));
+        }
+
+        fn elicitation_handler(&self) -> Option<ElicitationHandler> {
+            self.0
+                .elicitation_handler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         /// What a handler stored on this connection may hold of it.
@@ -1527,37 +1576,142 @@ mod runtime {
         });
     }
 
-    /// Maps to: CC `elicitationHandler.ts:173-206`, the
-    /// `ElicitationCompleteNotificationSchema` handler. rmcp has no typed
-    /// variant for `notifications/elicitation/complete`, so it arrives here as
-    /// a custom notification. A payload without a string `elicitationId`
-    /// fails the SDK schema and never reaches CC's handler; it is consumed
-    /// and dropped the same way.
-    pub(super) async fn handle_elicitation_complete_notification(
+    /// Maps to: CC `registerElicitationHandler(client, serverName,
+    /// setAppState)` (`elicitationHandler.ts:68-212`), which
+    /// `onConnectionAttempt` calls in place of the default handler
+    /// `connectToServer` registered. The request handler lets the elicitation
+    /// hooks answer first, else queues the request for the dialog and waits
+    /// for its answer or the request's cancellation, then runs the result
+    /// hooks. The completion handler marks the queued request complete.
+    ///
+    /// Placed with the rest of the elicitation runtime, which sits on the
+    /// rmcp side here rather than in `elicitation_handler.rs`.
+    pub(crate) fn register_elicitation_handler(
+        client: &McpClient,
         server_name: &str,
-        notification: &CustomNotification,
-    ) -> bool {
-        if notification.method != ELICITATION_COMPLETE_NOTIFICATION_METHOD {
-            return false;
+        writer: &crate::state::app_state_store::McpWriter,
+    ) {
+        use futures::FutureExt as _;
+        {
+            let (server_name, writer) = (server_name.to_owned(), writer.clone());
+            client.set_elicitation_handler(move |request, request_id, cancelled| {
+                queue_elicitation_request(
+                    server_name.clone(),
+                    request,
+                    request_id,
+                    cancelled,
+                    writer.clone(),
+                )
+                .boxed()
+            });
         }
-        let Some(elicitation_id) = notification
-            .params
-            .as_ref()
-            .and_then(|params| params.get("elicitationId"))
-            .and_then(Value::as_str)
-        else {
-            return true;
-        };
-        spawn_elicitation_notification_hooks(
-            elicitation_complete_notification_message(server_name, elicitation_id),
-            "elicitation_complete",
+        // `:175-207`. rmcp has no typed variant for
+        // `notifications/elicitation/complete`, so it arrives as a custom
+        // notification. A payload without a string `elicitationId` fails the
+        // SDK schema and never reaches CC's handler; it is dropped the same
+        // way.
+        let (server_name, writer) = (server_name.to_owned(), writer.clone());
+        client.set_notification_handler(ELICITATION_COMPLETE_NOTIFICATION_METHOD, move |params| {
+            if let Some(elicitation_id) = params
+                .as_ref()
+                .and_then(|params| params.get("elicitationId"))
+                .and_then(Value::as_str)
+            {
+                crate::utils::log::log_mcp_debug(
+                    &server_name,
+                    &format!("Received elicitation completion notification: {elicitation_id}"),
+                );
+                spawn_elicitation_notification_hooks(
+                    elicitation_complete_notification_message(&server_name, elicitation_id),
+                    "elicitation_complete",
+                );
+                writer.mark_elicitation_complete(&server_name, elicitation_id);
+            }
+            futures::future::ready(()).boxed()
+        });
+    }
+
+    /// The request handler of [`register_elicitation_handler`]
+    /// (`elicitationHandler.ts:77-171`).
+    async fn queue_elicitation_request(
+        server_name: String,
+        request: RmcpElicitRequestParams,
+        request_id: String,
+        mut cancelled: futures::future::BoxFuture<'static, ()>,
+        writer: crate::state::app_state_store::McpWriter,
+    ) -> ElicitationResult {
+        use futures::FutureExt as _;
+        crate::utils::log::log_mcp_debug(
+            &server_name,
+            &format!(
+                "Received elicitation request: {}",
+                elicitation_request_json(&request)
+            ),
         );
-        crate::services::mcp::use_manage_mcp_connections::emit_elicitation_completed(
-            server_name.to_string(),
-            elicitation_id.to_string(),
-        )
-        .await;
-        true
+        if let Some(hook_response) = run_elicitation_hooks_for_request(&server_name, &request).await
+        {
+            crate::utils::log::log_mcp_debug(
+                &server_name,
+                &format!(
+                    "Elicitation resolved by hook: {}",
+                    elicitation_result_json(&hook_response)
+                ),
+            );
+            return hook_response;
+        }
+
+        // `:119-122`: a request already cancelled is not queued.
+        if (&mut cancelled).now_or_never().is_some() {
+            return ElicitationResult::new(ElicitationAction::Cancel);
+        }
+        let (sender, receiver) = oneshot::channel::<ElicitationResult>();
+        PENDING_ELICITATION_RESPONSES
+            .lock()
+            .await
+            .insert((server_name.clone(), request_id.clone()), sender);
+        writer.push_elicitation_event(ElicitationRequestEvent::new(
+            server_name.clone(),
+            request_id.clone(),
+            rmcp_elicitation_params_to_event_params(&request),
+        ));
+        let raw_result = tokio::select! {
+            _ = cancelled => {
+                // `:115-117`, and the dialog that cancels on the abort
+                // (`ElicitationDialog.tsx:193-209`): the request leaves the
+                // queue as it is answered with a cancel.
+                PENDING_ELICITATION_RESPONSES
+                    .lock()
+                    .await
+                    .remove(&(server_name.clone(), request_id.clone()));
+                writer.remove_elicitation_event(&server_name, &request_id);
+                ElicitationResult::new(ElicitationAction::Cancel)
+            }
+            response = receiver => {
+                response.unwrap_or_else(|_| ElicitationResult::new(ElicitationAction::Cancel))
+            }
+        };
+        crate::utils::log::log_mcp_debug(
+            &server_name,
+            &format!(
+                "Elicitation response: {}",
+                elicitation_result_json(&raw_result)
+            ),
+        );
+        run_elicitation_result_hooks_for_response(&server_name, &request, raw_result).await
+    }
+
+    /// CC `jsonStringify(request)` of an `elicitation/create` request.
+    fn elicitation_request_json(request: &RmcpElicitRequestParams) -> Value {
+        serde_json::json!({ "method": "elicitation/create", "params": request })
+    }
+
+    /// CC `jsonStringify(result)` of an `ElicitResult`.
+    fn elicitation_result_json(result: &ElicitationResult) -> Value {
+        let mut json = serde_json::json!({ "action": result.action.as_str() });
+        if let Some(content) = &result.content {
+            json["content"] = content.clone();
+        }
+        json
     }
 
     async fn run_elicitation_result_hooks_for_response(
@@ -1631,48 +1785,51 @@ mod runtime {
             request: RmcpElicitRequestParams,
             context: RequestContext<RoleClient>,
         ) -> impl Future<Output = Result<RmcpElicitResult, McpError>> + Send + '_ {
+            use futures::FutureExt as _;
             let server_name = self.server_name.clone();
+            let handler = self
+                .client
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .and_then(|client| McpClient(client).elicitation_handler());
+            let request_id = context.id.to_string();
+            let ct = context.ct.clone();
             async move {
-                // Maps to: CC `registerElicitationHandler(...)`: hooks can
-                // resolve the request before REPL UI is queued.
-                if let Some(hook_response) =
-                    run_elicitation_hooks_for_request(&server_name, &request).await
-                {
-                    return Ok(elicitation_result_to_rmcp(hook_response));
+                // SDK `Client.setRequestHandler`'s elicitation wrapper
+                // (`client/index.js:191-207`): the client declares an empty
+                // `elicitation: {}` (`get_info` above, CC `client.ts:999`),
+                // which `getSupportedElicitationModes` (`:60-70`) reads as
+                // form mode only, so a URL-mode request is refused before any
+                // handler sees it.
+                if matches!(
+                    request,
+                    RmcpElicitRequestParams::UrlElicitationParams { .. }
+                ) {
+                    return Err(McpError::invalid_params(
+                        "Client does not support URL-mode elicitation requests",
+                        None,
+                    ));
                 }
-
-                // Maps to: CC `registerElicitationHandler(...)` queuing an
-                // `ElicitationRequestEvent` in `AppState.elicitation.queue`.
-                let request_id = context.id.to_string();
-                let (sender, receiver) = oneshot::channel::<ElicitationResult>();
-                PENDING_ELICITATION_RESPONSES
-                    .lock()
-                    .await
-                    .insert((server_name.clone(), request_id.clone()), sender);
-                let event = ElicitationRequestEvent::new(
-                    server_name.clone(),
-                    request_id.clone(),
-                    rmcp_elicitation_params_to_event_params(&request),
-                );
-                crate::services::mcp::use_manage_mcp_connections::emit_elicitation_requested(event)
-                    .await;
-
-                let raw_result = tokio::select! {
-                    _ = context.ct.cancelled() => {
-                        PENDING_ELICITATION_RESPONSES
-                            .lock()
-                            .await
-                            .remove(&(server_name.clone(), request_id));
+                let result = match handler {
+                    Some(handler) => {
+                        let cancelled = async move { ct.cancelled().await }.boxed();
+                        handler(request, request_id, cancelled).await
+                    }
+                    // Maps to: CC the default handler `connectToServer`
+                    // registers (`client.ts:1188-1197`), until
+                    // `onConnectionAttempt` registers the real one.
+                    None => {
+                        crate::utils::log::log_mcp_debug(
+                            &server_name,
+                            &format!(
+                                "Elicitation request received during initialization: {}",
+                                elicitation_request_json(&request)
+                            ),
+                        );
                         ElicitationResult::new(ElicitationAction::Cancel)
                     }
-                    response = receiver => {
-                        response.unwrap_or_else(|_| ElicitationResult::new(ElicitationAction::Cancel))
-                    }
                 };
-                let final_result =
-                    run_elicitation_result_hooks_for_response(&server_name, &request, raw_result)
-                        .await;
-                Ok(elicitation_result_to_rmcp(final_result))
+                Ok(elicitation_result_to_rmcp(result))
             }
         }
 
@@ -1731,9 +1888,6 @@ mod runtime {
             let server_name = self.server_name.clone();
             let registered = self.registered_handler(&notification.method);
             async move {
-                if handle_elicitation_complete_notification(&server_name, &notification).await {
-                    return;
-                }
                 if crate::services::mcp::vscode_sdk_mcp::handle_vscode_log_event_notification(
                     &server_name,
                     &notification,
@@ -4094,6 +4248,7 @@ mod runtime {
     }
 }
 
+pub(crate) use runtime::register_elicitation_handler;
 pub use runtime::{
     McpClient, call_ide_rpc, call_mcp_tool, call_mcp_tool_with_elicitation, cleanup_connection,
     cleanup_memoized_connection, clear_mcp_auth_cache, clear_server_cache, connect_to_server,
@@ -6621,13 +6776,13 @@ rl.on('line', line => {
                 });
                 let request_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     loop {
-                        for event in runtime::drain_mcp_connection_callback_observations().await {
-                            if let crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ElicitationRequested { event } = event {
-                                assert_eq!(event.server_name, SERVER);
-                                assert_eq!(event.request_id, "error-elicit-fixture-elicit");
-                                assert!(event.waiting_state.is_some());
-                                return event.request_id;
-                            }
+                        for crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ElicitationRequested { event } in
+                            runtime::drain_mcp_connection_callback_observations().await
+                        {
+                            assert_eq!(event.server_name, SERVER);
+                            assert_eq!(event.request_id, "error-elicit-fixture-elicit");
+                            assert!(event.waiting_state.is_some());
+                            return event.request_id;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     }
@@ -6801,11 +6956,15 @@ rl.on('line', line => {
         });
     }
 
-    /// `notifications/elicitation/complete` reaches CC's completion handler
-    /// (`elicitationHandler.ts:173-206`), although rmcp no longer types it.
+    /// `notifications/elicitation/complete` reaches the completion handler
+    /// `onConnectionAttempt` registers (`elicitationHandler.ts:175-207`),
+    /// although rmcp no longer types it: the queued request it names is
+    /// marked complete.
     #[test]
     fn elicitation_complete_notification_reaches_the_completion_handler() {
-        use crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation;
+        use crate::services::mcp::elicitation_handler::{
+            ElicitationRequestEvent, ElicitationRequestParams,
+        };
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let fixture = counting_fixture::CountingFixture::new();
         block_on_with_process_runtime(async {
@@ -6817,38 +6976,223 @@ rl.on('line', line => {
                 McpServerConnectionType::Connected,
                 "{connected:?}"
             );
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
+            let store = crate::state::store::AppStore::new(
+                crate::state::app_state_store::AppState::default(),
+                None,
+            );
+            let writer = crate::state::app_state_store::McpWriter::new(store.clone());
+            writer.push_elicitation_event(ElicitationRequestEvent::new(
+                SERVER,
+                "1",
+                ElicitationRequestParams::Url {
+                    message: "Authorize".to_string(),
+                    url: "https://example.com/auth".to_string(),
+                    elicitation_id: Some("elicit-1".to_string()),
+                },
+            ));
+            crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+                McpConnectionDiscovery::from(connected.clone()),
+                &writer,
+            );
 
+            // The fixture answers a `complete` call with the notification.
             let client = &connected.as_connected().expect("a connected record").client;
             runtime::call_mcp_tool(client, "complete", Map::new(), None)
                 .await
                 .expect("tool call");
-            let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    let observations = runtime::drain_mcp_connection_callback_observations().await;
-                    if let Some(found) =
-                        observations
-                            .into_iter()
-                            .find_map(|observation| match observation {
-                                McpConnectionCallbackObservation::ElicitationCompleted {
-                                    name,
-                                    elicitation_id,
-                                } => Some((name, elicitation_id)),
-                                _ => None,
-                            })
-                    {
-                        break found;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
+            until_state(&store, "the queued elicitation to complete", |state| {
+                state
+                    .elicitation
+                    .queue
+                    .first()
+                    .is_some_and(|event| event.completed)
             })
-            .await
-            .expect("an elicitation completion");
-            assert_eq!(completed, (SERVER.to_string(), "elicit-1".to_string()));
+            .await;
 
             runtime::clear_server_cache(SERVER, None).await;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
         });
+    }
+
+    /// An `elicitation/create` from the server: before `onConnectionAttempt`
+    /// the default handler `connectToServer` registered cancels it
+    /// (`client.ts:1188-1197`); after, `registerElicitationHandler`'s handler
+    /// queues it for the dialog and answers with the dialog's result
+    /// (`elicitationHandler.ts:77-171`), and a request the server cancels
+    /// leaves the queue. A URL-mode request is refused either way: the
+    /// client declares form mode only (SDK `client/index.js:191-207`).
+    #[test]
+    fn server_elicitations_are_cancelled_until_the_session_registers_its_handler() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let script_path =
+            std::env::temp_dir().join(format!("cometix-mcp-elicit-{}.mjs", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &script_path,
+            r#"
+import readline from 'node:readline'
+const rl = readline.createInterface({ input: process.stdin })
+function send(message) {
+  process.stdout.write(JSON.stringify(message) + '\n')
+}
+function reply(id, text) {
+  send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } })
+}
+let pendingCall
+rl.on('line', line => {
+  let message
+  try { message = JSON.parse(line) } catch { return }
+  if (message.method === undefined) {
+    // The client's answer to an `elicitation/create`.
+    if (message.id === 'srv-1') {
+      reply(pendingCall, message.error ? `error:${message.error.code}` : message.result.action)
+    }
+    return
+  }
+  if (message.id === undefined) return
+  if (message.method === 'initialize') {
+    send({
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        protocolVersion: '2025-11-25',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'elicit-fixture', version: '1.0.0' }
+      }
+    })
+  } else if (message.method === 'tools/call') {
+    const name = message.params.name
+    if (name === 'ask' || name === 'ask-url') {
+      pendingCall = message.id
+      send({
+        jsonrpc: '2.0',
+        id: 'srv-1',
+        method: 'elicitation/create',
+        params: name === 'ask'
+          ? {
+              message: 'Pick one',
+              requestedSchema: { type: 'object', properties: { choice: { type: 'string' } } }
+            }
+          : { mode: 'url', message: 'Open', url: 'https://example.com/auth', elicitationId: 'url-1' }
+      })
+    } else if (name === 'hold') {
+      send({
+        jsonrpc: '2.0',
+        id: 'srv-2',
+        method: 'elicitation/create',
+        params: { message: 'Hold', requestedSchema: { type: 'object', properties: {} } }
+      })
+      reply(message.id, 'held')
+    } else if (name === 'cancel') {
+      send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'srv-2' } })
+      reply(message.id, 'cancelled')
+    }
+  } else {
+    send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'method not found' } })
+  }
+})
+"#,
+        )
+        .expect("write MCP fixture");
+
+        block_on_with_process_runtime(async {
+            const SERVER: &str = "elicit-stdio-fixture";
+            let mut config = ScopedMcpServerConfig::stdio_for_test("node");
+            config.args = vec![script_path.to_string_lossy().to_string()];
+            let connected = runtime::connect_to_server(SERVER, &config).await;
+            let client = connected
+                .as_connected()
+                .expect("a connected record")
+                .client
+                .clone();
+            // What the fixture answers a tool call with: the action of the
+            // client's answer, or `error:<code>`.
+            async fn call(client: &McpClient, tool: &str) -> Option<String> {
+                let value = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    runtime::call_mcp_tool(client, tool, Map::new(), None),
+                )
+                .await
+                .expect("the tool call returns")
+                .expect("tool call");
+                value["content"][0]["text"].as_str().map(str::to_owned)
+            }
+
+            assert_eq!(call(&client, "ask").await.as_deref(), Some("cancel"));
+            assert_eq!(
+                call(&client, "ask-url").await.as_deref(),
+                Some("error:-32602")
+            );
+
+            let store = crate::state::store::AppStore::new(
+                crate::state::app_state_store::AppState::default(),
+                None,
+            );
+            let writer = crate::state::app_state_store::McpWriter::new(store.clone());
+            crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+                McpConnectionDiscovery::from(connected.clone()),
+                &writer,
+            );
+            assert_eq!(
+                call(&client, "ask-url").await.as_deref(),
+                Some("error:-32602")
+            );
+            assert!(store.get().elicitation.queue.is_empty());
+
+            let asking = tokio::spawn({
+                let client = client.clone();
+                async move { call(&client, "ask").await }
+            });
+            until_state(&store, "the queued elicitation", |state| {
+                !state.elicitation.queue.is_empty()
+            })
+            .await;
+            let event = store.get().elicitation.queue[0].clone();
+            assert_eq!(event.server_name, SERVER);
+            assert_eq!(event.request_id, "srv-1");
+            assert!(matches!(
+                &event.params,
+                crate::services::mcp::elicitation_handler::ElicitationRequestParams::Form {
+                    message,
+                    ..
+                } if message == "Pick one"
+            ));
+            assert_eq!(event.waiting_state, None);
+            assert!(
+                runtime::respond_to_mcp_elicitation(
+                    SERVER,
+                    &event.request_id,
+                    ElicitationResult::new(ElicitationAction::Accept),
+                )
+                .await
+            );
+            assert_eq!(asking.await.unwrap().as_deref(), Some("accept"));
+
+            // The server cancels a request still in the dialog's queue.
+            let held = |state: &crate::state::app_state_store::AppState| {
+                state
+                    .elicitation
+                    .queue
+                    .iter()
+                    .any(|event| event.request_id == "srv-2")
+            };
+            assert_eq!(call(&client, "hold").await.as_deref(), Some("held"));
+            until_state(&store, "the held elicitation", held).await;
+            assert_eq!(call(&client, "cancel").await.as_deref(), Some("cancelled"));
+            until_state(&store, "the cancelled elicitation to leave", |state| {
+                !held(state)
+            })
+            .await;
+            assert!(
+                !runtime::respond_to_mcp_elicitation(
+                    SERVER,
+                    "srv-2",
+                    ElicitationResult::new(ElicitationAction::Accept),
+                )
+                .await
+            );
+
+            runtime::clear_server_cache(SERVER, None).await;
+        });
+        let _ = std::fs::remove_file(script_path);
     }
 
     /// Without a process runtime a memoized connection would live on the
