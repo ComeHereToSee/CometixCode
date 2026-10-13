@@ -874,7 +874,7 @@ mod runtime {
         ElicitResult as RmcpElicitResult, ElicitationAction as RmcpElicitationAction,
         ElicitationCapability, ErrorCode, GetPromptRequestParams, Implementation,
         InitializeRequestParams, ProtocolVersion, ReadResourceRequestParams, RequestMetaObject,
-        RootsCapabilities, ServerPeerInfo,
+        RootsCapabilities,
     };
     // SEP-2577 deprecates roots in the 2026-07-28 draft; CC's SDK (1.29)
     // still serves `roots/list`, on the 2025-11-25 protocol Cometix speaks.
@@ -1202,7 +1202,7 @@ mod runtime {
         }
 
         /// Maps to: SDK `Client.setNotificationHandler(schema, handler)`
-        /// (`shared/protocol.js:905-911`): one handler per method, a later
+        /// (`shared/protocol.js:913-919`): one handler per method, a later
         /// one replacing the earlier.
         pub(crate) fn set_notification_handler(
             &self,
@@ -1217,6 +1217,16 @@ mod runtime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(method.to_owned(), Arc::new(handler));
+        }
+
+        /// Maps to: SDK `Client.removeNotificationHandler(method)`
+        /// (`shared/protocol.js:923-925`); safe when none is registered.
+        pub(crate) fn remove_notification_handler(&self, method: &str) {
+            self.0
+                .notification_handlers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(method);
         }
 
         /// What a handler stored on this connection may hold of it.
@@ -1315,13 +1325,9 @@ mod runtime {
     struct CometixMcpClientHandler {
         server_name: String,
         cwd: PathBuf,
-        /// Set by `serve_connection` once the connection is made and kept,
-        /// which [`Self::serving_client`] asks.
-        serving: Arc<OnceLock<()>>,
         /// The connection this handler serves, set when its handle is made:
-        /// CC's notification handlers close over the `client` they were
-        /// registered on (`useManageMCPConnections.ts:474-751`). Weak, so the
-        /// handler does not keep the handle alive on its own.
+        /// its notifications go to the handlers registered on it. Weak, so
+        /// the handler does not keep the handle alive on its own.
         client: Arc<OnceLock<std::sync::Weak<McpClientInner>>>,
     }
 
@@ -1330,21 +1336,11 @@ mod runtime {
             Self {
                 server_name: server_name.to_string(),
                 cwd: std::env::current_dir().unwrap_or_default(),
-                serving: Arc::new(OnceLock::new()),
                 client: Arc::new(OnceLock::new()),
             }
         }
 
-        /// The connection this handler serves, once it is kept; `None` for
-        /// one still being set up, or one a `clearServerCache` voided while it
-        /// was made. Only the channel gate's `plugin_source` reads it now; it
-        /// goes with the channel handlers' move onto the connection.
-        fn serving_client(&self) -> Option<McpClient> {
-            self.serving.get()?;
-            Some(McpClient(self.client.get()?.upgrade()?))
-        }
-
-        /// SDK `Protocol._onnotification` (`shared/protocol.js:269-279`): the
+        /// SDK `Protocol._onnotification` (`shared/protocol.js:273-283`): the
         /// handler registered on this client for `method`. Without one the
         /// SDK drops the notification.
         fn registered_handler(&self, method: &str) -> Option<NotificationHandler> {
@@ -1593,91 +1589,6 @@ mod runtime {
         final_result
     }
 
-    fn server_info_has_experimental_capability(
-        peer_info: Option<&ServerPeerInfo>,
-        capability: &str,
-    ) -> bool {
-        peer_info
-            .and_then(|info| info.capabilities.experimental.as_ref())
-            .is_some_and(|experimental| experimental.contains_key(capability))
-    }
-
-    /// `peer_info` and `plugin_source` are the notifying connection's.
-    pub(super) async fn emit_channel_message_event_from_custom_notification(
-        server_name: String,
-        notification: CustomNotification,
-        peer_info: Option<&ServerPeerInfo>,
-        plugin_source: Option<String>,
-    ) -> bool {
-        // Maps to: CC `ChannelMessageNotificationSchema` handler registered in
-        // `useManageMCPConnections.ts` for `notifications/claude/channel`.
-        if notification.method
-            != crate::services::mcp::channel_notification::CHANNEL_MESSAGE_NOTIFICATION_METHOD
-        {
-            return false;
-        }
-
-        let parsed = match crate::services::mcp::channel_notification::parse_channel_message_notification_params(
-            notification.params.as_ref(),
-        ) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                tracing::warn!(server = %server_name, error = %error, "invalid MCP channel notification");
-                return false;
-            }
-        };
-        let has_channel_capability = server_info_has_experimental_capability(
-            peer_info,
-            crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY,
-        );
-        crate::services::mcp::use_manage_mcp_connections::emit_channel_message_received(
-            server_name,
-            parsed.content,
-            parsed.meta,
-            has_channel_capability,
-            plugin_source,
-        )
-        .await;
-        true
-    }
-
-    pub(super) async fn emit_channel_permission_event_from_custom_notification(
-        server_name: String,
-        notification: CustomNotification,
-        peer_info: Option<&ServerPeerInfo>,
-    ) -> bool {
-        // Maps to: CC `ChannelPermissionNotificationSchema` handler registered
-        // in `useManageMCPConnections.ts` for
-        // `notifications/claude/channel/permission`.
-        if notification.method
-            != crate::services::mcp::channel_notification::CHANNEL_PERMISSION_METHOD
-        {
-            return false;
-        }
-
-        let parsed = match crate::services::mcp::channel_notification::parse_channel_permission_notification_params(
-            notification.params.as_ref(),
-        ) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                tracing::warn!(server = %server_name, error = %error, "invalid MCP channel permission notification");
-                return false;
-            }
-        };
-        let has_permission_capability = server_info_has_experimental_capability(
-            peer_info,
-            crate::services::mcp::channel_notification::CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY,
-        );
-        crate::services::mcp::use_manage_mcp_connections::emit_channel_permission_received(
-            server_name,
-            parsed.request_id,
-            parsed.behavior,
-            has_permission_capability,
-        )
-        .await;
-        true
-    }
-
     impl ClientHandler for CometixMcpClientHandler {
         fn get_info(&self) -> InitializeRequestParams {
             // Maps to: CC `new Client({ name:'claude-code', title:'Claude Code', ... },
@@ -1815,16 +1726,10 @@ mod runtime {
         fn on_custom_notification(
             &self,
             notification: CustomNotification,
-            context: NotificationContext<RoleClient>,
+            _context: NotificationContext<RoleClient>,
         ) -> impl Future<Output = ()> + Send + '_ {
             let server_name = self.server_name.clone();
             let registered = self.registered_handler(&notification.method);
-            // CC `gateChannelServer(client.name, client.capabilities,
-            // client.config.pluginSource)` (`useManageMCPConnections.ts:
-            // 473-478`): the config of the client the handler closed over.
-            let plugin_source = self
-                .serving_client()
-                .and_then(|client| client.config().plugin_source.clone());
             async move {
                 if handle_elicitation_complete_notification(&server_name, &notification).await {
                     return;
@@ -1837,25 +1742,7 @@ mod runtime {
                 }
                 if let Some(handler) = registered {
                     handler(notification.params).await;
-                    return;
                 }
-                let peer_info = context.peer.peer_info();
-                if emit_channel_message_event_from_custom_notification(
-                    server_name.clone(),
-                    notification.clone(),
-                    peer_info.as_deref(),
-                    plugin_source,
-                )
-                .await
-                {
-                    return;
-                }
-                let _ = emit_channel_permission_event_from_custom_notification(
-                    server_name,
-                    notification,
-                    peer_info.as_deref(),
-                )
-                .await;
             }
         }
     }
@@ -3437,8 +3324,7 @@ mod runtime {
         });
     }
 
-    /// Keeps a connection just made: it is marked kept, and its close is
-    /// watched — the rest of CC's
+    /// Watches a connection just made for its close — the rest of CC's
     /// `connectToServer` once `client.connect` resolves, which wraps the
     /// client's `onerror` and `onclose` (`client.ts:1216-1402`).
     ///
@@ -3446,8 +3332,8 @@ mod runtime {
     /// it was being made is closed at once instead, and `false` returned: CC's
     /// clear awaits the connect and then `cleanup()`s it. Closing it here,
     /// before the clear gets to it, hands its waiters a connection already
-    /// closed and keeps it from serving notifications meanwhile.
-    fn serve_connection(
+    /// closed.
+    fn watch_connection(
         client: &McpClient,
         service: RunningService<RoleClient, CometixMcpClientHandler>,
         memoized: bool,
@@ -3464,7 +3350,6 @@ mod runtime {
             client.cancel();
             return false;
         }
-        let _ = service.service().serving.set(());
         spawn_service_close_watcher(client.clone(), service);
         true
     }
@@ -3694,7 +3579,7 @@ mod runtime {
         // CC's do: CC's clear awaits the connect and then `cleanup()`s the
         // client they hold. Fetches through it come back empty, and an
         // automatic reconnect that made it stops, as in CC.
-        if serve_connection(&client, service, memoized) {
+        if watch_connection(&client, service, memoized) {
             let subscribe = connected.capabilities.resources.is_some();
             crate::utils::debug::log_for_debugging(&format!(
                 "[MCP] Server \"{name}\" connected with subscribe={subscribe}"
@@ -3745,7 +3630,7 @@ mod runtime {
                         // `client.ts:3296-3310`: capabilities only.
                         let connected = connected_mcp_server(client.clone());
                         let has_tools = connected.capabilities.tools.is_some();
-                        serve_connection(&client, service, false);
+                        watch_connection(&client, service, false);
                         let server = McpServerConnection::Connected(connected);
                         // CC `fetchToolsForClient(connectedClient)` when the
                         // server has tools (`client.ts:3312-3317`).
@@ -4937,7 +4822,7 @@ rl.on('line', line => {
         let _ = std::fs::remove_file(script_path);
     }
 
-    /// SDK `setNotificationHandler` (`shared/protocol.js:905-911`) keeps one
+    /// SDK `setNotificationHandler` (`shared/protocol.js:913-919`) keeps one
     /// handler per method, the later replacing the earlier: a remounted
     /// REPL's effect registers on the same IDE client, and only its channel
     /// receives the selections.
@@ -6226,117 +6111,241 @@ rl.on('line', line => {
         }
     }
 
-    #[test]
-    fn channel_custom_notification_emits_callback_observation() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
-                let mut capabilities = rmcp::model::ServerCapabilities::default();
-                capabilities.experimental = Some(BTreeMap::from([(
-                    crate::services::mcp::channel_notification::CHANNEL_EXPERIMENTAL_CAPABILITY
-                        .to_string(),
-                    Map::new(),
-                )]));
-                let peer_info = rmcp::model::ServerPeerInfo::new(
-                    rmcp::model::ProtocolVersion::V_2025_11_25,
-                    capabilities,
-                );
-
-                let emitted = runtime::emit_channel_message_event_from_custom_notification(
-                    "slack".to_string(),
-                    rmcp::model::CustomNotification::new(
-                        crate::services::mcp::channel_notification::CHANNEL_MESSAGE_NOTIFICATION_METHOD,
-                        Some(serde_json::json!({
-                            "content": "hello",
-                            "meta": { "thread_ts": "123" }
-                        })),
-                    ),
-                    Some(&peer_info),
-                    Some("slack@official".to_string()),
-                )
-                .await;
-                assert!(emitted);
-
-                let events = runtime::drain_mcp_connection_callback_observations().await;
-                match events.as_slice() {
-                    [crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ChannelMessageReceived {
-                        name,
-                        content,
-                        meta,
-                        has_channel_capability,
-                        plugin_source,
-                    }] => {
-                        assert_eq!(name, "slack");
-                        assert_eq!(content, "hello");
-                        assert_eq!(
-                            meta.as_ref().and_then(|meta| meta.get("thread_ts")),
-                            Some(&"123".to_string())
-                        );
-                        assert!(*has_channel_capability);
-                        assert_eq!(plugin_source.as_deref(), Some("slack@official"));
-                    }
-                    other => panic!("expected one channel event, got {other:?}"),
-                }
-            });
+    /// A connected record with no connection behind it, its config from
+    /// `plugin_source`, declaring the experimental `capabilities`.
+    fn channel_server(
+        name: &str,
+        plugin_source: Option<&str>,
+        capabilities: &[&str],
+    ) -> McpServerConnection {
+        let mut config = ScopedMcpServerConfig::stdio_for_test(name);
+        config.plugin_source = plugin_source.map(str::to_owned);
+        let mut server = McpServerConnection::connected_for_test(name, config);
+        if let McpServerConnection::Connected(connected) = &mut server {
+            connected.capabilities.experimental = Some(
+                capabilities
+                    .iter()
+                    .map(|capability| (capability.to_string(), Map::new()))
+                    .collect(),
+            );
+        }
+        server
     }
 
+    /// The channel gate's inputs, everything open but the session's
+    /// `--channels` list, which is `channels`.
+    fn open_channel_gate(
+        channels: Vec<crate::bootstrap::state::ChannelEntry>,
+    ) -> crate::services::mcp::channel_notification::ChannelRuntimeGateContext {
+        use crate::services::mcp::channel_notification::{
+            ChannelAllowlistSource, ChannelRuntimeGateContext, EffectiveChannelAllowlist,
+        };
+        ChannelRuntimeGateContext {
+            channels_enabled: true,
+            has_claude_ai_oauth: true,
+            subscription: Some("max".to_string()),
+            policy_channels_enabled: None,
+            session_channels: channels,
+            allowlist: EffectiveChannelAllowlist {
+                entries: Vec::new(),
+                source: ChannelAllowlistSource::Ledger,
+            },
+        }
+    }
+
+    /// CC's channel block (`useManageMCPConnections.ts:470-614`): the gate
+    /// decides when the client connects whether it gets a channel handler,
+    /// which queues each message (`:507-531`); a later connect the gate skips
+    /// removes it (`:562-572`).
     #[test]
-    fn channel_permission_custom_notification_emits_callback_observation() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let _ = runtime::drain_mcp_connection_callback_observations().await;
-                let mut capabilities = rmcp::model::ServerCapabilities::default();
-                capabilities.experimental = Some(BTreeMap::from([(
-                    crate::services::mcp::channel_notification::CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY
-                        .to_string(),
-                    Map::new(),
-                )]));
-                let peer_info = rmcp::model::ServerPeerInfo::new(
-                    rmcp::model::ProtocolVersion::V_2025_11_25,
-                    capabilities,
-                );
+    fn channel_messages_are_queued_only_on_a_client_the_gate_registered() {
+        use crate::bootstrap::state::ChannelEntry;
+        use crate::services::mcp::channel_notification::{
+            CHANNEL_EXPERIMENTAL_CAPABILITY, CHANNEL_MESSAGE_NOTIFICATION_METHOD,
+        };
+        use crate::services::mcp::use_manage_mcp_connections::install_channel_handlers;
+        let _queue_lock = crate::utils::message_queue_manager::TEST_QUEUE_LOCK
+            .lock()
+            .unwrap();
+        crate::utils::message_queue_manager::clear_command_queue();
+        let listed = open_channel_gate(vec![ChannelEntry::server("planner", true)]);
 
-                let emitted = runtime::emit_channel_permission_event_from_custom_notification(
-                    "telegram".to_string(),
-                    rmcp::model::CustomNotification::new(
-                        crate::services::mcp::channel_notification::CHANNEL_PERMISSION_METHOD,
-                        Some(serde_json::json!({
-                            "request_id": "TbXkQ",
-                            "behavior": "deny"
-                        })),
-                    ),
-                    Some(&peer_info),
-                )
-                .await;
-                assert!(emitted);
+        let server = channel_server("planner", None, &[CHANNEL_EXPERIMENTAL_CAPABILITY]);
+        let connected = server.as_connected().expect("connected");
+        install_channel_handlers(connected, &listed, None);
+        let handler = connected
+            .client
+            .notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD)
+            .expect("a channel handler");
+        futures::executor::block_on(handler(Some(serde_json::json!({
+            "content": "hello",
+            "meta": { "thread_ts": "1" }
+        }))));
+        let queue = crate::utils::message_queue_manager::get_command_queue();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].mode, "prompt");
+        assert!(queue[0].is_meta);
+        assert!(queue[0].skip_slash_commands);
+        assert!(
+            queue[0]
+                .value
+                .contains("<channel source=\"planner\" thread_ts=\"1\">")
+        );
+        crate::utils::message_queue_manager::clear_command_queue();
 
-                let events = runtime::drain_mcp_connection_callback_observations().await;
-                match events.as_slice() {
-                    [crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation::ChannelPermissionReceived {
-                        name,
-                        request_id,
-                        behavior,
-                        has_permission_capability,
-                    }] => {
-                        assert_eq!(name, "telegram");
-                        assert_eq!(request_id, "TbXkQ");
-                        assert_eq!(
-                            *behavior,
-                            crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Deny
-                        );
-                        assert!(*has_permission_capability);
-                    }
-                    other => panic!("expected one channel permission event, got {other:?}"),
-                }
-            });
+        // Connected again while not in the session's `--channels` list.
+        install_channel_handlers(connected, &open_channel_gate(Vec::new()), None);
+        assert!(
+            connected
+                .client
+                .notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD)
+                .is_none()
+        );
+
+        // A server that never declared the capability gets none.
+        let plain = channel_server("planner", None, &[]);
+        let plain = plain.as_connected().expect("connected");
+        install_channel_handlers(plain, &listed, None);
+        assert!(
+            plain
+                .client
+                .notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD)
+                .is_none()
+        );
+    }
+
+    /// CC registers the permission-reply handler beside a registered channel
+    /// handler, for a server that declared `claude/channel/permission`
+    /// (`useManageMCPConnections.ts:533-560`): a reply resolves the session's
+    /// pending relay, and a stale one resolves nothing. A skip removes it.
+    #[test]
+    fn channel_permission_replies_resolve_the_session_relays() {
+        use crate::bootstrap::state::ChannelEntry;
+        use crate::services::mcp::channel_notification::{
+            CHANNEL_EXPERIMENTAL_CAPABILITY, CHANNEL_MESSAGE_NOTIFICATION_METHOD,
+            CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY, CHANNEL_PERMISSION_METHOD,
+        };
+        use crate::services::mcp::channel_permissions::{
+            ChannelPermissionBehavior, ChannelPermissionCallbacks,
+        };
+        use crate::services::mcp::use_manage_mcp_connections::install_channel_handlers;
+        let callbacks = ChannelPermissionCallbacks::default();
+        let (tx, rx) = async_channel::bounded(1);
+        let _unsubscribe = callbacks.on_response("abcde", move |response| {
+            tx.try_send(response).unwrap();
+        });
+        let listed = open_channel_gate(vec![ChannelEntry::server("telegram", true)]);
+
+        let server = channel_server(
+            "telegram",
+            None,
+            &[
+                CHANNEL_EXPERIMENTAL_CAPABILITY,
+                CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY,
+            ],
+        );
+        let connected = server.as_connected().expect("connected");
+        install_channel_handlers(connected, &listed, Some(callbacks.clone()));
+        let reply = connected
+            .client
+            .notification_handler(CHANNEL_PERMISSION_METHOD)
+            .expect("a permission handler");
+        futures::executor::block_on(reply(Some(serde_json::json!({
+            "request_id": "ABCDE",
+            "behavior": "allow"
+        }))));
+        let response = rx.try_recv().unwrap();
+        assert_eq!(response.behavior, ChannelPermissionBehavior::Allow);
+        assert_eq!(response.from_server, "telegram");
+        futures::executor::block_on(reply(Some(serde_json::json!({
+            "request_id": "abcde",
+            "behavior": "deny"
+        }))));
+        assert!(rx.try_recv().is_err());
+
+        // Connected again while not in the session's `--channels` list: both
+        // handlers go (`:562-573`).
+        let unlisted_gate = open_channel_gate(Vec::new());
+        install_channel_handlers(connected, &unlisted_gate, Some(callbacks.clone()));
+        assert!(
+            connected
+                .client
+                .notification_handler(CHANNEL_PERMISSION_METHOD)
+                .is_none()
+        );
+
+        // The capability alone is not enough: the reply handler comes only
+        // with a registered channel.
+        let unlisted = channel_server(
+            "telegram",
+            None,
+            &[
+                CHANNEL_EXPERIMENTAL_CAPABILITY,
+                CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY,
+            ],
+        );
+        let unlisted = unlisted.as_connected().expect("connected");
+        install_channel_handlers(unlisted, &unlisted_gate, Some(callbacks.clone()));
+        assert!(
+            unlisted
+                .client
+                .notification_handler(CHANNEL_PERMISSION_METHOD)
+                .is_none()
+        );
+
+        let without = channel_server("telegram", None, &[CHANNEL_EXPERIMENTAL_CAPABILITY]);
+        let without = without.as_connected().expect("connected");
+        install_channel_handlers(without, &listed, Some(callbacks));
+        assert!(
+            without
+                .client
+                .notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD)
+                .is_some()
+        );
+        assert!(
+            without
+                .client
+                .notification_handler(CHANNEL_PERMISSION_METHOD)
+                .is_none()
+        );
+    }
+
+    /// The gate reads the connecting client's own `config.pluginSource`
+    /// (`useManageMCPConnections.ts:473-478`): of two connections under one
+    /// name asked for as `plugin:telegram@official`, only the one installed
+    /// from that marketplace gets a channel handler.
+    #[test]
+    fn the_channel_gate_reads_the_connections_own_plugin_source() {
+        use crate::bootstrap::state::ChannelEntry;
+        use crate::services::mcp::channel_notification::{
+            CHANNEL_EXPERIMENTAL_CAPABILITY, CHANNEL_MESSAGE_NOTIFICATION_METHOD,
+        };
+        use crate::services::mcp::use_manage_mcp_connections::install_channel_handlers;
+        const SERVER: &str = "plugin:telegram:telegram";
+        let listed = open_channel_gate(vec![ChannelEntry::plugin("telegram", "official", true)]);
+        let official = channel_server(
+            SERVER,
+            Some("telegram@official"),
+            &[CHANNEL_EXPERIMENTAL_CAPABILITY],
+        );
+        let elsewhere = channel_server(
+            SERVER,
+            Some("telegram@elsewhere"),
+            &[CHANNEL_EXPERIMENTAL_CAPABILITY],
+        );
+        for server in [&official, &elsewhere] {
+            install_channel_handlers(server.as_connected().expect("connected"), &listed, None);
+        }
+        let has_handler = |server: &McpServerConnection| {
+            server
+                .as_connected()
+                .expect("connected")
+                .client
+                .notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD)
+                .is_some()
+        };
+        assert!(has_handler(&official));
+        assert!(!has_handler(&elsewhere));
     }
 
     /// Maps to: CC `callMCPToolWithUrlElicitationRetry` client.ts:2944-2947 —
@@ -7690,11 +7699,10 @@ rl.on('line', line => {
         let _ = std::fs::remove_file(script_path);
     }
 
-    /// CC's notification handlers close over the `client` they were
-    /// registered on (`useManageMCPConnections.ts:474-751`): a list_changed
+    /// CC's list_changed handlers close over the `client` they were
+    /// registered on (`useManageMCPConnections.ts:616-751`): a list_changed
     /// refetches on that connection and writes `updateServer({ ...client,
-    /// .. })`, and the channel gate reads `client.config.pluginSource`
-    /// (`:473-478`). With another connection open under the same name, each
+    /// .. })`. With another connection open under the same name, each
     /// notification acts for the connection that sent it.
     #[test]
     fn notifications_carry_the_connection_that_sent_them() {
@@ -7716,11 +7724,6 @@ rl.on('line', line => {
   try { message = JSON.parse(line) } catch { return }
   if (message.method === 'fixture/emit') {
     send({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' })
-    send({
-      jsonrpc: '2.0',
-      method: 'notifications/claude/channel',
-      params: { content: 'hello from the channel' }
-    })
     return
   }
   if (message.method === 'fixture/emit-resources') {
@@ -7737,8 +7740,7 @@ rl.on('line', line => {
         capabilities: {
           tools: { listChanged: true },
           prompts: {},
-          resources: { listChanged: true },
-          experimental: { 'claude/channel': {} }
+          resources: { listChanged: true }
         },
         serverInfo: { name: 'notifying-fixture', version: '1.0.0' }
       }
@@ -7766,12 +7768,9 @@ rl.on('line', line => {
         .expect("write MCP fixture");
 
         block_on_with_process_runtime(async {
-            use crate::services::mcp::use_manage_mcp_connections::McpConnectionCallbackObservation;
-            let _ = runtime::drain_mcp_connection_callback_observations().await;
             const SERVER: &str = "notifying-stdio-fixture";
             let mut config = ScopedMcpServerConfig::stdio_for_test("node");
             config.args = vec![script_path.to_string_lossy().to_string()];
-            config.plugin_source = Some("telegram@official".to_string());
             let record = runtime::connect_to_server(SERVER, &config).await;
             let sender = record
                 .as_connected()
@@ -7780,7 +7779,7 @@ rl.on('line', line => {
                 .clone();
 
             // Another config's connection under the same name, open beside
-            // the sender.
+            // the sender; any config difference makes a second memo entry.
             let mut other_config = config.clone();
             other_config.plugin_source = Some("other@elsewhere".to_string());
             let other_record = runtime::connect_to_server(SERVER, &other_config).await;
@@ -7813,13 +7812,12 @@ rl.on('line', line => {
             assert_eq!(record_client(&store.get()), Some(sender.clone()));
 
             // Tells `emitter` to notify, then waits until its
-            // `tools/list_changed` has written its record, and for the channel
-            // message's plugin source.
+            // `tools/list_changed` has written its record.
             async fn notify_through(
                 emitter: &McpClient,
                 store: &crate::state::store::AppStore,
                 record_client: impl Fn(&crate::state::app_state_store::AppState) -> Option<McpClient>,
-            ) -> Option<String> {
+            ) {
                 emitter
                     .notification("fixture/emit", serde_json::json!({}))
                     .await
@@ -7828,30 +7826,12 @@ rl.on('line', line => {
                     record_client(state).as_ref() == Some(emitter)
                 })
                 .await;
-                tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        for event in runtime::drain_mcp_connection_callback_observations().await {
-                            if let McpConnectionCallbackObservation::ChannelMessageReceived {
-                                plugin_source,
-                                ..
-                            } = event
-                            {
-                                return plugin_source;
-                            }
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    }
-                })
-                .await
-                .expect("the channel message is emitted")
             }
 
             // Each connection under the name in turn: whichever one a lookup
             // by name would find, one of the two turns tells it apart.
-            let plugin_source = notify_through(&other, &store, record_client).await;
-            assert_eq!(plugin_source.as_deref(), Some("other@elsewhere"));
-            let plugin_source = notify_through(&sender, &store, record_client).await;
-            assert_eq!(plugin_source.as_deref(), Some("telegram@official"));
+            notify_through(&other, &store, record_client).await;
+            notify_through(&sender, &store, record_client).await;
             assert_eq!(tool_names(&store.get().mcp.tools), ["lookup"]);
 
             // The resources handler writes its own record too, and with

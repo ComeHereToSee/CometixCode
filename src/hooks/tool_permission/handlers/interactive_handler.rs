@@ -448,8 +448,11 @@ pub fn start_channel_permission_relay(
     request: &PermissionRequest,
 ) -> Option<ChannelPermissionRelayRegistration> {
     use crate::services::mcp::channel_permissions;
+    use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
 
-    if !channel_permissions::is_channel_permission_relay_enabled() {
+    // CC `:316-319`: `feature('KAIROS') || feature('KAIROS_CHANNELS')`, and
+    // callbacks in AppState, which the relay gate decided at seeding.
+    if !(feature_enabled(FeatureFlag::Kairos) || feature_enabled(FeatureFlag::KairosChannels)) {
         return None;
     }
     let callbacks = context.channel_permission_callbacks.as_ref()?;

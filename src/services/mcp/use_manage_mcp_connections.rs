@@ -19,10 +19,11 @@ use super::client::{
 };
 use super::config::{is_mcp_server_disabled, set_mcp_server_enabled};
 use super::types::{
-    McpServerConnection, McpServerConnectionType, ScopedMcpServerConfig, Transport,
+    ConnectedMcpServer, McpServerConnection, McpServerConnectionType, ScopedMcpServerConfig,
+    Transport,
 };
 use crate::state::app_state_store::{McpState, McpWriter};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
@@ -90,22 +91,23 @@ pub const INITIAL_BACKOFF_MS: u64 = 1_000;
 /// Maps to: CC `services/mcp/useManageMCPConnections.ts#MAX_BACKOFF_MS`.
 pub const MAX_BACKOFF_MS: u64 = 30_000;
 
-/// Maps to: CC `services/mcp/useManageMCPConnections.ts#getTransportDisplayName`.
-/// Maps to CC `useManageMCPConnections.ts` creating
-/// `AppState.channelPermissionCallbacks` only when channels and
-/// `isChannelPermissionRelayEnabled()` are both enabled. The callbacks live in
+/// Maps to: CC `useManageMCPConnections.ts:168-200`: the channel permission
+/// callbacks exist in a build with `KAIROS` or `KAIROS_CHANNELS`, and go into
+/// `AppState.channelPermissionCallbacks` only while
+/// `isChannelPermissionRelayEnabled()`. The callbacks live in
 /// `AppState.channel_permission_callbacks`; this is the startup seed.
 pub fn channel_permission_callbacks_from_official_gates()
 -> Option<crate::services::mcp::channel_permissions::ChannelPermissionCallbacks> {
-    let channels_enabled = crate::utils::feature_flags::feature_enabled(
-        crate::utils::feature_flags::FeatureFlag::ChannelsEnabled,
-    );
+    use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
+    let channels_built =
+        feature_enabled(FeatureFlag::Kairos) || feature_enabled(FeatureFlag::KairosChannels);
     let relay_enabled =
         crate::services::mcp::channel_permissions::is_channel_permission_relay_enabled();
-    (channels_enabled && relay_enabled)
+    (channels_built && relay_enabled)
         .then(crate::services::mcp::channel_permissions::ChannelPermissionCallbacks::default)
 }
 
+/// Maps to: CC `services/mcp/useManageMCPConnections.ts#getTransportDisplayName`.
 pub fn get_transport_display_name(transport: Transport) -> &'static str {
     match transport {
         Transport::Http => "HTTP",
@@ -392,77 +394,119 @@ pub async fn handle_mcp_resources_list_changed_event(
     });
 }
 
-/// Maps to: CC `useManageMCPConnections.ts` channel notification handler after
-/// `gateChannelServer(...)` returns `register`.
-pub fn handle_channel_message_notification_with_context(
-    server_name: &str,
-    content: &str,
-    meta: Option<&BTreeMap<String, String>>,
-    has_channel_capability: bool,
-    plugin_source: Option<&str>,
+/// Maps to: CC `useManageMCPConnections.ts:470-614`, the channel block of
+/// `onConnectionAttempt`: `gateChannelServer(client.name,
+/// client.capabilities, client.config.pluginSource)` decides when the client
+/// connects whether it gets channel handlers. Registered, its channel
+/// messages are queued, and — if the server declared
+/// `claude/channel/permission` — its permission replies resolve the
+/// session's pending relays (`channelPermCallbacksRef.current`, here
+/// `callbacks`, the same shared object). Skipped, any handlers an earlier
+/// connect registered are removed, so a demotion takes effect.
+///
+/// CC also raises a toast once per skip kind (`:578-611`); it is not ported,
+/// since nothing here reaches the notifications, and the block runs only
+/// with `KAIROS` or `KAIROS_CHANNELS`, both off.
+pub(crate) fn install_channel_handlers(
+    connected: &ConnectedMcpServer,
     context: &ChannelRuntimeGateContext,
-) -> ChannelGateResult {
+    callbacks: Option<ChannelPermissionCallbacks>,
+) {
+    use super::channel_notification::{
+        CHANNEL_EXPERIMENTAL_CAPABILITY, CHANNEL_MESSAGE_NOTIFICATION_METHOD,
+        CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY, CHANNEL_PERMISSION_METHOD,
+        parse_channel_message_notification_params, parse_channel_permission_notification_params,
+    };
+    use futures::FutureExt as _;
+    let declares = |capability: &str| {
+        connected
+            .capabilities
+            .experimental
+            .as_ref()
+            .is_some_and(|experimental| experimental.contains_key(capability))
+    };
     let gate = gate_channel_server_from_context(
-        server_name,
-        has_channel_capability,
+        &connected.name,
+        declares(CHANNEL_EXPERIMENTAL_CAPABILITY),
         context.channels_enabled,
         context.has_claude_ai_oauth,
         context.subscription.as_deref(),
         context.policy_channels_enabled,
         &context.session_channels,
-        plugin_source,
+        connected.config.plugin_source.as_deref(),
         &context.allowlist,
     );
-    if gate == ChannelGateResult::Register {
-        enqueue_channel_message_notification(server_name, content, meta);
+    let client = &connected.client;
+    match gate {
+        ChannelGateResult::Register => {
+            crate::utils::log::log_mcp_debug(&connected.name, "Channel notifications registered");
+            let name = connected.name.clone();
+            client.set_notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD, move |params| {
+                match parse_channel_message_notification_params(params.as_ref()) {
+                    Ok(parsed) => {
+                        // CC `content.slice(0, 80)`: UTF-16 code units.
+                        let preview = String::from_utf16_lossy(
+                            &parsed.content.encode_utf16().take(80).collect::<Vec<_>>(),
+                        );
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            &format!("notifications/claude/channel: {preview}"),
+                        );
+                        enqueue_channel_message_notification(
+                            &name,
+                            &parsed.content,
+                            parsed.meta.as_ref(),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(server = %name, error = %error, "invalid MCP channel notification");
+                    }
+                }
+                futures::future::ready(()).boxed()
+            });
+            if declares(CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY) {
+                let name = connected.name.clone();
+                client.set_notification_handler(CHANNEL_PERMISSION_METHOD, move |params| {
+                    match parse_channel_permission_notification_params(params.as_ref()) {
+                        Ok(parsed) => {
+                            let resolved =
+                                super::channel_permissions::handle_channel_permission_notification(
+                                    callbacks.as_ref(),
+                                    &parsed.request_id,
+                                    parsed.behavior,
+                                    &name,
+                                );
+                            crate::utils::log::log_mcp_debug(
+                                &name,
+                                &format!(
+                                    "notifications/claude/channel/permission: {} → {} ({})",
+                                    parsed.request_id,
+                                    parsed.behavior.as_str(),
+                                    if resolved {
+                                        "matched pending"
+                                    } else {
+                                        "no pending entry — stale or unknown ID"
+                                    }
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(server = %name, error = %error, "invalid MCP channel permission notification");
+                        }
+                    }
+                    futures::future::ready(()).boxed()
+                });
+            }
+        }
+        ChannelGateResult::Skip { reason, .. } => {
+            client.remove_notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD);
+            client.remove_notification_handler(CHANNEL_PERMISSION_METHOD);
+            crate::utils::log::log_mcp_debug(
+                &connected.name,
+                &format!("Channel notifications skipped: {reason}"),
+            );
+        }
     }
-    gate
-}
-
-/// Maps to: CC `gateChannelServer(...)` runtime reads and enqueue side effect
-/// inside `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`.
-pub fn handle_channel_message_notification_event(
-    server_name: &str,
-    content: &str,
-    meta: Option<&BTreeMap<String, String>>,
-    has_channel_capability: bool,
-    plugin_source: Option<&str>,
-) -> ChannelGateResult {
-    let policy_settings = crate::utils::settings::get_settings_for_source(
-        crate::utils::settings::constants::SettingSource::Policy,
-    );
-    let context = channel_gate_context_from_readonly_runtime(policy_settings.as_ref());
-    handle_channel_message_notification_with_context(
-        server_name,
-        content,
-        meta,
-        has_channel_capability,
-        plugin_source,
-        &context,
-    )
-}
-
-/// Maps to: CC `useManageMCPConnections.ts` channel permission notification
-/// handler registered under `CHANNEL_PERMISSION_METHOD`.
-pub fn handle_channel_permission_notification_event(
-    callbacks: Option<&crate::services::mcp::channel_permissions::ChannelPermissionCallbacks>,
-    server_name: &str,
-    request_id: &str,
-    behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-    has_permission_capability: bool,
-) -> Option<bool> {
-    if !has_permission_capability {
-        tracing::debug!(server = %server_name, request_id = %request_id, "MCP channel permission notification skipped: missing capability");
-        return None;
-    }
-    Some(
-        crate::services::mcp::channel_permissions::handle_channel_permission_notification(
-            callbacks,
-            request_id,
-            behavior,
-            server_name,
-        ),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -470,8 +514,8 @@ pub fn handle_channel_permission_notification_event(
 //
 // Claude Code registers `onclose` / `setNotificationHandler` closures inside
 // `onConnectionAttempt` that call `updateServer` / `setAppState` directly.
-// `onclose` and the list_changed handlers are assigned on the client itself
-// here too ([`install_connection_handlers`]). The channel and elicitation
+// `onclose`, the channel and the list_changed handlers are assigned on the
+// client itself here too ([`install_connection_handlers`]). The elicitation
 // handlers are not yet: App mounts [`OnConnectionAttemptHandlers`], and the
 // rmcp client handler invokes the `emit_*` entry points below for every
 // connection.
@@ -496,11 +540,14 @@ pub(crate) fn on_connection_attempt(result: McpConnectionDiscovery, writer: &Mcp
 
 /// Maps to: CC what `onConnectionAttempt` installs on a connected client
 /// (`useManageMCPConnections.ts:326-753`): its `onclose`
-/// (`client.client.onclose = () => { ... }`, `:333-468`) and a list_changed
-/// handler per list the server declared can change (`:616-751`). The
-/// handlers capture the writer where CC's capture `updateServer`; the
-/// writer applies its updates at once, CC's queue batches them.
+/// (`client.client.onclose = () => { ... }`, `:333-468`), the channel
+/// handlers its gate allows (`:470-614`, [`install_channel_handlers`]), and a
+/// list_changed handler per list the server declared can change
+/// (`:616-751`). The handlers capture the writer where CC's capture
+/// `updateServer`; the writer applies its updates at once, CC's queue
+/// batches them.
 fn install_connection_handlers(server: &McpServerConnection, writer: &McpWriter) {
+    use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
     use futures::FutureExt as _;
     use rmcp::model::ConstString as _;
     let Some(connected) = server.as_connected() else {
@@ -515,6 +562,19 @@ fn install_connection_handlers(server: &McpServerConnection, writer: &McpWriter)
         connected.client.set_onclose(move || {
             handle_mcp_server_closed_event(name.clone(), config.clone(), writer.clone()).boxed()
         });
+    }
+
+    // Maps to: CC `:470-614`, built with `feature('KAIROS') ||
+    // feature('KAIROS_CHANNELS')`.
+    if feature_enabled(FeatureFlag::Kairos) || feature_enabled(FeatureFlag::KairosChannels) {
+        let policy_settings = crate::utils::settings::get_settings_for_source(
+            crate::utils::settings::constants::SettingSource::Policy,
+        );
+        install_channel_handlers(
+            connected,
+            &channel_gate_context_from_readonly_runtime(policy_settings.as_ref()),
+            with_connection_handlers(|hooks| hooks.channel_permission_callbacks.clone()).flatten(),
+        );
     }
 
     // Maps to: CC `:616-751`: a handler for each list the server declared
@@ -599,52 +659,6 @@ impl OnConnectionAttemptHandlers {
         }
     }
 
-    /// Maps to: CC channel message notification handler in `onConnectionAttempt`.
-    pub fn on_channel_message_received(
-        &self,
-        name: &str,
-        content: &str,
-        meta: Option<&std::collections::BTreeMap<String, String>>,
-        has_channel_capability: bool,
-        plugin_source: Option<&str>,
-    ) {
-        let gate = handle_channel_message_notification_event(
-            name,
-            content,
-            meta,
-            has_channel_capability,
-            plugin_source,
-        );
-        if let ChannelGateResult::Skip { reason, .. } = gate {
-            tracing::debug!(server = %name, reason = %reason, "MCP channel notification skipped");
-        }
-    }
-
-    /// Maps to: CC channel permission notification handler in `onConnectionAttempt`.
-    pub fn on_channel_permission_received(
-        &self,
-        name: &str,
-        request_id: &str,
-        behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-        has_permission_capability: bool,
-    ) {
-        let Some(resolved) = handle_channel_permission_notification_event(
-            self.channel_permission_callbacks.as_ref(),
-            name,
-            request_id,
-            behavior,
-            has_permission_capability,
-        ) else {
-            return;
-        };
-        tracing::debug!(
-            server = %name,
-            request_id = %request_id,
-            resolved = resolved,
-            "MCP channel permission notification received"
-        );
-    }
-
     /// Maps to: CC `registerElicitationHandler` → `setAppState` queue push.
     pub fn on_elicitation_requested(&self, event: ElicitationRequestEvent) {
         self.mcp.push_elicitation_event(event);
@@ -722,65 +736,6 @@ pub(crate) fn declares_resources_list_changed(
         .unwrap_or(false)
 }
 
-pub(crate) async fn emit_channel_message_received(
-    name: String,
-    content: String,
-    meta: Option<std::collections::BTreeMap<String, String>>,
-    has_channel_capability: bool,
-    plugin_source: Option<String>,
-) {
-    if with_connection_handlers(|hooks| {
-        hooks.on_channel_message_received(
-            &name,
-            &content,
-            meta.as_ref(),
-            has_channel_capability,
-            plugin_source.as_deref(),
-        );
-    })
-    .is_some()
-    {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ChannelMessageReceived {
-        name,
-        content,
-        meta,
-        has_channel_capability,
-        plugin_source,
-    })
-    .await;
-}
-
-pub(crate) async fn emit_channel_permission_received(
-    name: String,
-    request_id: String,
-    behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-    has_permission_capability: bool,
-) {
-    if with_connection_handlers(|hooks| {
-        hooks.on_channel_permission_received(
-            &name,
-            &request_id,
-            behavior,
-            has_permission_capability,
-        );
-    })
-    .is_some()
-    {
-        return;
-    }
-    observe_for_test(
-        McpConnectionCallbackObservation::ChannelPermissionReceived {
-            name,
-            request_id,
-            behavior,
-            has_permission_capability,
-        },
-    )
-    .await;
-}
-
 pub(crate) async fn emit_elicitation_requested(event: ElicitationRequestEvent) {
     if with_connection_handlers(|hooks| hooks.on_elicitation_requested(event.clone())).is_some() {
         return;
@@ -805,19 +760,6 @@ pub(crate) async fn emit_elicitation_completed(name: String, elicitation_id: Str
 /// (unit tests that exercise the rmcp client without mounting App).
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpConnectionCallbackObservation {
-    ChannelMessageReceived {
-        name: String,
-        content: String,
-        meta: Option<std::collections::BTreeMap<String, String>>,
-        has_channel_capability: bool,
-        plugin_source: Option<String>,
-    },
-    ChannelPermissionReceived {
-        name: String,
-        request_id: String,
-        behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-        has_permission_capability: bool,
-    },
     ElicitationRequested {
         event: ElicitationRequestEvent,
     },
@@ -2430,53 +2372,6 @@ mod tests {
     }
 
     #[test]
-    fn channel_permission_notification_event_resolves_session_callbacks_and_skips_stale() {
-        let callbacks =
-            crate::services::mcp::channel_permissions::ChannelPermissionCallbacks::default();
-        let (tx, rx) = async_channel::bounded(1);
-        let _unsubscribe = callbacks.on_response("abcde", move |response| {
-            tx.try_send(response).unwrap();
-        });
-
-        assert_eq!(
-            handle_channel_permission_notification_event(
-                Some(&callbacks),
-                "telegram",
-                "ABCDE",
-                crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Allow,
-                true,
-            ),
-            Some(true)
-        );
-        let response = rx.try_recv().unwrap();
-        assert_eq!(
-            response.behavior,
-            crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Allow
-        );
-        assert_eq!(response.from_server, "telegram");
-        assert_eq!(
-            handle_channel_permission_notification_event(
-                Some(&callbacks),
-                "telegram",
-                "abcde",
-                crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Deny,
-                true,
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            handle_channel_permission_notification_event(
-                Some(&callbacks),
-                "telegram",
-                "abcde",
-                crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Deny,
-                false,
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn pending_mcp_state_from_configs_matches_official_initial_pending_clients() {
         with_isolated_config(|_| {
             let configs = indexmap::IndexMap::from([
@@ -3173,61 +3068,6 @@ mod tests {
         // Actual source spreads old resources before omit(old, name), so the
         // failed update clears tool/command contributions but retains this key.
         assert_eq!(state.resources["docs"][0].uri, "docs://guide");
-    }
-
-    #[test]
-    fn channel_message_notification_handler_gates_and_enqueues_like_official() {
-        let _queue_lock = crate::utils::message_queue_manager::TEST_QUEUE_LOCK
-            .lock()
-            .unwrap();
-        crate::utils::message_queue_manager::clear_command_queue();
-        let context = ChannelRuntimeGateContext {
-            channels_enabled: true,
-            has_claude_ai_oauth: true,
-            subscription: Some("max".to_string()),
-            policy_channels_enabled: None,
-            session_channels: vec![crate::bootstrap::state::ChannelEntry::server(
-                "planner", true,
-            )],
-            allowlist: crate::services::mcp::channel_notification::EffectiveChannelAllowlist {
-                entries: Vec::new(),
-                source: crate::services::mcp::channel_notification::ChannelAllowlistSource::Ledger,
-            },
-        };
-        let mut meta = BTreeMap::new();
-        meta.insert("thread_ts".to_string(), "1".to_string());
-        let gate = handle_channel_message_notification_with_context(
-            "planner",
-            "hello",
-            Some(&meta),
-            true,
-            None,
-            &context,
-        );
-        assert_eq!(gate, ChannelGateResult::Register);
-        let queue = crate::utils::message_queue_manager::get_command_queue();
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].mode, "prompt");
-        assert!(queue[0].is_meta);
-        assert!(queue[0].skip_slash_commands);
-        assert!(
-            queue[0]
-                .value
-                .contains("<channel source=\"planner\" thread_ts=\"1\">")
-        );
-
-        crate::utils::message_queue_manager::clear_command_queue();
-        let skipped = handle_channel_message_notification_with_context(
-            "planner", "hello", None, false, None, &context,
-        );
-        assert!(matches!(
-            skipped,
-            ChannelGateResult::Skip {
-                kind: crate::services::mcp::channel_notification::ChannelGateSkipKind::Capability,
-                ..
-            }
-        ));
-        assert!(crate::utils::message_queue_manager::get_command_queue().is_empty());
     }
 
     #[test]
