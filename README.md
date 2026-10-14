@@ -1,9 +1,16 @@
-# CometixCode
+<div align="center">
+
+<h1>
+  <img src="assets/logo-dark.gif#gh-dark-mode-only" alt="CometixCode" height="40" align="top"><img src="assets/logo-light.gif#gh-light-mode-only" alt="CometixCode" height="40" align="top">
+  CometixCode
+</h1>
 
 English | [简体中文](README_CN.md)
 
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-blue)
+
+</div>
 
 A terminal-based AI coding assistant, written in Rust as a 1:1 reimplementation
 of Anthropic's Claude Code.
@@ -29,13 +36,26 @@ cursor, bracketed paste, grid layout).
 It is a work in progress. Large parts of the interactive loop, tool execution,
 permissions, MCP and slash commands are implemented; other areas are partial.
 
+## Sponsors
+
+<p align="center">
+  <a href="https://www.infistar.cc/register?aff=HALLEY#gh-dark-mode-only"><img src="assets/sponsor-infistar-en-dark.webp#gh-dark-mode-only" alt="Infistar.cc Sponsor"></a><a href="https://www.infistar.cc/register?aff=HALLEY#gh-light-mode-only"><img src="assets/sponsor-infistar-en-light.webp#gh-light-mode-only" alt="Infistar.cc Sponsor"></a>
+</p>
+
+<p align="center">
+  <strong>CometixCode × Infistar.cc | High-Availability AI API</strong><br>
+  Stable routing | 10% rates · Transparent · Failover<br>
+  Top models | ChatGPT · Claude · Gemini · Kimi · GLM · DeepSeek<br>
+  Multimodal | Text · Image · Video · Embedding / Rerank<br>
+  CometixCode users: bonus credits via the <a href="https://www.infistar.cc/register?aff=HALLEY">exclusive link</a>.
+</p>
+
 ## Building
 
 ### Prerequisites
 
 **Rust 1.88+** (edition 2024). Nothing else — no system libraries, no
-`pkg-config`. Unicode segmentation and collation come from ICU4X, whose data
-is compiled into the binary.
+`pkg-config`.
 
 ### Build and run
 

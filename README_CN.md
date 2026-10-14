@@ -1,9 +1,16 @@
-# CometixCode
+<div align="center">
+
+<h1>
+  <img src="assets/logo-dark.gif#gh-dark-mode-only" alt="CometixCode" height="40" align="top"><img src="assets/logo-light.gif#gh-light-mode-only" alt="CometixCode" height="40" align="top">
+  CometixCode
+</h1>
 
 [English](README.md) | 简体中文
 
 ![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-blue)
+
+</div>
 
 一个终端 AI 编码助手，用 Rust 对 Anthropic Claude Code 做 1:1 复刻。
 
@@ -25,6 +32,20 @@ iocraft 复刻它 —— 那是一个 React 风格的保留模式 TUI 框架，�
 
 项目仍在进行中。交互主循环、工具执行、权限、MCP 与斜杠命令的大部分已经实现，
 其余部分尚不完整。
+
+## 赞助商
+
+<p align="center">
+  <a href="https://www.infistar.cc/register?aff=HALLEY#gh-dark-mode-only"><img src="assets/sponsor-infistar-zh-dark.webp#gh-dark-mode-only" alt="无限星河 Sponsor"></a><a href="https://www.infistar.cc/register?aff=HALLEY#gh-light-mode-only"><img src="assets/sponsor-infistar-zh-light.webp#gh-light-mode-only" alt="无限星河 Sponsor"></a>
+</p>
+
+<p align="center">
+  <strong>CometixCode × Infistar.cc 无限星河｜高可用全模型 API</strong><br>
+  企业级高并发稳定调度｜官方 1 折起 · 透明倍率 · 多节点冗余<br>
+  全系模型支持｜ChatGPT · Claude · Gemini · DeepSeek<br>
+  全模态接入｜文本 · 图像 · 视频 · Embedding / Rerank<br>
+  CometixCode 用户通过<a href="https://www.infistar.cc/register?aff=HALLEY">专属链接</a>注册，可享专属特惠。
+</p>
 
 ## 构建
 
